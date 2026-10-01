@@ -168,12 +168,34 @@ def save_training_checkpoint(
     draft_accumulated_step,
     batch_data,
     keep_last,
+    cumulative_elapsed_time_s,
 ):
-    if dist.is_initialized() and dist.get_rank() != 0:
+    current_rank = dist.get_rank() if dist.is_initialized() else 0
+    current_world_size = dist.get_world_size() if dist.is_initialized() else 1
+    local_state = {
+        "rank": int(current_rank),
+        "used_items": int(used_items),
+        "batch_data": batch_data,
+        "target_gradients": _gradient_state(model.target_model),
+        "draft_gradients": _gradient_state(model.draft_model),
+        "rng": capture_rng_state(),
+        "cumulative_elapsed_time_s": float(cumulative_elapsed_time_s),
+    }
+    if dist.is_initialized():
+        rank_states = [None] * current_world_size
+        dist.all_gather_object(rank_states, local_state)
+    else:
+        rank_states = [local_state]
+    if current_rank != 0:
         return None
     checkpoint_dir = Path(checkpoint_dir)
     state = {
-        "format": "specnaacl_fastgrpo_checkpoint_v2",
+        "format": "specnaacl_fastgrpo_checkpoint_v3",
+        "world_size": int(current_world_size),
+        "rank_states": rank_states,
+        "cumulative_elapsed_time_s": max(
+            float(item["cumulative_elapsed_time_s"]) for item in rank_states
+        ),
         "epoch": int(epoch),
         "next_batch": int(next_batch),
         "step": int(step),
@@ -186,12 +208,6 @@ def save_training_checkpoint(
         "optimizer_draft": optimizer_draft.state_dict(),
         "scheduler_target": None,
         "scheduler_draft": None,
-        "target_gradients": _gradient_state(model.target_model),
-        "draft_gradients": _gradient_state(model.draft_model),
-        "batch_data": batch_data,
-        "all_rng_states": capture_rng_state(),
-        "rng_state": torch.random.get_rng_state(),
-        "cuda_rng_state_all": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
     }
     checkpoint_path = checkpoint_dir / f"step{int(step)}_epoch{int(epoch) + 1}_batch{int(next_batch)}.pt"
     _atomic_torch_save(state, checkpoint_path)
@@ -203,18 +219,40 @@ def save_training_checkpoint(
 
 def load_training_checkpoint(path, *, model, optimizer_target, optimizer_draft):
     checkpoint = torch.load(path, map_location="cpu")
+    current_world_size = dist.get_world_size() if dist.is_initialized() else 1
+    current_rank = dist.get_rank() if dist.is_initialized() else 0
+    saved_world_size = int(checkpoint.get("world_size", 1))
+    if saved_world_size != current_world_size:
+        raise RuntimeError(
+            "checkpoint world-size mismatch: "
+            f"saved={saved_world_size}, current={current_world_size}; "
+            "resume with the same number of ranks"
+        )
+    rank_states = checkpoint.get("rank_states")
+    if rank_states is not None:
+        if len(rank_states) != saved_world_size:
+            raise RuntimeError("checkpoint rank_states does not match saved world_size")
+        local_state = rank_states[current_rank]
+        if int(local_state.get("rank", current_rank)) != current_rank:
+            raise RuntimeError(f"checkpoint has no state for rank {current_rank}")
+    else:
+        local_state = {
+            "used_items": checkpoint.get("used_items", 0),
+            "batch_data": checkpoint.get("batch_data", {}),
+            "target_gradients": checkpoint.get("target_gradients"),
+            "draft_gradients": checkpoint.get("draft_gradients"),
+            "rng": checkpoint.get("all_rng_states"),
+        }
     model.draft_model.load_state_dict(checkpoint["draft_model"])
     _load_target_lora_state_dict(model.target_model, checkpoint["target_lora"])
     optimizer_target.load_state_dict(checkpoint["optimizer_target"])
     optimizer_draft.load_state_dict(checkpoint["optimizer_draft"])
-    _restore_gradient_state(model.target_model, checkpoint.get("target_gradients"))
-    _restore_gradient_state(model.draft_model, checkpoint.get("draft_gradients"))
-    if checkpoint.get("all_rng_states") is not None:
-        restore_rng_state(checkpoint["all_rng_states"])
-    if checkpoint.get("rng_state") is not None:
-        torch.random.set_rng_state(checkpoint["rng_state"])
-    if torch.cuda.is_available() and checkpoint.get("cuda_rng_state_all") is not None:
-        torch.cuda.set_rng_state_all(checkpoint["cuda_rng_state_all"])
+    _restore_gradient_state(model.target_model, local_state.get("target_gradients"))
+    _restore_gradient_state(model.draft_model, local_state.get("draft_gradients"))
+    if local_state.get("rng") is not None:
+        restore_rng_state(local_state["rng"])
+    checkpoint["used_items"] = int(local_state.get("used_items", 0))
+    checkpoint["batch_data"] = local_state.get("batch_data", {})
     return checkpoint
 
 
@@ -346,6 +384,68 @@ def _sync_gradients(module):
         if parameter.grad is not None:
             dist.all_reduce(parameter.grad, op=dist.ReduceOp.SUM)
             parameter.grad.div_(world_size)
+
+
+def _aggregate_job_metrics(data, device, cumulative_elapsed_time_s):
+    """Aggregate cumulative counters only at log/final boundaries."""
+    sum_names = (
+        'total_rollout_tokens', 'total_acc_length', 'total_decoded_token_num',
+        'total_accepted_draft_tokens', 'total_proposed_draft_tokens',
+        'reward_sum', 'reward_count', 'target_loss_sum', 'target_loss_count',
+        'draft_loss1_sum', 'draft_loss2_sum', 'draft_loss_count',
+        'draft_sparse_tv_sum', 'draft_sparse_kl_sum', 'draft_sparse_count',
+        'reflex_alpha_sum', 'reflex_loss_sum', 'reflex_updates',
+        'trace_rollout_count', 'used_items', 'ignore_due_correct', 'ignore_due_incorrect',
+    )
+    max_names = (
+        'generate_time_cost', 'train_time_cost', 'draft_train_time_cost',
+        'prefill_time_cost', 'target_time_cost', 'draft_time_cost',
+        'check_time_cost', 'reflex_profile_time_ms',
+    )
+    sums = torch.tensor(
+        [float(data.get(name, 0.0)) for name in sum_names],
+        device=device, dtype=torch.float64,
+    )
+    maxima = torch.tensor(
+        [float(data.get(name, 0.0)) for name in max_names]
+        + [float(cumulative_elapsed_time_s)],
+        device=device, dtype=torch.float64,
+    )
+    if dist.is_initialized():
+        dist.all_reduce(sums, op=dist.ReduceOp.SUM)
+        dist.all_reduce(maxima, op=dist.ReduceOp.MAX)
+    result = dict(zip(sum_names, sums.tolist()))
+    result.update(zip(max_names + ('cumulative_elapsed_time_s',), maxima.tolist()))
+    rounds = max(result['total_decoded_token_num'], 1.0)
+    proposed = max(result['total_proposed_draft_tokens'], 1.0)
+    result['average_accept_length'] = result['total_acc_length'] / rounds
+    result['accepted_tokens_per_medusa_step'] = (
+        result['total_accepted_draft_tokens'] / rounds
+    )
+    result['draft_acceptance_rate'] = (
+        result['total_accepted_draft_tokens'] / proposed
+    )
+    result['mean_reward'] = result['reward_sum'] / max(result['reward_count'], 1.0)
+    result['target_loss'] = (
+        result['target_loss_sum'] / max(result['target_loss_count'], 1.0)
+    )
+    result['draft_loss1'] = (
+        result['draft_loss1_sum'] / max(result['draft_loss_count'], 1.0)
+    )
+    result['draft_loss2'] = (
+        result['draft_loss2_sum'] / max(result['draft_loss_count'], 1.0)
+    )
+    result['draft_sparse_tv'] = (
+        result['draft_sparse_tv_sum'] / max(result['draft_sparse_count'], 1.0)
+    )
+    result['draft_sparse_kl'] = (
+        result['draft_sparse_kl_sum'] / max(result['draft_sparse_count'], 1.0)
+    )
+    result['tokens_per_s'] = (
+        result['total_rollout_tokens'] /
+        max(result['cumulative_elapsed_time_s'], 1.0e-9)
+    )
+    return result
 num_epochs=args.num_epochs
 sample_num=args.sample_num
 train_data_fraction=args.train_data_fraction
@@ -1169,11 +1269,25 @@ batch_data={
     'reflex_loss_sum':0.0,
     'reflex_updates':0,
     'reflex_profile_time_ms':0.0,
+    'reward_sum':0.0,
+    'reward_count':0,
+    'target_loss_sum':0.0,
+    'target_loss_count':0,
+    'draft_loss1_sum':0.0,
+    'draft_loss2_sum':0.0,
+    'draft_loss_count':0,
 }
 
 optimizer_target.zero_grad(set_to_none=True)
 optimizer_draft.zero_grad(set_to_none=True)
-start_time=time.time()
+session_start_time=time.time()
+cumulative_elapsed_before_resume=0.0
+
+
+def _cumulative_wall_time():
+    return cumulative_elapsed_before_resume + time.time() - session_start_time
+
+
 batch=[]
 start_epoch = 0
 start_batch = 0
@@ -1196,6 +1310,9 @@ if resume_checkpoint:
     start_epoch = int(checkpoint.get("epoch", 0))
     start_batch = int(checkpoint.get("next_batch", 0))
     last_checkpoint_step = step
+    cumulative_elapsed_before_resume = float(
+        checkpoint.get("cumulative_elapsed_time_s", 0.0)
+    )
     print(
         f"Resumed FastGRPO checkpoint {resume_checkpoint}: "
         f"epoch={start_epoch + 1}, next_batch={start_batch}, "
@@ -1535,6 +1652,10 @@ for epoch in epoch_bar:
             batch_data['draft_train_time_cost']+=time.time()-draft_train_time_start
             batch_data['last_draft_loss1'].append(draft_loss1)
             batch_data['last_draft_loss2'].append(draft_loss2)
+            draft_loss_weight = max(int(draft_sparse_count), 1)
+            batch_data['draft_loss1_sum'] += float(draft_loss1) * draft_loss_weight
+            batch_data['draft_loss2_sum'] += float(draft_loss2) * draft_loss_weight
+            batch_data['draft_loss_count'] += draft_loss_weight
             batch_data['draft_sparse_tv_sum'] += float(draft_sparse_tv) * int(draft_sparse_count)
             batch_data['draft_sparse_kl_sum'] += float(draft_sparse_kl) * int(draft_sparse_count)
             batch_data['draft_sparse_count'] += int(draft_sparse_count)
@@ -1620,6 +1741,7 @@ for epoch in epoch_bar:
         batch_data['generate_length']+=generate_length
         trace_rollout_count += 1
         batch_data['trace_rollout_count'] = int(batch_data.get('trace_rollout_count', 0)) + 1
+        batch_data['used_items'] = int(used_items)
         source_grpo_step = used_items // max(1, batch_size * accumulation_steps)
         local_grpo_step = max(0, int(source_grpo_step - trace_start_step))
         rollout_log = {
@@ -1702,6 +1824,8 @@ for epoch in epoch_bar:
         step = synchronized_used_items // (batch_size * accumulation_steps)
         batch_old_logps=[]
         batch_ref_logps=[]
+        batch_data['reward_sum'] += float(sum(batch_data['rewards']))
+        batch_data['reward_count'] += int(len(batch_data['rewards']))
         
         for grpo_iteration in range(grpo_iteration_num):
             if statistical_time and torch.cuda.is_available():
@@ -1764,6 +1888,8 @@ for epoch in epoch_bar:
                         chunk_size=logps_chunk_size,
                         loss_scale=1.0 / max(len(batch_data['messages']), 1),
                     )
+                    batch_data['target_loss_sum'] += float(loss)
+                    batch_data['target_loss_count'] += int(cur_batch)
                         
                     if grpo_iteration==0:
                         batch_old_logps.append(old_logps)
@@ -1811,6 +1937,8 @@ for epoch in epoch_bar:
                 chunk_size=logps_chunk_size,
                 loss_scale=1.0 / max(len(batch_data['messages']), 1),
             )
+            batch_data['target_loss_sum'] += float(loss)
+            batch_data['target_loss_count'] += int(cur_batch)
                 
             if grpo_iteration==0:
                 batch_old_logps.append(old_logps)
@@ -2054,7 +2182,7 @@ for epoch in epoch_bar:
                 f"length_cv" : round(mean(batch_data['length_cv']),4) ,
                 f"length_stdev" : round(mean(batch_data['length_stdev']),4) ,  
                 "grpo_iteration":grpo_iteration+1,
-                "used_time": round((time.time()-start_time)/60, 3),
+                "used_time": round(_cumulative_wall_time()/60, 3),
                 f"last_{sample_num}_generate_time_cost":round(sum(batch_data['last_generate_time_cost'][-real_sample_num:])/60,3),
                 f"last_{sample_num}_train_time_cost": round(sum(batch_data['last_train_time_cost'][-real_sample_num:]) / 60, 3),
                 f"last_{sample_num}_acc_length":round(sum(batch_data['last_acc_length'][-real_sample_num:]) / sum(batch_data['last_decoded_token_num'][-real_sample_num:]),4),
@@ -2106,20 +2234,57 @@ for epoch in epoch_bar:
                 f"last_{sample_num}_draft_loss2":round(sum(batch_data['last_draft_loss2'][-real_sample_num:])/len(batch_data['last_draft_loss2'][-real_sample_num:]),4) if is_train_draft and draft_step > 0 else 0 
             }
 
-            if is_main_process and step != last_metrics_step and (
+            should_log_metrics = step != last_metrics_step and (
                 step == 0 or step % log_interval == 0
-            ):
-                wall_elapsed = time.time() - start_time
-                with open(log_file, 'a', encoding='utf-8') as f:
-                    f.write(json.dumps(avg_logs) + '\n')
-                with open(timing_file, 'a', newline='', encoding='utf-8') as stream:
-                    csv.writer(stream).writerow([
-                        int(step), float(wall_elapsed), float(batch_data['generate_time_cost']),
-                        float(batch_data['train_time_cost']), float(batch_data['draft_train_time_cost']),
-                        int(batch_data['total_rollout_tokens']),
-                        float(batch_data['total_rollout_tokens']) / max(float(wall_elapsed), 1e-9),
-                        float(average_accept_length), float(draft_acceptance_rate),
-                    ])
+            )
+            if should_log_metrics:
+                wall_elapsed = _cumulative_wall_time()
+                global_metrics = _aggregate_job_metrics(
+                    batch_data, model.target_model.device, wall_elapsed
+                )
+                wall_elapsed = global_metrics['cumulative_elapsed_time_s']
+                avg_logs.update({
+                    "used_time": round(wall_elapsed / 60.0, 3),
+                    "generate_time_cost": round(global_metrics['generate_time_cost'] / 60.0, 3),
+                    "train_time_cost": round(global_metrics['train_time_cost'] / 60.0, 3),
+                    "draft_train_time_cost": round(global_metrics['draft_train_time_cost'] / 60.0, 3),
+                    "average_acc_length": round(global_metrics['average_accept_length'], 4),
+                    "average_accept_length": round(global_metrics['average_accept_length'], 4),
+                    "accepted_tokens_per_medusa_step": round(global_metrics['accepted_tokens_per_medusa_step'], 4),
+                    "draft_acceptance_rate": round(global_metrics['draft_acceptance_rate'], 4),
+                    "medusa_acceptance_rate": round(global_metrics['draft_acceptance_rate'], 4),
+                    "total_rollout_tokens": int(global_metrics['total_rollout_tokens']),
+                    "total_acc_length": int(global_metrics['total_acc_length']),
+                    "total_decoded_token_num": int(global_metrics['total_decoded_token_num']),
+                    "total_accepted_draft_tokens": int(global_metrics['total_accepted_draft_tokens']),
+                    "total_proposed_draft_tokens": int(global_metrics['total_proposed_draft_tokens']),
+                    "total_accepted_medusa_tokens": int(global_metrics['total_accepted_draft_tokens']),
+                    "total_proposed_medusa_tokens": int(global_metrics['total_proposed_draft_tokens']),
+                    "mean_reward": round(global_metrics['mean_reward'], 4),
+                    "target_loss": float(global_metrics['target_loss']),
+                    "draft_loss1": float(global_metrics['draft_loss1']),
+                    "draft_loss2": float(global_metrics['draft_loss2']),
+                    "reflex_updates": int(global_metrics['reflex_updates']),
+                    "reflex_alpha": global_metrics['reflex_alpha_sum'] / max(global_metrics['reflex_updates'], 1.0),
+                    "reflex_lk_loss": global_metrics['reflex_loss_sum'] / max(global_metrics['reflex_updates'], 1.0),
+                    "reflex_profile_time_ms": (
+                        float(global_metrics['reflex_profile_time_ms'])
+                        if _as_bool(args.reflex_profile) else None
+                    ),
+                    "tokens_per_s": float(global_metrics['tokens_per_s']),
+                })
+                if is_main_process:
+                    with open(log_file, 'a', encoding='utf-8') as f:
+                        f.write(json.dumps(avg_logs) + '\n')
+                    with open(timing_file, 'a', newline='', encoding='utf-8') as stream:
+                        csv.writer(stream).writerow([
+                            int(step), float(wall_elapsed), float(global_metrics['generate_time_cost']),
+                            float(global_metrics['train_time_cost']), float(global_metrics['draft_train_time_cost']),
+                            int(global_metrics['total_rollout_tokens']),
+                            float(global_metrics['tokens_per_s']),
+                            float(global_metrics['average_accept_length']),
+                            float(global_metrics['draft_acceptance_rate']),
+                        ])
                 last_metrics_step = int(step)
 
             postfix = {
@@ -2165,6 +2330,7 @@ for epoch in epoch_bar:
                 draft_accumulated_step=draft_accumulated_step,
                 batch_data=batch_data,
                 keep_last=keep_last_checkpoints,
+                cumulative_elapsed_time_s=_cumulative_wall_time(),
             )
             last_checkpoint_step = step
 
@@ -2185,6 +2351,7 @@ for epoch in epoch_bar:
                     draft_accumulated_step=draft_accumulated_step,
                     batch_data=batch_data,
                     keep_last=keep_last_checkpoints,
+                    cumulative_elapsed_time_s=_cumulative_wall_time(),
                 )
                 last_checkpoint_step = step
             with open(log_file, 'a', encoding='utf-8') as f:
@@ -2219,33 +2386,31 @@ if checkpoint_dir and not stop_requested:
         draft_accumulated_step=draft_accumulated_step,
         batch_data=batch_data,
         keep_last=keep_last_checkpoints,
+        cumulative_elapsed_time_s=_cumulative_wall_time(),
     )
 
-final_average_accept_length = (
-    batch_data['total_acc_length'] / max(batch_data['total_decoded_token_num'], 1)
+total_wall_time = _cumulative_wall_time()
+batch_data['used_items'] = int(used_items)
+final_metrics = _aggregate_job_metrics(
+    batch_data, model.target_model.device, total_wall_time
 )
-final_medusa_acceptance_rate = (
-    batch_data['total_accepted_draft_tokens'] /
-    max(batch_data['total_proposed_draft_tokens'], 1)
-)
-final_accepted_tokens_per_medusa_step = (
-    batch_data['total_accepted_draft_tokens'] /
-    max(batch_data['total_decoded_token_num'], 1)
-)
-total_wall_time = time.time() - start_time
+total_wall_time = final_metrics['cumulative_elapsed_time_s']
+final_average_accept_length = final_metrics['average_accept_length']
+final_medusa_acceptance_rate = final_metrics['draft_acceptance_rate']
+final_accepted_tokens_per_medusa_step = final_metrics['accepted_tokens_per_medusa_step']
 summary = {
     "run_name": version_name,
     "final_step": int(step),
-    "used_items": int(used_items),
+    "used_items": int(final_metrics['used_items']),
     "draft_step": int(draft_step),
     "completed_grpo_steps": int(max(0, step - trace_start_step)),
     "max_grpo_steps": int(max_grpo_steps),
     "stopped_by_max_grpo_steps": bool(stop_requested),
-    "rollout_count": int(trace_rollout_count),
+    "rollout_count": int(final_metrics['trace_rollout_count']),
     "draft_updates_committed": int(draft_step - trace_start_draft_step),
-    "draft_sparse_tv": float(batch_data['draft_sparse_tv_sum']) / max(int(batch_data['draft_sparse_count']), 1),
-    "draft_sparse_kl": float(batch_data['draft_sparse_kl_sum']) / max(int(batch_data['draft_sparse_count']), 1),
-    "draft_sparse_count": int(batch_data['draft_sparse_count']),
+    "draft_sparse_tv": float(final_metrics['draft_sparse_tv']),
+    "draft_sparse_kl": float(final_metrics['draft_sparse_kl']),
+    "draft_sparse_count": int(final_metrics['draft_sparse_count']),
     "draft_lr_multiplier": float(draft_lr_multiplier),
     "effective_draft_lrs": effective_draft_lrs,
     "fastgrpo_ablation": bool(fastgrpo_ablation),
@@ -2253,11 +2418,11 @@ summary = {
     "reflex_feature_dim": int(args.reflex_feature_dim),
     "reflex_lr": float(args.reflex_lr),
     "reflex_weight_decay": float(args.reflex_weight_decay),
-    "reflex_updates": int(batch_data['reflex_updates']),
-    "reflex_alpha": float(batch_data['reflex_alpha_sum']) / max(int(batch_data['reflex_updates']), 1),
-    "reflex_lk_loss": float(batch_data['reflex_loss_sum']) / max(int(batch_data['reflex_updates']), 1),
+    "reflex_updates": int(final_metrics['reflex_updates']),
+    "reflex_alpha": float(final_metrics['reflex_alpha_sum']) / max(int(final_metrics['reflex_updates']), 1),
+    "reflex_lk_loss": float(final_metrics['reflex_loss_sum']) / max(int(final_metrics['reflex_updates']), 1),
     "reflex_profile_time_ms": (
-        float(batch_data['reflex_profile_time_ms']) if _as_bool(args.reflex_profile) else None
+        float(final_metrics['reflex_profile_time_ms']) if _as_bool(args.reflex_profile) else None
     ),
     "train_dataset_full_size": int(full_train_samples),
     "train_dataset_selected_size": int(selected_train_samples),
@@ -2267,32 +2432,31 @@ summary = {
     "train_subset_seed": int(train_subset_seed),
     "max_train_samples": int(max_train_samples),
     "logps_chunk_size": int(logps_chunk_size),
-    "total_generate_time_s": float(batch_data['generate_time_cost']),
-    "total_train_time_s": float(batch_data['train_time_cost']),
-    "total_draft_train_time_s": float(batch_data['draft_train_time_cost']) if is_train_draft else 0.0,
+    "total_generate_time_s": float(final_metrics['generate_time_cost']),
+    "total_train_time_s": float(final_metrics['train_time_cost']),
+    "total_draft_train_time_s": float(final_metrics['draft_train_time_cost']) if is_train_draft else 0.0,
     "total_wall_time_s": float(total_wall_time),
-    "total_rollout_tokens": int(batch_data['total_rollout_tokens']),
-    "generation_tokens_per_s": (
-        float(batch_data['total_rollout_tokens']) /
-        max(float(batch_data['generate_time_cost']), 1e-9)
-    ),
+    "total_rollout_tokens": int(final_metrics['total_rollout_tokens']),
+    "generation_tokens_per_s": float(final_metrics['tokens_per_s']),
+    "tokens_per_s": float(final_metrics['tokens_per_s']),
     "average_accept_length": float(final_average_accept_length),
     "average_acc_length": float(final_average_accept_length),
     "accepted_tokens_per_medusa_step": float(final_accepted_tokens_per_medusa_step),
     "medusa_acceptance_rate": float(final_medusa_acceptance_rate),
     "draft_acceptance_rate": float(final_medusa_acceptance_rate),
-    "total_acc_length": int(batch_data['total_acc_length']),
-    "total_decoded_token_num": int(batch_data['total_decoded_token_num']),
-    "total_verify_rounds": int(batch_data['total_decoded_token_num']),
-    "total_accepted_draft_tokens": int(batch_data['total_accepted_draft_tokens']),
-    "total_proposed_draft_tokens": int(batch_data['total_proposed_draft_tokens']),
-    "total_accepted_medusa_tokens": int(batch_data['total_accepted_draft_tokens']),
-    "total_proposed_medusa_tokens": int(batch_data['total_proposed_draft_tokens']),
-    "mean_reward": (
-        float(batch_data['mean_rewards']) / max(int(used_items), 1)
-    ),
-    "ignore_due_correct": int(batch_data['ignore_due_correct']),
-    "ignore_due_incorrect": int(batch_data['ignore_due_incorrect']),
+    "total_acc_length": int(final_metrics['total_acc_length']),
+    "total_decoded_token_num": int(final_metrics['total_decoded_token_num']),
+    "total_verify_rounds": int(final_metrics['total_decoded_token_num']),
+    "total_accepted_draft_tokens": int(final_metrics['total_accepted_draft_tokens']),
+    "total_proposed_draft_tokens": int(final_metrics['total_proposed_draft_tokens']),
+    "total_accepted_medusa_tokens": int(final_metrics['total_accepted_draft_tokens']),
+    "total_proposed_medusa_tokens": int(final_metrics['total_proposed_draft_tokens']),
+    "mean_reward": float(final_metrics['mean_reward']),
+    "target_loss": float(final_metrics['target_loss']),
+    "draft_loss1": float(final_metrics['draft_loss1']),
+    "draft_loss2": float(final_metrics['draft_loss2']),
+    "ignore_due_correct": int(final_metrics['ignore_due_correct']),
+    "ignore_due_incorrect": int(final_metrics['ignore_due_incorrect']),
     "metrics_jsonl": str(log_file),
     "summary_json": str(summary_file),
     "saved_model_dir": f"{saved_model_dir}/step{step}",

@@ -167,23 +167,28 @@ class FastLKReflex:
         return probabilities
 
     @torch.no_grad()
-    def update_from_target_logits(
+    def update_from_target_probs(
         self,
-        target_root_logits: torch.Tensor,
+        target_root_probs: torch.Tensor,
         compact_to_target: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Perform one root-only analytic LK update using verification logits."""
         started = self._profile_start()
         if self.state is None or self._root_q is None or self._root_psi is None:
             raise RuntimeError("root q/psi were not cached before the Reflex update")
-        mapping = compact_to_target.to(device=target_root_logits.device, dtype=torch.long)
-        # p is the raw temperature-1 teacher distribution before top-p/top-k.
-        log_norm = torch.logsumexp(target_root_logits.float(), dim=-1, keepdim=True)
-        p = (target_root_logits.float().index_select(-1, mapping) - log_norm).exp()
+        mapping = compact_to_target.to(device=target_root_probs.device, dtype=torch.long)
+        # Conditional compact-vocabulary LK: condition the exact target sampling
+        # distribution on tokens controllable by the EAGLE compact head.
+        p = target_root_probs.float().index_select(-1, mapping)
+        p = p / (p.sum(dim=-1, keepdim=True) + self.eps)
         alpha, loss, gradient = lk_alpha_and_logit_gradient(self._root_q, p, self.eps)
         decay = 1.0 - self.learning_rate * self.weight_decay
-        self.state.mul_(decay).add_(
-            torch.einsum("bv,bd->bvd", gradient, self._root_psi),
+        # baddbmm_ applies decay and the batched rank-one update without
+        # materializing a [batch, vocabulary, feature] outer-product temporary.
+        self.state.baddbmm_(
+            gradient.unsqueeze(-1),
+            self._root_psi.unsqueeze(1),
+            beta=decay,
             alpha=-self.learning_rate,
         )
         self._alpha_sum.add_(alpha.sum())
@@ -195,13 +200,20 @@ class FastLKReflex:
         return alpha, loss
 
     @torch.no_grad()
-    def remove(self, index: int) -> None:
-        """Remove a completed response while preserving active-batch ordering."""
+    def remove_finished(self, finished_indices) -> None:
+        """Compact all completed responses once while preserving batch order."""
         if self.state is None:
             raise RuntimeError("FastLKReflex has not been started")
-        if index < 0 or index >= self.state.shape[0]:
-            raise IndexError(index)
-        self.state = torch.cat((self.state[:index], self.state[index + 1 :]), dim=0)
+        if not finished_indices:
+            return
+        finished_set = {int(index) for index in finished_indices}
+        if any(index < 0 or index >= self.state.shape[0] for index in finished_set):
+            raise IndexError(finished_indices)
+        keep_indices = [
+            index for index in range(self.state.shape[0]) if index not in finished_set
+        ]
+        keep = torch.tensor(keep_indices, device=self.state.device, dtype=torch.long)
+        self.state = self.state.index_select(0, keep)
         # A root cache belongs to the just-verified batch and has already been
         # consumed. Clearing defensively prevents accidental cross-round reuse.
         self._root_q = None
@@ -239,9 +251,16 @@ def reflex_or_baseline_probabilities(
     *,
     cache_root: bool = False,
 ) -> torch.Tensor:
-    """Keep the disabled path exactly equal to the original softmax path."""
+    """Use the same FP32 compact-proposal path in OFF and ACTIVE modes."""
     if reflex is None:
-        return raw_logits.softmax(dim=-1)
+        return raw_logits.float().softmax(dim=-1)
     if native_hidden is None:
         raise ValueError("native_hidden is required when Reflex is active")
     return reflex.correct(raw_logits, native_hidden, cache_root=cache_root)
+
+
+def topk_compact_candidates(probabilities, compact_to_target, k):
+    """Shared OFF/ACTIVE compact top-k and fixed d2t mapping path."""
+    values, compact_ids = torch.topk(probabilities, k=int(k), dim=-1)
+    mapping = compact_to_target.to(probabilities.device, torch.long)
+    return values, compact_ids, mapping[compact_ids]

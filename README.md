@@ -5,9 +5,10 @@ It preserves FastGRPO's GRPO reward/loss, target-update schedule, speculative
 tree verifier, concurrency-aware scheduler, and persistent online EAGLE update.
 It adds an optional trajectory-local Fast LK Reflex correction during rollout.
 
-- `REFLEX_MODE=off`: the original EAGLE-3 proposal path.
-- `REFLEX_MODE=active`: compact-vocabulary `z = z0 + A psi`, followed by the
-  analytic root LK update from the target logits already produced by verification.
+- `REFLEX_MODE=off`: compact EAGLE logits, softmax, top-k, then fixed `d2t` mapping.
+- `REFLEX_MODE=active`: the identical path with only `A psi` added to the compact
+  logits, followed by an analytic root LK update that reuses the exact target
+  sampling probabilities after temperature/top-p/top-k.
 - No Reflex backward, optimizer, persistent model update, or extra target forward.
 - SpecForge `0.2.0` source is vendored at commit
   `3cb0510f0bd0e8c195ac6e9c5c62f6b50580ff83`.

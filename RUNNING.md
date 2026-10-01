@@ -55,8 +55,11 @@ single-process.
 
 `RESUME=auto` restores `checkpoints/resume/latest.pt`. Checkpoints contain target
 LoRA, EAGLE state, both optimizers, accumulation gradients/counters, epoch/step,
-Python/NumPy/Torch/CUDA RNG. There are currently no schedulers; both scheduler
-fields are recorded as `null`.
+per-rank Python/NumPy/Torch/CUDA RNG, the original world size, and cumulative
+elapsed time. Exact resume rejects a different world size. There are currently
+no schedulers; both scheduler fields are recorded as `null`. Logged and final
+token/acceptance/reward/loss counters are reduced across ranks; throughput is
+global rollout tokens divided by cumulative job wall time.
 
 ## Outputs
 

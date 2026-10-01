@@ -1,73 +1,64 @@
 # Implementation report
 
-## Result
+## Files modified
 
-`SpecNaacl/` was created as an independent sibling copy; `fastgrpo/` was not
-modified. The rollout now supports `REFLEX_MODE=off|active`. The disabled path
-retains the original proposal softmax and FastGRPO verifier. Active mode uses a
-compact-vocabulary, trajectory-local `FastLKReflex`, updates only at the root,
-and reuses the verification target logits.
+- `helper/specualtive_generate.py`
+- `helper/fast_lk_reflex.py`
+- `helper/sampling.py` (new)
+- `grpo_speculative.py`
+- `tests/test_fast_lk_reflex.py`
+- `tests/test_sampling.py` (new)
+- `pytest.ini`
+- `README.md`
+- `RUNNING.md`
+- `METHOD_FAST_LK_REFLEX.md`
+- `IMPLEMENTATION_REPORT.md`
 
-No long training and no fabricated experimental output were produced.
+## Bugs fixed
 
-## Main files created or modified
+- OFF and ACTIVE now share the same FP32 compact EAGLE softmax, top-k and
+  fixed `d2t` mapping. ACTIVE differs only by adding `A psi`; a zero A parity
+  test covers probabilities, compact top-k ids and mapped target ids.
+- Target sampling and Reflex supervision reuse one normalized probability
+  tensor after temperature, top-p and top-k. Reflex adds no target forward or
+  separate full-vocabulary softmax.
+- LK now conditions and renormalizes target probability on the compact
+  vocabulary. Analytic-gradient, nonzero-gradient and descent tests were added.
+- The fast-state update uses in-place batched `baddbmm`, including `beta=1`
+  when weight decay is zero, and finished trajectories are compacted once per
+  verification round.
+- Pytest resolves repository modules without manually setting `PYTHONPATH`.
+- Log/final AAL, acceptance, rollout-token, reward and loss counters are reduced
+  across ranks. Timing uses the maximum rank time; throughput uses global
+  cumulative tokens divided by cumulative elapsed job time.
+- Checkpoint v3 gathers per-rank Python, NumPy, Torch CPU and CUDA RNG, rank-local
+  accumulated gradients and buffers; it records world size and cumulative
+  elapsed time. Resume selects the current rank state and rejects world-size
+  mismatch. Both optimizer states and accumulated gradients remain restorable.
+- Default Reflex profiling remains disabled and no per-token/per-round disk log,
+  diagnostic top-k, or default-path synchronization was added.
 
-- `helper/fast_lk_reflex.py`: fixed projection, per-response A state, analytic
-  LK gradient/update, active-batch removal and aggregate counters.
-- `helper/specualtive_generate.py`: compact EAGLE proposal correction and
-  root feedback hook; FastGRPO tree verification is unchanged.
-- `helper/eagle3_specforge.py`: minimal native compact-logit and fixed
-  compact-to-target vocabulary adapter.
-- `helper/checkpointing.py`, `grpo_speculative.py`: RNG/optimizer/gradient
-  accumulation resume, synchronous gradient all-reduce, rank-0 tqdm/logging,
-  Reflex CLI/config/metrics, and lightweight timing CSV.
-- `helper/drift_metrics.py`: removes the accidental dependency on the sibling
-  MEDUSA project. It is only a compatibility metric for the legacy draft path.
-- `scripts/launch/{pretrain_model,train_model}.sh`: shared launch logic.
-- Seven `pretrain_<model>.sh` and seven `train_<model>.sh` wrappers for Qwen2.5
-  1.5B/3B/7B/14B, Qwen3 1.7B/4B, and Llama 3.1 8B.
-- `scripts/generate_eagle3_config.py`: explicit Qwen2, Qwen3, and Llama family
-  validation; unknown families fail rather than fall back.
-- `scripts/prepare_local_pretrain_data.py`, `scripts/write_run_metadata.py`.
-- `scripts/plot_training_time.py` and `.sh`.
-- `README.md`, `RUNNING.md`, `METHOD_FAST_LK_REFLEX.md`, `huongdanchay.md`.
-- `tests/test_fast_lk_reflex.py`, `tests/test_checkpointing.py`,
-  `tests/test_model_configs.py`, `tests/test_shell_scripts.py`, and `pytest.ini`.
+## Test commands
 
-The vendored SpecForge source and previously implemented Torch 2.11 /
-Transformers 5.8.1 / SGLang 0.5.14 compatibility fixes remain in
-`third_party/SpecForge`. Provenance is recorded in `VENDORED_COMMIT` and
-`DEPENDENCIES_POLICY_LAG.md`.
+```bash
+cd /workspace/storage-shared/nlp/minhpn19/SpecNaacl
+python -m compileall -q .
+pytest -q
+find . -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
+```
 
-## Preserved versus changed
+## Test result on this workstation
 
-Preserved from FastGRPO: GRPO objective and rewards, policy update ordering,
-adaptive concurrency/tree budget, target verification semantics, accepted
-length counters, and persistent online draft updates.
+- `python3 -m compileall -q SpecNaacl`: passed.
+- Shell syntax check for every `.sh` under `SpecNaacl`: passed.
+- Non-Torch tests: `5 passed`.
+- Full `pytest -q`: collection stopped because this workstation does not have
+  PyTorch (`ModuleNotFoundError: torch`) for three tensor test modules. Tests
+  were not skipped or weakened to hide the missing dependency.
 
-Changed: EAGLE-3 proposal logits may receive the temporary `A psi` correction;
-after verification the analytic LK root feedback updates only A. The existing
-SpecForge `OnlineEagle3Model` still owns persistent EAGLE architecture, feature
-projection, loss and training-time unrolling. Reflex has no optimizer and does
-not enter a checkpoint because it ends with each completed rollout.
+## Not verified without B200/model checkpoints
 
-## Validation performed on this workstation
-
-- `python3 -m compileall -q .`: passed, including vendored source.
-- `bash -n` over every shell script: passed.
-- Dry-run of all 14 model wrappers: passed.
-- Model config generation tests for Qwen2, Qwen3 and Llama plus unsupported
-  family rejection: passed.
-- Available CPU test subset: `5 passed`.
-
-The complete `pytest -q` suite was collected, but this workstation has no
-PyTorch installation (`ModuleNotFoundError: torch`), so tensor/autograd,
-optimizer/RNG and state-removal tests could not execute here. The tests are
-present and should be run in the B200 Python environment.
-
-Not verified locally because this machine has no B200/model checkpoints and no
-matching CUDA stack: real collect -> persistent SpecForge draft train -> target
-GRPO train, multi-GPU NCCL, and end-to-end active/off acceptance throughput.
-Run `python -m pytest -q` before the first long job, then use a small
-`MAX_TRAIN_SAMPLES`/`GEN_MAX_LENGTH` smoke run. No full training is launched by
-the setup scripts automatically.
+- Full tensor/autograd suite in the pinned B200 environment.
+- Real OFF/ACTIVE EAGLE-3 rollout parity with model checkpoints.
+- End-to-end FastGRPO training, NCCL multi-GPU checkpoint/resume, and measured
+  B200 wall-clock/throughput. No full training or speedup benchmark was run.

@@ -28,7 +28,12 @@ import math
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 
-from helper.fast_lk_reflex import FastLKReflex, reflex_or_baseline_probabilities
+from helper.fast_lk_reflex import (
+    FastLKReflex,
+    reflex_or_baseline_probabilities,
+    topk_compact_candidates,
+)
+from helper.sampling import build_sampling_probs, sample_from_probs
 
 
 total_target_time=0
@@ -128,64 +133,8 @@ def sampling(
     Returns:
         torch.Tensor: Sampled token indices (shape: [batch_size, seq_len]).
     """
-    assert logits.dim() == 3, f"Expected logits to have shape [bsz, seq, vocab], got {logits.shape}"
-    bsz, seq_len, vocab_size = logits.shape
-    
-    logits_flat = logits.view(-1, vocab_size)
-
-    if torch.isnan(logits_flat).any() or torch.isinf(logits_flat).any():
-        logits_flat = torch.where(
-            torch.isnan(logits_flat) | torch.isinf(logits_flat),
-            torch.tensor(float('-inf'), dtype=logits_flat.dtype, device=logits_flat.device),
-            logits_flat
-        )
-
-    valid_mask = ~torch.isinf(logits_flat).all(dim=-1)  
-    if not valid_mask.any():
-        warnings.warn("All sequences in the batch are invalid. Returning EOS token IDs as fallback.")
-        return torch.full(
-            (bsz, seq_len), 
-            fill_value=eos_token_id, 
-            dtype=torch.long, 
-            device=logits.device
-        )
-
-    sampled_tokens_flat = torch.full(
-        (logits_flat.shape[0], ), 
-        fill_value=eos_token_id, 
-        dtype=torch.long, 
-        device=logits.device
-    )
-
-    valid_indices = torch.where(valid_mask)[0]
-    if valid_indices.numel() > 0:
-        valid_logits = logits_flat[valid_indices] / temperature
-        probs = F.softmax(valid_logits, dim=-1)
-        
-        if top_p:
-            sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
-            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-
-            mask = cumulative_probs > top_p
-            mask = torch.roll(mask, shifts=1, dims=-1)
-            mask[..., 0] = False  
-
-            sorted_probs.masked_fill_(mask, 0.0)
-            sorted_probs /= sorted_probs.sum(dim=-1, keepdim=True)
-
-            probs = torch.zeros_like(probs).scatter_(-1, sorted_indices, sorted_probs)
-        
-        if top_k:
-            top_k_probs, top_k_indices = torch.topk(probs, top_k, dim=-1)
-            top_k_probs /= top_k_probs.sum(dim=-1, keepdim=True)
-
-            probs = torch.zeros_like(probs).scatter_(-1, top_k_indices, top_k_probs)
-
-        sampled_indices = torch.multinomial(probs, num_samples=1).squeeze(-1)
-        sampled_tokens_flat[valid_indices] = sampled_indices
-
-    sampled_tokens = sampled_tokens_flat.view(bsz, seq_len)
-    return sampled_tokens
+    probs = build_sampling_probs(logits, temperature, top_p, top_k, eos_token_id)
+    return sample_from_probs(probs)
 
 
 
@@ -261,18 +210,18 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
         draft_position_ids=past_position_ids_tensor.unsqueeze(-1).repeat(1, draft_k) # (bsz, draft_k)
         total_position_ids.append(draft_position_ids)
         
-        if reflex is None:
-            draft_logits=model.lm_head(draft_hidden_states.to(model.target_model.dtype))
-            draft_logits=reflex_or_baseline_probabilities(draft_logits)
-        else:
+        if getattr(model, "is_eagle3_specforge", False):
             compact_logits = model.compute_compact_logits(draft_hidden_states)
             draft_logits = reflex_or_baseline_probabilities(
-                compact_logits, draft_hidden_states, reflex, cache_root=True
+                compact_logits, draft_hidden_states, reflex, cache_root=reflex is not None
             )
-        
-        next_token_values, draft_next_token=torch.topk(draft_logits, k=draft_k, dim=-1) # draft_next_token.shape (bsz, 1, draft_k)
-        if reflex is not None:
-            draft_next_token = compact_to_target[draft_next_token]
+            next_token_values, _, draft_next_token = topk_compact_candidates(
+                draft_logits, compact_to_target, draft_k
+            )
+        else:
+            draft_logits = model.lm_head(draft_hidden_states.to(model.target_model.dtype))
+            draft_logits = draft_logits.softmax(dim=-1)
+            next_token_values, draft_next_token = torch.topk(draft_logits, k=draft_k, dim=-1)
         draft_confidences=next_token_values.view(bsz, -1) # (bsz, draft_k)
         
         past_kv_len=draft_past_key_values_tree[0][0].shape[-2]
@@ -343,19 +292,18 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
             draft_hidden_states=draft_outputs['hidden_states']
             next_feature_states=draft_outputs['next_feature_states'] # (bsz, seq, hidden_size)
             
-            if reflex is None:
-                draft_logits=model.lm_head(draft_hidden_states.to(model.target_model.dtype))
-                draft_logits=reflex_or_baseline_probabilities(draft_logits)
-            else:
+            if getattr(model, "is_eagle3_specforge", False):
                 compact_logits = model.compute_compact_logits(draft_hidden_states)
                 draft_logits = reflex_or_baseline_probabilities(
                     compact_logits, draft_hidden_states, reflex, cache_root=False
                 )
-            
-            
-            next_token_values,draft_next_token=torch.topk(draft_logits, k=draft_k, dim=-1) # (bsz, seq, draft_k)
-            if reflex is not None:
-                draft_next_token = compact_to_target[draft_next_token]
+                next_token_values, _, draft_next_token = topk_compact_candidates(
+                    draft_logits, compact_to_target, draft_k
+                )
+            else:
+                draft_logits = model.lm_head(draft_hidden_states.to(model.target_model.dtype))
+                draft_logits = draft_logits.softmax(dim=-1)
+                next_token_values, draft_next_token = torch.topk(draft_logits, k=draft_k, dim=-1)
 
             draft_confidences=draft_confidences.unsqueeze(-1)*next_token_values
             draft_top_k_token_values, draft_top_k_token_indices=torch.topk(draft_confidences.view(bsz, -1), k=draft_k, dim=-1) # (bsz, draft_k)
@@ -591,9 +539,12 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
         total_target_time+=time.time()-target_time_start
             
     if do_sample==False:
-        target_next_token=target_logits.softmax(dim=-1).argmax(-1)
+        target_next_token=target_logits.argmax(-1)
     elif do_sample==True:
-        target_next_token=sampling(target_logits,top_k,top_p,temperature,eos_token_id)
+        target_sampling_probs = build_sampling_probs(
+            target_logits, temperature, top_p, top_k, eos_token_id
+        )
+        target_next_token=sample_from_probs(target_sampling_probs)
     else:
         raise ValueError('"do_sample" must be True or False')
     
@@ -688,6 +639,8 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
     response_accepted_length_sum=[0 for _ in range(bsz)]
     response_verification_rounds=[0 for _ in range(bsz)]
 
+    if getattr(model, "is_eagle3_specforge", False):
+        compact_to_target = model.compact_to_target_ids(device=draft_hidden_states.device)
     if reflex_mode == "active":
         reflex = FastLKReflex(
             feature_dim=reflex_feature_dim,
@@ -702,7 +655,6 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
             int(draft_hidden_states.shape[-1]),
             draft_hidden_states.device,
         )
-        compact_to_target = model.compact_to_target_ids(device=draft_hidden_states.device)
         
 
     if statistical_time:
@@ -807,19 +759,28 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
             target_hidden_states_tree=target_outputs['target_hidden_state']
             target_outputs_logits=model.target_model.lm_head(target_hidden_states_tree)
 
-            if reflex is not None:
-                # Position zero predicts the root EAGLE proposal.  Reuse these
-                # verification logits; no additional target forward is run.
-                reflex.update_from_target_logits(
-                    target_outputs_logits[:, 0, :], compact_to_target
-                )
-            
             if do_sample==False:
-                target_next_token_tree=target_outputs_logits.softmax(-1).argmax(-1)
+                target_next_token_tree=target_outputs_logits.argmax(-1)
+                target_sampling_probs = None
+                if reflex is not None:
+                    target_sampling_probs = torch.nn.functional.one_hot(
+                        target_next_token_tree,
+                        num_classes=target_outputs_logits.shape[-1],
+                    ).to(torch.float32)
             elif do_sample==True:
-                target_next_token_tree=sampling(target_outputs_logits,top_k,top_p,temperature,eos_token_id)
+                target_sampling_probs = build_sampling_probs(
+                    target_outputs_logits, temperature, top_p, top_k, eos_token_id
+                )
+                target_next_token_tree=sample_from_probs(target_sampling_probs)
             else:
                 raise ValueError('"do_sample" must be True or False')
+
+            if reflex is not None:
+                # Reuse the exact normalized distribution used above for target
+                # sampling. No extra target forward or full-vocabulary softmax.
+                reflex.update_from_target_probs(
+                    target_sampling_probs[:, 0, :], compact_to_target
+                )
         
         if statistical_time:
             torch.cuda.synchronize()
@@ -977,6 +938,12 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
             all_draft_input_ids=torch.concat([all_draft_input_ids, next_token], dim=-1)
             
         generated_sequences=torch.concat([generated_sequences,next_token],dim=-1)
+
+        finished_indices = [index for index, finished in enumerate(end_sig) if finished]
+        if reflex is not None and finished_indices:
+            # Compact A once for the whole verification round. The remaining
+            # FastGRPO tensors are pruned below with their existing semantics.
+            reflex.remove_finished(finished_indices)
         
         if 0 not in end_sig:
             break
@@ -1048,8 +1015,6 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
                         [all_draft_input_ids[:delete_idx], all_draft_input_ids[delete_idx+1:]], dim=0)
                     
                 residual_index=[residual_index[_] for _ in range(bsz) if _ != delete_idx]
-                if reflex is not None:
-                    reflex.remove(delete_idx)
                 bsz-=1
                 
                 draft_token_length, draft_k, draft_total_token = get_adaptive_hyperparameters(bsz, verification_capacity,
