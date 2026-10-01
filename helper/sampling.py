@@ -40,3 +40,39 @@ def build_sampling_probs(logits, temperature=1.0, top_p=None, top_k=None, eos_to
 def sample_from_probs(probs):
     vocabulary = probs.shape[-1]
     return torch.multinomial(probs.reshape(-1, vocabulary), 1).reshape(*probs.shape[:-1])
+
+
+def sample_target_from_logits(
+    logits,
+    *,
+    do_sample,
+    temperature,
+    top_p,
+    top_k,
+    eos_token_id,
+    reflex=None,
+    compact_to_target=None,
+):
+    """Sample once from existing logits and reuse the same probs for Reflex.
+
+    This function deliberately accepts logits rather than a model, so Reflex
+    supervision cannot trigger another target forward.
+    """
+    if do_sample == True:
+        probs = build_sampling_probs(
+            logits, temperature, top_p, top_k, eos_token_id
+        )
+        tokens = sample_from_probs(probs)
+    elif do_sample == False:
+        tokens = logits.argmax(-1)
+        probs = None
+    else:
+        raise ValueError('"do_sample" must be True or False')
+    if reflex is not None:
+        if compact_to_target is None:
+            raise ValueError("compact_to_target is required for Reflex supervision")
+        if probs is None:
+            reflex.update_from_target_tokens(tokens[:, 0], compact_to_target)
+        else:
+            reflex.update_from_target_probs(probs[:, 0, :], compact_to_target)
+    return tokens, probs

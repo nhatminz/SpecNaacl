@@ -127,8 +127,8 @@ import sys
 from pathlib import Path
 from packaging.version import Version
 
-if sys.version_info < (3, 11):
-    raise SystemExit(f"Python >=3.11 is required; found {sys.version.split()[0]}")
+if sys.version_info[:3] != (3, 12, 12):
+    raise SystemExit(f"Python 3.12.12 is required; found {sys.version.split()[0]}")
 modules = {}
 for name in ("torch", "transformers", "datasets", "accelerate", "yaml", "sglang", "specforge"):
     try:
@@ -141,22 +141,18 @@ sglang_version = getattr(modules["sglang"], "__version__", "unknown")
 torch_base = Version(torch_version.split("+", 1)[0])
 transformers_base = Version(transformers_version.split("+", 1)[0])
 sglang_base = Version(sglang_version.split("+", 1)[0])
-# SpecForge contains an explicit Torch-2.11 CuteDSL compatibility shim. 2.13 is
-# its upstream lockfile version; both stacks exercise the same EAGLE-3 code.
-if (torch_base.major, torch_base.minor) not in {(2, 11), (2, 13)}:
+if torch_base != Version("2.13.0"):
     raise SystemExit(
-        "unsupported torch stack: expected a validated 2.11.x or upstream "
-        f"2.13.x build, found {torch_version}"
+        f"unsupported torch stack: expected 2.13.0, found {torch_version}"
     )
-if not (Version("5.8.0") <= transformers_base < Version("6.0.0")):
+if transformers_base != Version("5.12.1"):
     raise SystemExit(
-        "unsupported transformers stack: expected >=5.8,<6.0, found "
+        "unsupported transformers stack: expected 5.12.1, found "
         f"{transformers_version}"
     )
-if sglang_base not in {Version("0.5.14"), Version("0.5.18")}:
+if sglang_base != Version("0.5.18"):
     raise SystemExit(
-        "unsupported SGLang stack: expected installed B200 0.5.14 or "
-        f"SpecForge upstream 0.5.18, found {sglang_version}"
+        f"unsupported SGLang stack: expected 0.5.18, found {sglang_version}"
     )
 
 # Import the concrete APIs used by EAGLE-3 training and local SGLang feature
@@ -187,10 +183,8 @@ report = {
     "transformers": transformers_version,
     "sglang": sglang_version,
     "specforge": getattr(modules["specforge"], "__version__", "vendored"),
-    "compatibility_mode": "torch_2_11" if torch_base.minor == 11 else "upstream_lock",
-    "sglang_compatibility_mode": (
-        "b200_0_5_14_adapter" if sglang_base == Version("0.5.14") else "upstream_lock"
-    ),
+    "compatibility_mode": "upstream_lock",
+    "sglang_compatibility_mode": "upstream_lock",
     "local_specforge_patches": [
         "lazy_sglang_runtime_context_get_flags_for_dp_disabled_capture",
         "sglang_0_5_14_parallel_state_without_dcp_fields",

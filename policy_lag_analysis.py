@@ -276,7 +276,7 @@ def dependency_report(repo: Path) -> dict:
         ).strip()
     except Exception as exc:
         report["fastgrpo_commit_error"] = str(exc)
-    for module in ("torch", "transformers", "peft", "datasets", "specforge"):
+    for module in ("torch", "transformers", "sglang", "peft", "datasets", "specforge"):
         try:
             imported = __import__(module)
             report[module] = getattr(imported, "__version__", "installed")
@@ -406,20 +406,27 @@ def main():
 
         torch_version = str(report.get('torch', '')).split('+', 1)[0]
         transformers_version = str(report.get('transformers', '')).split('+', 1)[0]
+        sglang_version = str(report.get('sglang', '')).split('+', 1)[0]
         try:
             torch_parsed = Version(torch_version)
             transformers_parsed = Version(transformers_version)
+            sglang_parsed = Version(sglang_version)
         except Exception as exc:
             raise RuntimeError(f'cannot parse runtime dependency versions: {exc}') from exc
-        if (torch_parsed.major, torch_parsed.minor) not in {(2, 11), (2, 13)}:
+        if torch_parsed != Version('2.13.0'):
             raise RuntimeError(
-                'policy-lag EAGLE-3 supports validated torch 2.11.x or the '
-                f'upstream 2.13.x lock; found {report.get("torch")}'
+                'policy-lag EAGLE-3 requires torch 2.13.0; found '
+                f'{report.get("torch")}'
             )
-        if not (Version('5.8.0') <= transformers_parsed < Version('6.0.0')):
+        if transformers_parsed != Version('5.12.1'):
             raise RuntimeError(
-                'policy-lag EAGLE-3 requires transformers >=5.8,<6.0; found '
+                'policy-lag EAGLE-3 requires transformers 5.12.1; found '
                 f'{report.get("transformers")}'
+            )
+        if sglang_parsed != Version('0.5.18'):
+            raise RuntimeError(
+                'policy-lag EAGLE-3 requires sglang 0.5.18; found '
+                f'{report.get("sglang")}'
             )
         if report.get('specforge_commit') != SPECFORGE_COMMIT:
             raise RuntimeError(

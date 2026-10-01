@@ -33,7 +33,11 @@ from helper.fast_lk_reflex import (
     reflex_or_baseline_probabilities,
     topk_compact_candidates,
 )
-from helper.sampling import build_sampling_probs, sample_from_probs
+from helper.sampling import (
+    build_sampling_probs,
+    sample_from_probs,
+    sample_target_from_logits,
+)
 
 
 total_target_time=0
@@ -164,11 +168,12 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
                         verification_capacity=160, 
                         max_draft_token_length=5, max_draft_k=8, max_verification_num=160,
                         min_draft_token_length=3, draft_token_length_c=0.75,
-                        statistical_time=True,return_all_draft_input=False,
+                        statistical_time=False,return_all_draft_input=False,
                         max_length=2048,
                         reflex_mode="off", reflex_feature_dim=8,
                         reflex_lr=0.05, reflex_weight_decay=0.0,
                         reflex_seed=42, reflex_profile=False,
+                        reflex_diagnostics=False,
                         ):
 
     reflex_mode = str(reflex_mode).strip().lower()
@@ -474,7 +479,8 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
         return attention_mask
 
 
-    torch.cuda.synchronize()
+    if statistical_time:
+        torch.cuda.synchronize()
     start_time=time.time()
     target_past_key_values=DynamicCache()
     avg_acc_length=[0,0]
@@ -538,15 +544,14 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
         torch.cuda.synchronize()
         total_target_time+=time.time()-target_time_start
             
-    if do_sample==False:
-        target_next_token=target_logits.argmax(-1)
-    elif do_sample==True:
-        target_sampling_probs = build_sampling_probs(
-            target_logits, temperature, top_p, top_k, eos_token_id
-        )
-        target_next_token=sample_from_probs(target_sampling_probs)
-    else:
-        raise ValueError('"do_sample" must be True or False')
+    target_next_token, _ = sample_target_from_logits(
+        target_logits,
+        do_sample=do_sample,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        eos_token_id=eos_token_id,
+    )
     
     generated_sequences=target_next_token
     
@@ -648,6 +653,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
             weight_decay=reflex_weight_decay,
             seed=reflex_seed,
             profile=reflex_profile,
+            diagnostics=reflex_diagnostics,
         )
         reflex.start(
             bsz,
@@ -759,28 +765,16 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
             target_hidden_states_tree=target_outputs['target_hidden_state']
             target_outputs_logits=model.target_model.lm_head(target_hidden_states_tree)
 
-            if do_sample==False:
-                target_next_token_tree=target_outputs_logits.argmax(-1)
-                target_sampling_probs = None
-                if reflex is not None:
-                    target_sampling_probs = torch.nn.functional.one_hot(
-                        target_next_token_tree,
-                        num_classes=target_outputs_logits.shape[-1],
-                    ).to(torch.float32)
-            elif do_sample==True:
-                target_sampling_probs = build_sampling_probs(
-                    target_outputs_logits, temperature, top_p, top_k, eos_token_id
-                )
-                target_next_token_tree=sample_from_probs(target_sampling_probs)
-            else:
-                raise ValueError('"do_sample" must be True or False')
-
-            if reflex is not None:
-                # Reuse the exact normalized distribution used above for target
-                # sampling. No extra target forward or full-vocabulary softmax.
-                reflex.update_from_target_probs(
-                    target_sampling_probs[:, 0, :], compact_to_target
-                )
+            target_next_token_tree, _ = sample_target_from_logits(
+                target_outputs_logits,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                eos_token_id=eos_token_id,
+                reflex=reflex,
+                compact_to_target=compact_to_target,
+            )
         
         if statistical_time:
             torch.cuda.synchronize()
@@ -1235,7 +1229,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
     if reflex is not None:
         reflex.clear()
 
-    return {
+    result = {
         'generated_token_ids':filtered_generated_token_ids,
         'max_sequence_length':max_sequence_length,
         'total_acc_length':avg_acc_length[0],
@@ -1259,8 +1253,11 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
         'response_accepted_length_sum':response_accepted_length_sum,
         'response_verification_rounds':response_verification_rounds,
         'response_generated_tokens':[len(item) for item in filtered_generated_token_ids],
-        'reflex_alpha_sum': 0.0 if reflex_stats is None else reflex_stats.alpha_sum,
-        'reflex_loss_sum': 0.0 if reflex_stats is None else reflex_stats.loss_sum,
         'reflex_updates': 0 if reflex_stats is None else reflex_stats.updates,
-        'reflex_profile_time_ms': 0.0 if reflex_stats is None else reflex_stats.profile_time_ms,
     }
+    if reflex_stats is not None and reflex_stats.alpha_sum is not None:
+        result['reflex_alpha_sum'] = reflex_stats.alpha_sum
+        result['reflex_loss_sum'] = reflex_stats.loss_sum
+    if reflex_stats is not None and reflex_profile:
+        result['reflex_profile_time_ms'] = reflex_stats.profile_time_ms
+    return result

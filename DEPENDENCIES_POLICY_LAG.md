@@ -2,24 +2,19 @@
 
 - FastGRPO: `yedaotian9/FastGRPO@38e252493149072d2c5905f0a47de1d935d7170a`
 - SpecForge: `sgl-project/SpecForge@3cb0510f0bd0e8c195ac6e9c5c62f6b50580ff83` (`0.2.0`)
-- Python: `>=3.11` (required by the pinned SpecForge commit)
-- PyTorch: upstream pins `2.13.0`; the bundled source also contains its explicit
-  Torch 2.11 CuteDSL compatibility shim, and launch validation accepts
-  `2.11.x` or `2.13.x` without replacing the installed CUDA build.
-- Transformers: upstream pins `5.12.1`; capability validation accepts
-  `>=5.8,<6.0` for the offline B200 stack, including the installed `5.8.1`.
-- SGLang: upstream SpecForge pins `0.5.18`; the offline-capture adapter also
-  accepts the installed B200 `0.5.14` exactly. The adapter handles the missing
-  runtime flags/DCP fields and the older `ModelRunner`, `ForwardBatch`, and
-  DP-sync/request-range representations. SGLang is **not** used for FastGRPO
-  rollout or verification here.
+- Python: `3.12.x` for the reproduced environment (`>=3.11` is required by the
+  vendored SpecForge metadata).
+- PyTorch: `2.13.0` with the official CUDA 13.0 wheel.
+- Transformers: `5.12.1`.
+- SGLang: `0.5.18`. SGLang is used only for offline SpecForge feature capture,
+  not for FastGRPO rollout or verification.
 
 SpecForge source is bundled in `third_party/SpecForge`, including a
 `VENDORED_COMMIT` provenance file, so the experiment does not clone or fetch
-source code on the B200 machine. `requirements-policy-lag.txt` documents the
-Python package contract without a Git URL. CUDA framework binaries are not
-portable project source and must already exist in the B200 environment or be
-provided through a local wheelhouse. The analysis
+source code on the B200 machine. `requirements.txt` exactly pins every direct
+dependency and `requirements-policy-lag.txt` delegates to it. CUDA framework
+binaries must be provided through the offline wheelhouse described in
+`ENVIRONMENT.md`. The analysis
 code imports SpecForge EAGLE-3's `AutoDraftModel`, `OnlineEagle3Model`, feature
 layer rule, model forward, compact full-vocabulary teacher projection, and
 training-time TTT objective. It never substitutes the local legacy
@@ -31,10 +26,9 @@ intentionally fails on a mismatched stack instead of silently selecting another
 SpecForge commit or objective.
 
 The launcher imports the concrete EAGLE-3, FlexAttention, and offline SGLang
-capture APIs before allocating the target model. It writes the actual Python,
-Torch, Transformers, and SGLang versions plus local compatibility patches to
-each pretrain run's `dependencies.json`; this records deviations from the
-upstream lock instead of pretending the installed versions match it.
+capture APIs before allocating the target model and rejects versions that do
+not match the pinned stack. It writes the actual versions to each pretrain
+run's `dependencies.json`.
 
 For targets with `tie_word_embeddings=true`, the frozen SpecForge target head
 uses the checkpoint's configured embedding tensor when `lm_head.weight` is

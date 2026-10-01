@@ -9,6 +9,11 @@ MODEL_ENV="${MODEL_ENV:-$PROJECT_DIR/configs/$MODEL_KEY/b200.env}"
 source "$COMMON_ENV"
 source "$MODEL_ENV"
 : "${MODEL:?MODEL is required}"
+case "$METHOD" in
+  fastgrpo) REFLEX_MODE="off" ;;
+  specnaacl) REFLEX_MODE="active" ;;
+  *) echo "ERROR: METHOD must be fastgrpo or specnaacl, got: $METHOD" >&2; exit 2 ;;
+esac
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-$PROJECT_DIR/outputs}"
@@ -43,7 +48,7 @@ TRAIN_MODEL_ROOT="${TRAIN_MODEL_ROOT:-$OUTPUT_ROOT/train/$MODEL_KEY}"
 REQUESTED_RUN_DIR="${RUN_DIR:-}"
 timestamp="$(date -u +%Y%m%dT%H%M%S)"
 short_uuid="$($PYTHON_BIN -c 'import uuid; print(uuid.uuid4().hex[:8])')"
-RUN_NAME="${RUN_NAME:-${MODEL_KEY}__${DATASET}__reflex-${REFLEX_MODE}__seed${TRAIN_SUBSET_SEED}__${timestamp}__${short_uuid}}"
+RUN_NAME="${RUN_NAME:-${MODEL_KEY}__${DATASET}__method-${METHOD}__seed${TRAIN_SUBSET_SEED}__${timestamp}__${short_uuid}}"
 RUN_DIR="${RUN_DIR:-$TRAIN_MODEL_ROOT/$RUN_NAME}"
 if [[ "$RESUME" == "auto" && -z "$REQUESTED_RUN_DIR" && -e "$TRAIN_MODEL_ROOT/active_run" ]]; then
   active_run="$(readlink -f "$TRAIN_MODEL_ROOT/active_run")"
@@ -67,6 +72,7 @@ fi
 cmd=(
   "$PYTHON_BIN" -m torch.distributed.run --standalone "--nproc_per_node=$NPROC_PER_NODE"
   "$PROJECT_DIR/grpo_speculative.py"
+  --method "$METHOD"
   --model_dir "$MODEL"
   --adapter_path "$DRAFT_CHECKPOINT"
   --draft_backend eagle3
@@ -118,6 +124,7 @@ cmd=(
   --reflex_seed "$REFLEX_SEED"
   --reflex_update_scope root
   --reflex_profile "$REFLEX_PROFILE"
+  --reflex_diagnostics "$REFLEX_DIAGNOSTICS"
   --log_interval "$LOG_INTERVAL"
   --log_file "$LOG_DIR/metrics.jsonl"
   --timing_file "$LOG_DIR/timing.csv"
@@ -133,8 +140,8 @@ cmd=(
 )
 if (($#)); then cmd+=("$@"); fi
 
-printf 'Run name : %s\nRun dir  : %s\nModel    : %s\nDataset  : %s\nDraft    : %s\nReflex   : %s\nGPUs     : %s\n' \
-  "$RUN_NAME" "$RUN_DIR" "$MODEL" "$DATASET_PATH" "$DRAFT_CHECKPOINT" "$REFLEX_MODE" "$NPROC_PER_NODE"
+printf 'Run name : %s\nRun dir  : %s\nModel    : %s\nDataset  : %s\nDraft    : %s\nMethod   : %s\nReflex   : %s\nGPUs     : %s\n' \
+  "$RUN_NAME" "$RUN_DIR" "$MODEL" "$DATASET_PATH" "$DRAFT_CHECKPOINT" "$METHOD" "$REFLEX_MODE" "$NPROC_PER_NODE"
 printf 'Command  :'; printf ' %q' "${cmd[@]}"; printf '\n'
 if [[ "${DRY_RUN:-false}" == "true" ]]; then return 0 2>/dev/null || exit 0; fi
 
@@ -149,6 +156,10 @@ if [[ -n "$RESUME_CHECKPOINT" && ! -f "$RESUME_CHECKPOINT" ]]; then
   echo "ERROR: resume checkpoint not found: $RESUME_CHECKPOINT" >&2; exit 2
 fi
 
+export PYTHONPATH="$PROJECT_DIR:$PROJECT_DIR/third_party/SpecForge${PYTHONPATH:+:$PYTHONPATH}"
+"$PYTHON_BIN" "$PROJECT_DIR/scripts/validate_environment.py" \
+  --requirements "$PROJECT_DIR/requirements.txt" --require-cuda
+
 mkdir -p "$LOG_DIR" "$CHECKPOINT_DIR" "$RUN_DIR/statistics"
 mkdir -p "$TRAIN_MODEL_ROOT"
 ln -sfn "$RUN_DIR" "$TRAIN_MODEL_ROOT/active_run"
@@ -161,11 +172,11 @@ ln -sfn "$RUN_DIR" "$TRAIN_MODEL_ROOT/active_run"
   --item "responses_per_prompt=$RESPONSES_PER_PROMPT" --item "temperature=$TEMPERATURE" \
   --item "top_p=$TOP_P" --item "max_length=$GEN_MAX_LENGTH" \
   --item "max_prompt_length=$MAX_PROMPT_LENGTH" --item "num_epochs=$NUM_EPOCHS" \
-  --item "resume_checkpoint=$RESUME_CHECKPOINT" --item "reflex_mode=$REFLEX_MODE" \
+  --item "resume_checkpoint=$RESUME_CHECKPOINT" --item "method=$METHOD" \
+  --item "reflex_mode=$REFLEX_MODE" --item "reflex_diagnostics=$REFLEX_DIAGNOSTICS" \
   --item "reflex_feature_dim=$REFLEX_FEATURE_DIM" --item "reflex_lr=$REFLEX_LR" \
   --item "reflex_weight_decay=$REFLEX_WEIGHT_DECAY" --item "nproc_per_node=$NPROC_PER_NODE"
 
-export PYTHONPATH="$PROJECT_DIR:$PROJECT_DIR/third_party/SpecForge${PYTHONPATH:+:$PYTHONPATH}"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 env CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" "${cmd[@]}" 2>&1 | tee -a "$LOG_DIR/console.log"

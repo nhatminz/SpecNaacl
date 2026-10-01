@@ -39,8 +39,9 @@ run directory can be passed through `RESUME=/path/to/run`.
 The matching `train_<model>.sh` wrappers expose `MODEL`, `DATASET`,
 `DRAFT_CHECKPOINT`, `TARGET_LR`, `DRAFT_LR`, `BATCH_SIZE`,
 `ACCUMULATION_STEPS`, `GEN_MAX_LENGTH`, `MAX_PROMPT_LENGTH`, `NUM_EPOCHS`,
-`NPROC_PER_NODE`, `REFLEX_MODE`, `REFLEX_FEATURE_DIM`, `REFLEX_LR`, and
-`REFLEX_WEIGHT_DECAY`. `DATASET` accepts `gsm8k`, `simplelr`, or `dapo`.
+`NPROC_PER_NODE`, `METHOD`, `REFLEX_FEATURE_DIM`, `REFLEX_LR`, and
+`REFLEX_WEIGHT_DECAY`. `METHOD=fastgrpo` disables Reflex and
+`METHOD=specnaacl` enables it; `DATASET` accepts `gsm8k`, `simplelr`, or `dapo`.
 
 If `DRAFT_CHECKPOINT`, `DRAFT_CONFIG`, and `VOCAB_MAPPING` are omitted, the
 launcher uses the matching model's `outputs/pretrain/<model>/latest_*` links.
@@ -68,7 +69,7 @@ outputs/pretrain/<model>/<unique_run>/
 outputs/train/<model>/<unique_run>/
 ```
 
-Run names include model, dataset, Reflex mode, seed, UTC timestamp and an
+Run names include model, dataset, method, seed, UTC timestamp and an
 8-character UUID. Each run has `checkpoints/`, `logs/`,
 `config_resolved.yaml`, `summary.json`, and `summary.txt`. Training logs are
 `logs/metrics.jsonl` and `logs/timing.csv`; detailed CUDA synchronization remains

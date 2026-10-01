@@ -31,7 +31,7 @@ outputs/pretrain/qwen25_3b/latest_vocab_mapping.pt
 Run đầy đủ nằm trong
 `outputs/pretrain/qwen25_3b/<run_name>/`; terminal cũng in chính xác `Run dir`.
 
-## 2. Train FastGRPO + Reflex active bằng DAPO
+## 2. Benchmark FastGRPO và SpecNaacl công bằng bằng DAPO
 
 Launcher tự lấy draft mới nhất ở bước 1:
 
@@ -39,7 +39,6 @@ Launcher tự lấy draft mới nhất ở bước 1:
 MODEL=/workspace/storage-shared/models/Qwen2.5-3B-Instruct \
 DATASET=dapo \
 DATASET_PATH=/workspace/storage-shared/nlp/minhpn19/data/DAPO-Math-17k-Processed/en/train-00000-of-00001.parquet \
-REFLEX_MODE=active \
 REFLEX_FEATURE_DIM=8 \
 REFLEX_LR=0.05 \
 REFLEX_WEIGHT_DECAY=0.0 \
@@ -52,13 +51,31 @@ MAX_PROMPT_LENGTH=2048 \
 NUM_EPOCHS=1 \
 NPROC_PER_NODE=1 \
 CUDA_VISIBLE_DEVICES=0 \
-bash train_qwen25_3b.sh
+bash scripts/run_specnaacl.sh
 ```
 
-Để chạy baseline công bằng, giữ nguyên mọi biến và đổi duy nhất:
+Baseline công bằng dùng chính runtime trên, cùng compact EAGLE proposal,
+sampling, verifier, checkpoint và logging; launcher chỉ đổi `METHOD` để tắt
+Reflex:
 
 ```bash
-REFLEX_MODE=off bash train_qwen25_3b.sh
+MODEL=/workspace/storage-shared/models/Qwen2.5-3B-Instruct \
+MODEL_KEY=qwen25_3b \
+DATASET=dapo \
+DATASET_PATH=/workspace/storage-shared/nlp/minhpn19/data/DAPO-Math-17k-Processed/en/train-00000-of-00001.parquet \
+REFLEX_FEATURE_DIM=8 \
+REFLEX_LR=0.05 \
+REFLEX_WEIGHT_DECAY=0.0 \
+TARGET_LR=1e-6 \
+DRAFT_LR=1e-6 \
+BATCH_SIZE=8 \
+ACCUMULATION_STEPS=4 \
+GEN_MAX_LENGTH=2048 \
+MAX_PROMPT_LENGTH=2048 \
+NUM_EPOCHS=1 \
+NPROC_PER_NODE=1 \
+CUDA_VISIBLE_DEVICES=0 \
+bash scripts/run_fastgrpo_fair.sh
 ```
 
 Muốn chỉ rõ draft thay vì dùng link mới nhất:
@@ -67,7 +84,7 @@ Muốn chỉ rõ draft thay vì dùng link mới nhất:
 DRAFT_CHECKPOINT=/absolute/pretrain/run/checkpoints/<run>-latest \
 DRAFT_CONFIG=/absolute/pretrain/run/config/eagle3.json \
 VOCAB_MAPPING=/absolute/pretrain/run/features/vocab_mapping/vocab_mapping.pt \
-REFLEX_MODE=active bash train_qwen25_3b.sh
+METHOD=specnaacl bash train_qwen25_3b.sh
 ```
 
 Resume run train cũ:

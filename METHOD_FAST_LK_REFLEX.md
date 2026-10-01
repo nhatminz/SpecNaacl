@@ -21,9 +21,11 @@ exactly proposal-equivalent to OFF mode.
 After each target verification, only the root proposal is updated. The target
 token is sampled from `build_sampling_probs`, which applies the configured
 temperature, top-p and top-k and returns the final normalized sampling
-distribution. Reflex reuses that same tensor; it adds neither a target forward
-nor a separate full-vocabulary softmax. The fixed compact-vocabulary entries
-are gathered and conditioned before computing:
+distribution. For stochastic decoding Reflex reuses that same tensor. For
+greedy decoding it constructs the mathematically equivalent one-hot directly
+in compact-vocabulary space. It adds neither a target forward nor a separate
+full-vocabulary softmax/one-hot. The fixed compact-vocabulary entries are
+gathered and conditioned before computing:
 
 ```text
 alpha = sum_i min(p_i, q_i)
@@ -51,11 +53,15 @@ The logged AAL keeps FastGRPO's weighted definition:
 length includes the verified root/target bonus token; draft acceptance rate is
 accepted draft tokens divided by proposed draft tokens.
 
-The fast update uses an in-place batched `baddbmm`; with zero weight decay it
-does not launch a separate multiply-by-one over A. Finished trajectories are
-collected and compacted in one indexed operation per verification round.
+The correction uses fused `baddbmm(compact_logits, psi, A^T)`, and the fast
+update uses an in-place batched `baddbmm`; with zero weight decay it does not
+launch a separate multiply-by-one over A. The fixed random projection is cached
+per device/shape/seed across rollouts. Finished trajectories are collected and
+compacted in one indexed operation per verification round.
 
-The default path does not profile Reflex or log speculative rounds. Setting
-`REFLEX_PROFILE=1` adds explicit synchronization around Reflex tensor work and
-reports aggregate `reflex_profile_time_ms`; it is intended only for dedicated
-profiling runs and does not change the algorithm.
+The default path neither profiles Reflex nor computes diagnostic LK loss.
+`REFLEX_DIAGNOSTICS=1` enables rollout-aggregate LK alpha/loss only;
+`REFLEX_PROFILE=1` measures aggregate host dispatch time without synchronizing
+CUDA in the Reflex hot path and reports `reflex_profile_time_ms`. Both switches
+are intended only for dedicated diagnostic runs and neither emits
+per-token/per-round disk logs.

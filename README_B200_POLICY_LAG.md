@@ -40,17 +40,11 @@ PYTHON_BIN="$(command -v python)" \
 bash run_b200_policy_lag_pipeline.sh
 ```
 
-The launcher keeps an installed CUDA Torch `2.11.x` build. It does not ask pip
-to replace it with the upstream `2.13.0` lock. Before loading the model it
+Install the exact Python 3.12 / Torch 2.13.0 CUDA 13.0 / Transformers 5.12.1 /
+SGLang 0.5.18 stack from `ENVIRONMENT.md`. Before loading the model the launcher
 checks the concrete EAGLE-3, FlexAttention, and SGLang capture APIs and records
-the actual versions in `<run-directory>/dependencies.json`.
-
-The vendored backend includes narrow compatibility shims for the installed
-SGLang 0.5.14: it does not require `runtime_context.get_flags` or the newer
-`ParallelState.attn_dcp_*` fields on the default DP/DCP-disabled capture path.
-DP/DCP modes are not silently emulated: requesting an unsupported mode produces
-an explicit error. The `flash_attn is not found` message is only a warning;
-SpecForge then uses the supported PyTorch FlexAttention backend.
+the actual versions in `<run-directory>/dependencies.json`. A missing optional
+`flash_attn` v2 import is a warning; SpecForge then uses PyTorch FlexAttention.
 
 For Qwen2.5-7B-Instruct, only change the path:
 

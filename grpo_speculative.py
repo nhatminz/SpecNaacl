@@ -18,6 +18,7 @@ from helper.get_QAs import get_test_QAs , get_train_QAs, get_QAs_from_path, sele
 from helper.specualtive_generate import speculative_generate
 from helper.eagle3_specforge import Eagle3FastGRPOAdapter
 from helper.checkpointing import capture_rng_state, restore_rng_state
+from helper.method_config import resolve_method
 from policy_lag_analysis import (
     BranchSummary,
     bootstrap_delta_by_prompt,
@@ -270,13 +271,15 @@ parser.add_argument('--eagle_ttt_length', type=int, default=7)
 parser.add_argument('--eagle_lk_loss_type', type=str, default='', choices=['', 'lambda', 'alpha', 'tv'])
 parser.add_argument('--eagle_kl_scale', type=float, default=1.0)
 parser.add_argument('--eagle_kl_decay', type=float, default=1.0)
-parser.add_argument('--reflex_mode', type=str, default='off', choices=['off', 'active'])
+parser.add_argument('--method', type=str, default='fastgrpo', choices=['fastgrpo', 'specnaacl'])
+parser.add_argument('--reflex_mode', type=str, default='', choices=['', 'off', 'active'])
 parser.add_argument('--reflex_feature_dim', type=int, default=8)
 parser.add_argument('--reflex_lr', type=float, default=0.05)
 parser.add_argument('--reflex_weight_decay', type=float, default=0.0)
 parser.add_argument('--reflex_seed', type=int, default=42)
 parser.add_argument('--reflex_update_scope', type=str, default='root', choices=['root'])
 parser.add_argument('--reflex_profile', default='0')
+parser.add_argument('--reflex_diagnostics', default='0')
 parser.add_argument('--dtype', type=str, default='auto', choices=['auto', 'bf16', 'fp16', 'fp32'])
 parser.add_argument('--attn_implementation', type=str, default='')
 parser.add_argument('--temperature',type=float,default=1.0)
@@ -366,6 +369,13 @@ parser.add_argument('--analysis_draft_update_steps', type=int, default=1)
 parser.add_argument('--analysis_bootstrap_samples', type=int, default=2000)
 parser.add_argument('--analysis_resume', default='true')
 args = parser.parse_args()
+method, method_reflex_mode = resolve_method(args.method)
+if args.reflex_mode and args.reflex_mode != method_reflex_mode:
+    raise ValueError(
+        f"--method={method} requires --reflex_mode={method_reflex_mode}; "
+        "the fair benchmark permits no independent Reflex toggle"
+    )
+args.reflex_mode = method_reflex_mode
 world_size = int(os.environ.get('WORLD_SIZE', '1'))
 local_rank = int(os.environ.get('LOCAL_RANK', '0'))
 if world_size > 1:
@@ -386,7 +396,10 @@ def _sync_gradients(module):
             parameter.grad.div_(world_size)
 
 
-def _aggregate_job_metrics(data, device, cumulative_elapsed_time_s):
+def _aggregate_job_metrics(
+    data, device, cumulative_elapsed_time_s, *, include_reflex_diagnostics=False,
+    include_reflex_profile=False,
+):
     """Aggregate cumulative counters only at log/final boundaries."""
     sum_names = (
         'total_rollout_tokens', 'total_acc_length', 'total_decoded_token_num',
@@ -394,14 +407,18 @@ def _aggregate_job_metrics(data, device, cumulative_elapsed_time_s):
         'reward_sum', 'reward_count', 'target_loss_sum', 'target_loss_count',
         'draft_loss1_sum', 'draft_loss2_sum', 'draft_loss_count',
         'draft_sparse_tv_sum', 'draft_sparse_kl_sum', 'draft_sparse_count',
-        'reflex_alpha_sum', 'reflex_loss_sum', 'reflex_updates',
+        'reflex_updates',
         'trace_rollout_count', 'used_items', 'ignore_due_correct', 'ignore_due_incorrect',
     )
+    if include_reflex_diagnostics:
+        sum_names += ('reflex_alpha_sum', 'reflex_loss_sum')
     max_names = (
         'generate_time_cost', 'train_time_cost', 'draft_train_time_cost',
         'prefill_time_cost', 'target_time_cost', 'draft_time_cost',
-        'check_time_cost', 'reflex_profile_time_ms',
+        'check_time_cost',
     )
+    if include_reflex_profile:
+        max_names += ('reflex_profile_time_ms',)
     sums = torch.tensor(
         [float(data.get(name, 0.0)) for name in sum_names],
         device=device, dtype=torch.float64,
@@ -505,6 +522,7 @@ reflex_kwargs = {
     "reflex_weight_decay": float(args.reflex_weight_decay),
     "reflex_seed": int(args.reflex_seed),
     "reflex_profile": _as_bool(args.reflex_profile),
+    "reflex_diagnostics": _as_bool(args.reflex_diagnostics),
 }
 reset_rng_on_resume = _as_bool(args.reset_rng_on_resume)
 _seed_everything(trace_seed)
@@ -594,8 +612,10 @@ print(f"B200/spec: dtype={args.dtype}, attn_impl={attn_impl or 'default'}, "
       f"max_draft_len={max_draft_token_length}, max_draft_k={max_draft_k}, "
       f"statistical_time={statistical_time}")
 print(f"Draft: train={is_train_draft}")
-print(f"Reflex: mode={args.reflex_mode}, scope=root, dim={args.reflex_feature_dim}, "
-      f"lr={args.reflex_lr}, wd={args.reflex_weight_decay}, profile={_as_bool(args.reflex_profile)}")
+print(f"Method: {method} | Reflex: mode={args.reflex_mode}, scope=root, "
+      f"dim={args.reflex_feature_dim}, lr={args.reflex_lr}, "
+      f"wd={args.reflex_weight_decay}, profile={_as_bool(args.reflex_profile)}, "
+      f"diagnostics={_as_bool(args.reflex_diagnostics)}")
 print(f"Trace: max_new_grpo_steps={max_grpo_steps}, drift_topk={drift_topk}, "
       f"drift_temperature={drift_temperature}, drift_row_chunk={drift_row_chunk_size}")
 print(f"FastGRPO ablation: enabled={fastgrpo_ablation}, draft_lr_multiplier={draft_lr_multiplier}")
@@ -1339,6 +1359,10 @@ effective_draft_lrs = [float(group['lr']) for group in optimizer_draft.param_gro
 run_config_log = {
     "phase": "run_config",
     "run_name": version_name,
+    "method": method,
+    "reflex_mode": args.reflex_mode,
+    "reflex_profile": _as_bool(args.reflex_profile),
+    "reflex_diagnostics": _as_bool(args.reflex_diagnostics),
     "resume_checkpoint": str(resume_checkpoint),
     "append_log": bool(append_log),
     "source_grpo_step": int(trace_start_step),
@@ -1734,8 +1758,10 @@ for epoch in epoch_bar:
         batch_data['total_decoded_token_num']+=outputs['total_decoded_token_num']
         batch_data['total_accepted_draft_tokens']+=accepted_draft_tokens
         batch_data['total_proposed_draft_tokens']+=proposed_draft_tokens
-        batch_data['reflex_alpha_sum'] += float(outputs.get('reflex_alpha_sum', 0.0))
-        batch_data['reflex_loss_sum'] += float(outputs.get('reflex_loss_sum', 0.0))
+        if outputs.get('reflex_alpha_sum') is not None:
+            batch_data['reflex_alpha_sum'] += float(outputs['reflex_alpha_sum'])
+        if outputs.get('reflex_loss_sum') is not None:
+            batch_data['reflex_loss_sum'] += float(outputs['reflex_loss_sum'])
         batch_data['reflex_updates'] += int(outputs.get('reflex_updates', 0))
         batch_data['reflex_profile_time_ms'] += float(outputs.get('reflex_profile_time_ms', 0.0))
         batch_data['generate_length']+=generate_length
@@ -2217,17 +2243,9 @@ for epoch in epoch_bar:
                 "draft_updates_cumulative": int(draft_step - trace_start_draft_step),
                 "draft_lr_multiplier": float(draft_lr_multiplier),
                 "fastgrpo_ablation": bool(fastgrpo_ablation),
+                "method": method,
                 "reflex_mode": args.reflex_mode,
                 "reflex_updates": int(batch_data['reflex_updates']),
-                "reflex_alpha": (
-                    float(batch_data['reflex_alpha_sum']) / max(int(batch_data['reflex_updates']), 1)
-                ),
-                "reflex_lk_loss": (
-                    float(batch_data['reflex_loss_sum']) / max(int(batch_data['reflex_updates']), 1)
-                ),
-                "reflex_profile_time_ms": (
-                    float(batch_data['reflex_profile_time_ms']) if _as_bool(args.reflex_profile) else None
-                ),
                 
                 "draft_train_time_cost":round(batch_data['draft_train_time_cost']/60,3) if is_train_draft else 0, 
                 f"last_{sample_num}_draft_loss1":round(sum(batch_data['last_draft_loss1'][-real_sample_num:])/len(batch_data['last_draft_loss1'][-real_sample_num:]),4) if is_train_draft and draft_step > 0 else 0,
@@ -2240,7 +2258,9 @@ for epoch in epoch_bar:
             if should_log_metrics:
                 wall_elapsed = _cumulative_wall_time()
                 global_metrics = _aggregate_job_metrics(
-                    batch_data, model.target_model.device, wall_elapsed
+                    batch_data, model.target_model.device, wall_elapsed,
+                    include_reflex_diagnostics=_as_bool(args.reflex_diagnostics),
+                    include_reflex_profile=_as_bool(args.reflex_profile),
                 )
                 wall_elapsed = global_metrics['cumulative_elapsed_time_s']
                 avg_logs.update({
@@ -2265,14 +2285,23 @@ for epoch in epoch_bar:
                     "draft_loss1": float(global_metrics['draft_loss1']),
                     "draft_loss2": float(global_metrics['draft_loss2']),
                     "reflex_updates": int(global_metrics['reflex_updates']),
-                    "reflex_alpha": global_metrics['reflex_alpha_sum'] / max(global_metrics['reflex_updates'], 1.0),
-                    "reflex_lk_loss": global_metrics['reflex_loss_sum'] / max(global_metrics['reflex_updates'], 1.0),
-                    "reflex_profile_time_ms": (
-                        float(global_metrics['reflex_profile_time_ms'])
-                        if _as_bool(args.reflex_profile) else None
-                    ),
                     "tokens_per_s": float(global_metrics['tokens_per_s']),
                 })
+                if _as_bool(args.reflex_diagnostics):
+                    avg_logs.update({
+                        "reflex_alpha": (
+                            global_metrics['reflex_alpha_sum'] /
+                            max(global_metrics['reflex_updates'], 1.0)
+                        ),
+                        "reflex_lk_loss": (
+                            global_metrics['reflex_loss_sum'] /
+                            max(global_metrics['reflex_updates'], 1.0)
+                        ),
+                    })
+                if _as_bool(args.reflex_profile):
+                    avg_logs["reflex_profile_time_ms"] = float(
+                        global_metrics['reflex_profile_time_ms']
+                    )
                 if is_main_process:
                     with open(log_file, 'a', encoding='utf-8') as f:
                         f.write(json.dumps(avg_logs) + '\n')
@@ -2392,7 +2421,9 @@ if checkpoint_dir and not stop_requested:
 total_wall_time = _cumulative_wall_time()
 batch_data['used_items'] = int(used_items)
 final_metrics = _aggregate_job_metrics(
-    batch_data, model.target_model.device, total_wall_time
+    batch_data, model.target_model.device, total_wall_time,
+    include_reflex_diagnostics=_as_bool(args.reflex_diagnostics),
+    include_reflex_profile=_as_bool(args.reflex_profile),
 )
 total_wall_time = final_metrics['cumulative_elapsed_time_s']
 final_average_accept_length = final_metrics['average_accept_length']
@@ -2414,16 +2445,13 @@ summary = {
     "draft_lr_multiplier": float(draft_lr_multiplier),
     "effective_draft_lrs": effective_draft_lrs,
     "fastgrpo_ablation": bool(fastgrpo_ablation),
+    "method": method,
     "reflex_mode": args.reflex_mode,
     "reflex_feature_dim": int(args.reflex_feature_dim),
     "reflex_lr": float(args.reflex_lr),
     "reflex_weight_decay": float(args.reflex_weight_decay),
+    "reflex_diagnostics": _as_bool(args.reflex_diagnostics),
     "reflex_updates": int(final_metrics['reflex_updates']),
-    "reflex_alpha": float(final_metrics['reflex_alpha_sum']) / max(int(final_metrics['reflex_updates']), 1),
-    "reflex_lk_loss": float(final_metrics['reflex_loss_sum']) / max(int(final_metrics['reflex_updates']), 1),
-    "reflex_profile_time_ms": (
-        float(final_metrics['reflex_profile_time_ms']) if _as_bool(args.reflex_profile) else None
-    ),
     "train_dataset_full_size": int(full_train_samples),
     "train_dataset_selected_size": int(selected_train_samples),
     "dataset_path": str(args.dataset_path),
@@ -2464,6 +2492,19 @@ summary = {
     "saved_statistics_dir": str(saved_statistics_dir),
     "checkpoint_dir": str(checkpoint_dir),
 }
+if _as_bool(args.reflex_diagnostics):
+    summary.update({
+        "reflex_alpha": (
+            float(final_metrics['reflex_alpha_sum']) /
+            max(int(final_metrics['reflex_updates']), 1)
+        ),
+        "reflex_lk_loss": (
+            float(final_metrics['reflex_loss_sum']) /
+            max(int(final_metrics['reflex_updates']), 1)
+        ),
+    })
+if _as_bool(args.reflex_profile):
+    summary["reflex_profile_time_ms"] = float(final_metrics['reflex_profile_time_ms'])
 summary_text = json.dumps(summary, indent=2, ensure_ascii=True)
 if is_main_process:
     with open(summary_file, "w", encoding="utf-8") as f:

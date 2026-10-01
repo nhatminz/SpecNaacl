@@ -15,6 +15,31 @@ import torch
 import torch.nn.functional as F
 
 
+_PROJECTION_CACHE: dict[tuple[str, int, int, int], torch.Tensor] = {}
+
+
+def lk_alpha_and_logit_gradient_without_loss(
+    q: torch.Tensor,
+    p: torch.Tensor,
+    eps: float = 1.0e-8,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the alpha and analytic gradient required by the update."""
+    if q.shape != p.shape:
+        raise ValueError(f"p/q shape mismatch: p={tuple(p.shape)}, q={tuple(q.shape)}")
+    q32 = q.float()
+    p32 = p.float()
+    alpha = torch.minimum(p32, q32).sum(dim=-1)
+    mask = (q32 < p32).to(q32.dtype)
+    selected_mass = (mask * q32).sum(dim=-1, keepdim=True)
+    gradient = q32 * (selected_mass - mask) / (alpha.unsqueeze(-1) + float(eps))
+    return alpha, gradient
+
+
+def lk_diagnostic_loss(alpha: torch.Tensor, eps: float) -> torch.Tensor:
+    """Compute the optional LK scalar used only when diagnostics are enabled."""
+    return -(alpha + float(eps)).log()
+
+
 def lk_alpha_and_logit_gradient(
     q: torch.Tensor,
     p: torch.Tensor,
@@ -26,22 +51,15 @@ def lk_alpha_and_logit_gradient(
     the same vocabulary.  All reductions are batched over the last dimension.
     At the non-differentiable equality point we consistently choose ``m=0``.
     """
-    if q.shape != p.shape:
-        raise ValueError(f"p/q shape mismatch: p={tuple(p.shape)}, q={tuple(q.shape)}")
-    q32 = q.float()
-    p32 = p.float()
-    alpha = torch.minimum(p32, q32).sum(dim=-1)
-    mask = (q32 < p32).to(q32.dtype)
-    selected_mass = (mask * q32).sum(dim=-1, keepdim=True)
-    gradient = q32 * (selected_mass - mask) / (alpha.unsqueeze(-1) + float(eps))
-    loss = -(alpha + float(eps)).log()
+    alpha, gradient = lk_alpha_and_logit_gradient_without_loss(q, p, eps)
+    loss = lk_diagnostic_loss(alpha, eps)
     return alpha, loss, gradient
 
 
 @dataclass(frozen=True)
 class ReflexStats:
-    alpha_sum: float
-    loss_sum: float
+    alpha_sum: Optional[float]
+    loss_sum: Optional[float]
     updates: int
     profile_time_ms: float = 0.0
 
@@ -61,6 +79,7 @@ class FastLKReflex:
         seed: int = 42,
         eps: float = 1.0e-8,
         profile: bool = False,
+        diagnostics: bool = False,
     ) -> None:
         if feature_dim <= 0:
             raise ValueError("feature_dim must be positive")
@@ -72,6 +91,7 @@ class FastLKReflex:
         self.seed = int(seed)
         self.eps = float(eps)
         self.profile = bool(profile)
+        self.diagnostics = bool(diagnostics)
         self.projection: Optional[torch.Tensor] = None
         self.state: Optional[torch.Tensor] = None
         self._root_q: Optional[torch.Tensor] = None
@@ -84,15 +104,11 @@ class FastLKReflex:
     def _profile_start(self):
         if not self.profile:
             return None
-        if self.state is not None and self.state.is_cuda:
-            torch.cuda.synchronize(self.state.device)
         return time.perf_counter()
 
     def _profile_end(self, started) -> None:
         if started is None:
             return
-        if self.state is not None and self.state.is_cuda:
-            torch.cuda.synchronize(self.state.device)
         self._profile_time_s += time.perf_counter() - started
 
     @property
@@ -112,16 +128,20 @@ class FastLKReflex:
         device = torch.device(device)
         # Initialization is outside the per-round hot path. A device-local
         # generator makes R reproducible without copying it from CPU.
-        generator = torch.Generator(device=device)
-        generator.manual_seed(self.seed)
-        projection = torch.randn(
-            (hidden_size, self.feature_dim),
-            generator=generator,
-            device=device,
-            dtype=torch.float32,
-        )
-        projection.mul_(hidden_size ** -0.5)
-        projection.requires_grad_(False)
+        cache_key = (str(device), hidden_size, self.feature_dim, self.seed)
+        projection = _PROJECTION_CACHE.get(cache_key)
+        if projection is None:
+            generator = torch.Generator(device=device)
+            generator.manual_seed(self.seed)
+            projection = torch.randn(
+                (hidden_size, self.feature_dim),
+                generator=generator,
+                device=device,
+                dtype=torch.float32,
+            )
+            projection.mul_(hidden_size ** -0.5)
+            projection.requires_grad_(False)
+            _PROJECTION_CACHE[cache_key] = projection
         self.projection = projection
         self.state = torch.zeros(
             (num_trajectories, compact_vocab_size, self.feature_dim),
@@ -131,8 +151,14 @@ class FastLKReflex:
         )
         self._root_q = None
         self._root_psi = None
-        self._alpha_sum = torch.zeros((), device=device, dtype=torch.float32)
-        self._loss_sum = torch.zeros((), device=device, dtype=torch.float32)
+        self._alpha_sum = (
+            torch.zeros((), device=device, dtype=torch.float32)
+            if self.diagnostics else None
+        )
+        self._loss_sum = (
+            torch.zeros((), device=device, dtype=torch.float32)
+            if self.diagnostics else None
+        )
         self._updates = 0
 
     def _feature(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -155,8 +181,9 @@ class FastLKReflex:
         if compact_logits.shape[0] != self.state.shape[0]:
             raise ValueError("Reflex state is not aligned with the active batch")
         psi = self._feature(native_hidden)
-        correction = torch.einsum("bvd,bsd->bsv", self.state, psi)
-        corrected = compact_logits.float() + correction
+        corrected = torch.baddbmm(
+            compact_logits.float(), psi, self.state.transpose(1, 2)
+        )
         probabilities = corrected.softmax(dim=-1)
         if cache_root:
             if corrected.shape[1] != 1:
@@ -171,9 +198,8 @@ class FastLKReflex:
         self,
         target_root_probs: torch.Tensor,
         compact_to_target: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Perform one root-only analytic LK update using verification logits."""
-        started = self._profile_start()
         if self.state is None or self._root_q is None or self._root_psi is None:
             raise RuntimeError("root q/psi were not cached before the Reflex update")
         mapping = compact_to_target.to(device=target_root_probs.device, dtype=torch.long)
@@ -181,7 +207,36 @@ class FastLKReflex:
         # distribution on tokens controllable by the EAGLE compact head.
         p = target_root_probs.float().index_select(-1, mapping)
         p = p / (p.sum(dim=-1, keepdim=True) + self.eps)
-        alpha, loss, gradient = lk_alpha_and_logit_gradient(self._root_q, p, self.eps)
+        return self._update_from_compact_probs(p)
+
+    @torch.no_grad()
+    def update_from_target_tokens(
+        self,
+        target_root_tokens: torch.Tensor,
+        compact_to_target: torch.Tensor,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Apply greedy one-hot supervision without a full-vocabulary tensor."""
+        if self.state is None or self._root_q is None or self._root_psi is None:
+            raise RuntimeError("root q/psi were not cached before the Reflex update")
+        mapping = compact_to_target.to(
+            device=target_root_tokens.device, dtype=torch.long
+        )
+        p = target_root_tokens.to(torch.long).unsqueeze(-1).eq(mapping.unsqueeze(0))
+        p = p.to(torch.float32)
+        p = p / (p.sum(dim=-1, keepdim=True) + self.eps)
+        return self._update_from_compact_probs(p)
+
+    def _update_from_compact_probs(
+        self,
+        compact_target_probs: torch.Tensor,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Shared in-place update after compact target supervision is formed."""
+        started = self._profile_start()
+        p = compact_target_probs
+        alpha, gradient = lk_alpha_and_logit_gradient_without_loss(
+            self._root_q, p, self.eps
+        )
+        loss = lk_diagnostic_loss(alpha, self.eps) if self.diagnostics else None
         decay = 1.0 - self.learning_rate * self.weight_decay
         # baddbmm_ applies decay and the batched rank-one update without
         # materializing a [batch, vocabulary, feature] outer-product temporary.
@@ -191,8 +246,9 @@ class FastLKReflex:
             beta=decay,
             alpha=-self.learning_rate,
         )
-        self._alpha_sum.add_(alpha.sum())
-        self._loss_sum.add_(loss.sum())
+        if self.diagnostics:
+            self._alpha_sum.add_(alpha.sum())
+            self._loss_sum.add_(loss.sum())
         self._updates += int(alpha.shape[0])
         self._root_q = None
         self._root_psi = None
@@ -221,6 +277,11 @@ class FastLKReflex:
 
     def finish(self) -> ReflexStats:
         """Materialize aggregate scalars once, at rollout completion."""
+        if not self.diagnostics:
+            return ReflexStats(
+                alpha_sum=None, loss_sum=None, updates=int(self._updates),
+                profile_time_ms=self._profile_time_s * 1000.0,
+            )
         if self._updates == 0 or self._alpha_sum is None or self._loss_sum is None:
             return ReflexStats(
                 alpha_sum=0.0, loss_sum=0.0, updates=0,
