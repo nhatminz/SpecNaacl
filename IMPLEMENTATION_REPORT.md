@@ -51,8 +51,8 @@ compact greedy supervision against the full-vocabulary one-hot reference.
 ## Dependency environment
 
 `requirements.txt` contains exact direct pins only and no Python standard
-library modules. The supported Python versions are 3.12.12 and 3.12.13 (the
-default for new environments). The anchored library stack is PyTorch 2.13.0,
+library modules. The interpreter gate is Python >=3.12.0; `.python-version`
+prefers the 3.12 series without locking a patch release. The anchored library stack is PyTorch 2.13.0,
 Transformers 5.12.1, and SGLang 0.5.18. SpecForge is installed without dependency
 resolution:
 
@@ -344,3 +344,49 @@ No full pretrain, CUDA probe or B200 throughput benchmark has been run for this
 fix, and no speedup is claimed. The server's standard FA package remains absent
 or incompatible until the user installs a compatible build; the recovery above
 does not claim to repair that external package.
+
+## Minimum Python version instead of patch allowlist (2026-10-02)
+
+The only project-wide exact interpreter restriction was the allowlist in
+`scripts/validate_environment.py`; pretrain, train and the benchmark invoke this
+shared validator. Vendored SpecForge metadata requires Python >=3.11, not a
+specific 3.12 patch. The existing 3.12 environment remains the conservative
+production baseline; the project gate is now **Python >=3.12.0**, not a claim
+that 3.12.0 is the lowest interpreter on which every source file could run.
+Python 3.12.3 and future patch/minor versions are no longer rejected solely for
+not equaling 3.12.12/3.12.13. Accepting an interpreter is separate from having
+working binaries/dependencies for it.
+
+Evidence: [CPython ABI stability](https://docs.python.org/3/c-api/stable.html)
+documents compatibility across patch releases within a minor series for matching
+builds (private extension APIs can still differ). The published Python metadata
+for [Torch 2.13.0](https://pypi.org/project/torch/2.13.0/),
+[Transformers 5.12.1](https://pypi.org/project/transformers/5.12.1/) and
+[SGLang 0.5.18](https://pypi.org/project/sglang/0.5.18/) specifies lower bounds,
+not a 3.12.12/3.12.13 allowlist. This evidence does not replace import checks or
+actual GPU testing of the complete transitive stack.
+
+Changed files:
+
+- `scripts/validate_environment.py`: compare against `MIN_PYTHON_VERSION =
+  (3, 12, 0)` and give recovery commands for the 3.12 series. Direct package pins,
+  imports, CUDA/B200 checks and SpecForge capture API validation are unchanged.
+- `.python-version`: prefer `3.12` rather than exactly `3.12.13` for uv; this file
+  remains optional and is not used for runtime admission.
+- `tests/test_environment.py`: admit 3.12.0/3.12.3/old and future patches/newer
+  minors, reject versions below the boundary, preserve dependency/CUDA failures,
+  and verify the optional uv preference is not an exact patch.
+- `ENVIRONMENT.md`, `huongdanchay.md`, `DEPENDENCIES_POLICY_LAG.md`, and the
+  dependency section in this report: align guidance with the lower-bound policy.
+
+Targeted validation: **21 passed** in environment/requirements tests. Native
+`python scripts/validate_environment.py --python-only` passes on the workstation's
+Python 3.13.9. Tests for other interpreter versions substitute `sys.version_info`;
+the complete pinned CUDA stack has not been executed under actual Python 3.12.3.
+Final validation: `python -m compileall -q .` passes; `pytest -q` with
+`BASH_BIN=D:/Git/bin/bash.exe` reports **95 passed, 1 skipped, 8 warnings**.
+The skip is the same unsupported Gloo transport on the Windows CPU build;
+warnings are the existing scheduler and optional FA availability notices.
+`git diff --check` passes. No production GPU training was launched.
+No dependencies, training math, optimizer settings, checkpoints or backend
+selection were changed by this interpreter-policy update.

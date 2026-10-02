@@ -19,21 +19,24 @@ IMPORT_NAMES = {
     "pyyaml": "yaml",
     "typing-extensions": "typing_extensions",
 }
-SUPPORTED_PYTHON_VERSIONS = ((3, 12, 12), (3, 12, 13))
+# Interpreter admission is a lower bound, not a patch-release allowlist.
+# The dependency pins/imports and CUDA checks below remain separate: accepting
+# a newer interpreter does not guarantee wheels/runtime support for that version.
+MIN_PYTHON_VERSION = (3, 12, 0)
 
 
 def validate_python_version():
-    if sys.version_info[:3] in SUPPORTED_PYTHON_VERSIONS:
+    if sys.version_info[:3] >= MIN_PYTHON_VERSION:
         return
-    required = ".".join(map(str, SUPPORTED_PYTHON_VERSIONS[-1]))
-    supported = " or ".join(".".join(map(str, item)) for item in SUPPORTED_PYTHON_VERSIONS)
-    environment = f"venv-py{required.replace('.', '')}"
+    minimum = ".".join(map(str, MIN_PYTHON_VERSION))
+    recommended = ".".join(map(str, MIN_PYTHON_VERSION[:2]))
+    environment = f"venv-py{recommended.replace('.', '')}"
     raise RuntimeError(
-        f"Python {supported} is required; found {sys.version.split()[0]}\n"
+        f"Python >={minimum} is required; found {sys.version.split()[0]}\n"
         f"Interpreter: {sys.executable}\n"
         "Create a supported environment from the project directory:\n"
-        f"  uv python install {required}\n"
-        f"  uv venv --python {required} --seed {environment}\n"
+        f"  uv python install {recommended}\n"
+        f"  uv venv --python {recommended} --seed {environment}\n"
         f"  source {environment}/bin/activate\n"
         '  export PYTHON_BIN="$(command -v python)"\n'
         "Install the project dependencies in this environment; see ENVIRONMENT.md."

@@ -1,7 +1,8 @@
 # Hướng dẫn chạy nhanh trên B200
 
-Project hỗ trợ Python **3.12.12 và 3.12.13**, không cần file `.python-version`
-trên server. Có thể dùng tiếp `.venv` 3.12.13 hiện tại;
+Project yêu cầu Python **>=3.12.0**, không khóa phiên bản patch: **3.12.3 dùng được**
+nếu các dependencies/CUDA tương thích. Không cần file `.python-version` trên server;
+file này chỉ gợi ý dòng 3.12 cho uv, không ép 3.12.12/3.12.13. Có thể dùng tiếp `.venv` hiện tại;
 kiểm tra các dependency theo [ENVIRONMENT.md](ENVIRONMENT.md) trước khi chạy.
 
 ```bash

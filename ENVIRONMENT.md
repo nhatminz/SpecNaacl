@@ -1,8 +1,13 @@
 # Reproducible B200 environment
 
-The supported Python versions are 3.12.12 and 3.12.13. New environments use
-3.12.13. The optional `.python-version` file helps uv select that version;
-runtime validation does not read it, so it can be omitted on the server.
+The project's interpreter gate is **Python >=3.12.0**, not an exact patch
+allowlist. Python 3.12.3, 3.12.12, 3.12.13 and later releases pass this gate.
+Use a maintained 3.12 patch release when creating a new production environment.
+The optional `.python-version` file contains `3.12` as a uv preference, not a
+fixed patch version. Runtime validation does not read it, so it can be omitted
+on the server. Newer minor versions also pass the interpreter gate, but are not
+automatically certified for the pinned CUDA/dependency stack: compatible wheels,
+dependency versions, imports and GPU APIs must still be checked independently.
 The library stack is PyTorch 2.13.0 with the CUDA 13.0
 wheel, Transformers 5.12.1, and SGLang 0.5.18. CUDA 13.x requires an NVIDIA
 driver from the R580 branch or newer. The PyTorch wheel carries its CUDA runtime
@@ -11,15 +16,15 @@ CUDA extension.
 
 ## Online installation
 
-For a new environment, install Python 3.12.13 with `uv`, then create the
-environment from that managed interpreter. An existing 3.12.12 or 3.12.13
+For a new environment, install Python 3.12 with `uv`, then create the
+environment from that managed interpreter. An existing Python >=3.12.0
 environment can be kept; use the validation commands below:
 
 ```bash
 cd /workspace/storage-shared/nlp/minhpn19/SpecNaacl
 nvidia-smi
-uv python install 3.12.13
-uv venv --python 3.12.13 --seed .venv
+uv python install 3.12
+uv venv --python 3.12 --seed .venv
 source .venv/bin/activate
 export PYTHON_BIN="$(command -v python)"
 python scripts/validate_environment.py --python-only
@@ -45,14 +50,14 @@ python -c 'import torch; print(torch.__version__, torch.version.cuda, torch.cuda
 
 ## Preparing an offline wheelhouse
 
-Run this on an Internet-connected Linux x86-64 machine with Python 3.12.13, then
+Run this on an Internet-connected Linux x86-64 machine with Python 3.12, then
 copy both the project and `wheelhouse/` to the B200 machine. `pip wheel` is used
 instead of `pip download` so source distributions are built before transfer.
 
 ```bash
 cd /workspace/storage-shared/nlp/minhpn19/SpecNaacl
-uv python install 3.12.13
-uv venv --python 3.12.13 --seed .wheel-builder
+uv python install 3.12
+uv venv --python 3.12 --seed .wheel-builder
 source .wheel-builder/bin/activate
 python -m pip install --upgrade pip wheel setuptools
 mkdir -p wheelhouse
@@ -123,18 +128,20 @@ exists, normal resume validation still applies; never change its saved backend
 implicitly. Batch size 64 in the reported command was not changed by this fix;
 whether it fits at length 2048/TTT 7 must be established on the GPU separately.
 
-## Using an existing Python 3.12.13 environment
+## Using an existing Python 3.12.3 (or newer) environment
 
-Both launchers accept 3.12.12 and 3.12.13 without a `.python-version` file.
-The optional file selects 3.12.13 for new uv environments; it does not change
-the interpreter in an existing venv. The explicit `--python 3.12.13` option
+Both launchers accept Python >=3.12.0 without a `.python-version` file, including
+3.12.3. The optional file requests the 3.12 series for new uv environments; it
+does not change the interpreter in an existing venv. The explicit `--python 3.12` option
 in the installation commands also works without this file (see
 [uv Python version files](https://docs.astral.sh/uv/concepts/python-versions/#python-version-files)).
 CPython documents ABI compatibility across patch releases within the same minor
 release when builds match (see [C API stability](https://docs.python.org/3/c-api/stable.html)).
+This supports relaxing the patch allowlist; it does not by itself establish
+compatibility of private extension APIs or different Python minor versions.
 The project still checks dependency versions, imports, and required runtime APIs.
 
-If an older checkout reports `Python 3.12.12 is required; found 3.12.13`, update
+If an older checkout rejects 3.12.3 because it only accepts 3.12.12/3.12.13, update
 the project code and keep the existing environment:
 
 ```bash

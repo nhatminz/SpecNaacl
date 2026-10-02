@@ -2,8 +2,9 @@
 
 - FastGRPO: `yedaotian9/FastGRPO@38e252493149072d2c5905f0a47de1d935d7170a`
 - SpecForge: `sgl-project/SpecForge@3cb0510f0bd0e8c195ac6e9c5c62f6b50580ff83` (`0.2.0`)
-- Python: `3.12.x` for the reproduced environment (`>=3.11` is required by the
-  vendored SpecForge metadata).
+- Python: project interpreter gate `>=3.12.0`, including `3.12.3`; prefer `3.12.x`
+  for the reproduced environment (`>=3.11` is required by the vendored SpecForge
+  metadata). Newer interpreters still need compatible pinned dependencies/CUDA.
 - PyTorch: `2.13.0` with the official CUDA 13.0 wheel.
 - Transformers: `5.12.1`.
 - SGLang: `0.5.18`. SGLang is used only for offline SpecForge feature capture,
