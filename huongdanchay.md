@@ -1,7 +1,7 @@
 # Hướng dẫn chạy nhanh trên B200
 
-Project hỗ trợ Python **3.12.12 và 3.12.13**; môi trường mới mặc định dùng
-3.12.13 theo `.python-version`. Có thể dùng tiếp `.venv` 3.12.13 hiện tại;
+Project hỗ trợ Python **3.12.12 và 3.12.13**, không cần file `.python-version`
+trên server. Có thể dùng tiếp `.venv` 3.12.13 hiện tại;
 kiểm tra các dependency theo [ENVIRONMENT.md](ENVIRONMENT.md) trước khi chạy.
 
 ```bash

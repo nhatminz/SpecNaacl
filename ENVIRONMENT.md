@@ -1,7 +1,9 @@
 # Reproducible B200 environment
 
 The supported Python versions are 3.12.12 and 3.12.13. New environments use
-3.12.13, pinned in `.python-version`. The library stack is PyTorch 2.13.0 with the CUDA 13.0
+3.12.13. The optional `.python-version` file helps uv select that version;
+runtime validation does not read it, so it can be omitted on the server.
+The library stack is PyTorch 2.13.0 with the CUDA 13.0
 wheel, Transformers 5.12.1, and SGLang 0.5.18. CUDA 13.x requires an NVIDIA
 driver from the R580 branch or newer. The PyTorch wheel carries its CUDA runtime
 libraries; a system CUDA toolkit is not required unless building an optional
@@ -87,8 +89,11 @@ for `pip check` to pass.
 
 ## Using an existing Python 3.12.13 environment
 
-Both launchers accept 3.12.12 and 3.12.13. `.python-version` selects 3.12.13
-for new uv environments; it does not change the interpreter in an existing venv.
+Both launchers accept 3.12.12 and 3.12.13 without a `.python-version` file.
+The optional file selects 3.12.13 for new uv environments; it does not change
+the interpreter in an existing venv. The explicit `--python 3.12.13` option
+in the installation commands also works without this file (see
+[uv Python version files](https://docs.astral.sh/uv/concepts/python-versions/#python-version-files)).
 CPython documents ABI compatibility across patch releases within the same minor
 release when builds match (see [C API stability](https://docs.python.org/3/c-api/stable.html)).
 The project still checks dependency versions, imports, and required runtime APIs.

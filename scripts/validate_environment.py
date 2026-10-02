@@ -25,11 +25,9 @@ SUPPORTED_PYTHON_VERSIONS = ((3, 12, 12), (3, 12, 13))
 def validate_python_version():
     if sys.version_info[:3] in SUPPORTED_PYTHON_VERSIONS:
         return
-    required = (Path(__file__).resolve().parents[1] / ".python-version").read_text(
-        encoding="utf-8"
-    ).strip()
+    required = ".".join(map(str, SUPPORTED_PYTHON_VERSIONS[-1]))
     supported = " or ".join(".".join(map(str, item)) for item in SUPPORTED_PYTHON_VERSIONS)
-    environment = f".venv-py{required.replace('.', '')}"
+    environment = f"venv-py{required.replace('.', '')}"
     raise RuntimeError(
         f"Python {supported} is required; found {sys.version.split()[0]}\n"
         f"Interpreter: {sys.executable}\n"

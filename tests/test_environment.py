@@ -11,7 +11,9 @@ def set_python_version(monkeypatch, version):
 
 
 @pytest.mark.parametrize("version", [(3, 12, 12), (3, 12, 13)])
-def test_python_only_accepts_supported_versions_without_dependencies(monkeypatch, version):
+def test_python_only_accepts_supported_versions_without_dependencies(monkeypatch, tmp_path, version):
+    monkeypatch.setattr(validate_environment, "__file__", str(tmp_path / "scripts/validate_environment.py"))
+    assert not (tmp_path / ".python-version").exists()
     set_python_version(monkeypatch, version)
     monkeypatch.setattr(sys, "argv", ["validate_environment.py", "--python-only",
                                       "--requirements", "missing-requirements.txt"])
@@ -26,14 +28,16 @@ def test_python_only_accepts_supported_versions_without_dependencies(monkeypatch
 
 
 @pytest.mark.parametrize("version", [(3, 11, 12), (3, 12, 11), (3, 12, 14), (3, 13, 0)])
-def test_wrong_python_version_reports_interpreter_and_recovery(monkeypatch, version):
+def test_wrong_python_version_reports_interpreter_and_recovery(monkeypatch, tmp_path, version):
+    monkeypatch.setattr(validate_environment, "__file__", str(tmp_path / "scripts/validate_environment.py"))
+    assert not (tmp_path / ".python-version").exists()
     set_python_version(monkeypatch, version)
     with pytest.raises(RuntimeError) as error:
         validate_environment.validate_python_version()
     message = str(error.value)
     assert f"Python 3.12.12 or 3.12.13 is required; found {sys.version}" in message
     assert sys.executable in message
-    assert "uv venv --python 3.12.13 --seed .venv-py31213" in message
+    assert "uv venv --python 3.12.13 --seed venv-py31213" in message
     assert "export PYTHON_BIN=" in message
     assert "ENVIRONMENT.md" in message
 
