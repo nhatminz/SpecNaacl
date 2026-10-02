@@ -51,7 +51,8 @@ compact greedy supervision against the full-vocabulary one-hot reference.
 ## Dependency environment
 
 `requirements.txt` contains exact direct pins only and no Python standard
-library modules. The anchored stack is Python 3.12.12, PyTorch 2.13.0,
+library modules. The supported Python versions are 3.12.12 and 3.12.13 (the
+default for new environments). The anchored library stack is PyTorch 2.13.0,
 Transformers 5.12.1, and SGLang 0.5.18. SpecForge is installed without dependency
 resolution:
 

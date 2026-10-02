@@ -19,24 +19,27 @@ IMPORT_NAMES = {
     "pyyaml": "yaml",
     "typing-extensions": "typing_extensions",
 }
+SUPPORTED_PYTHON_VERSIONS = ((3, 12, 12), (3, 12, 13))
 
 
 def validate_python_version():
+    if sys.version_info[:3] in SUPPORTED_PYTHON_VERSIONS:
+        return
     required = (Path(__file__).resolve().parents[1] / ".python-version").read_text(
         encoding="utf-8"
     ).strip()
-    expected = tuple(int(part) for part in required.split("."))
-    if sys.version_info[:3] != expected:
-        raise RuntimeError(
-            f"Python {required} is required; found {sys.version.split()[0]}\n"
-            f"Interpreter: {sys.executable}\n"
-            "Create a separate environment from the project directory:\n"
-            f"  uv python install {required}\n"
-            f"  uv venv --python {required} --seed .venv-py31212\n"
-            "  source .venv-py31212/bin/activate\n"
-            '  export PYTHON_BIN="$(command -v python)"\n'
-            "Install the project dependencies in this environment; see ENVIRONMENT.md."
-        )
+    supported = " or ".join(".".join(map(str, item)) for item in SUPPORTED_PYTHON_VERSIONS)
+    environment = f".venv-py{required.replace('.', '')}"
+    raise RuntimeError(
+        f"Python {supported} is required; found {sys.version.split()[0]}\n"
+        f"Interpreter: {sys.executable}\n"
+        "Create a supported environment from the project directory:\n"
+        f"  uv python install {required}\n"
+        f"  uv venv --python {required} --seed {environment}\n"
+        f"  source {environment}/bin/activate\n"
+        '  export PYTHON_BIN="$(command -v python)"\n'
+        "Install the project dependencies in this environment; see ENVIRONMENT.md."
+    )
 
 
 def pinned_requirements(path: Path):
@@ -55,7 +58,7 @@ def main():
     parser.add_argument("--requirements", type=Path, default=Path("requirements.txt"))
     parser.add_argument("--require-cuda", action="store_true")
     parser.add_argument("--python-only", action="store_true",
-                        help="check the pinned interpreter without importing dependencies")
+                        help="check the supported interpreter without importing dependencies")
     args = parser.parse_args()
     validate_python_version()
     if args.python_only:

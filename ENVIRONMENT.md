@@ -1,6 +1,7 @@
 # Reproducible B200 environment
 
-The supported environment is Python 3.12.12, PyTorch 2.13.0 with the CUDA 13.0
+The supported Python versions are 3.12.12 and 3.12.13. New environments use
+3.12.13, pinned in `.python-version`. The library stack is PyTorch 2.13.0 with the CUDA 13.0
 wheel, Transformers 5.12.1, and SGLang 0.5.18. CUDA 13.x requires an NVIDIA
 driver from the R580 branch or newer. The PyTorch wheel carries its CUDA runtime
 libraries; a system CUDA toolkit is not required unless building an optional
@@ -8,14 +9,15 @@ CUDA extension.
 
 ## Online installation
 
-Install the exact Python patch with `uv`, then create the environment from that
-managed interpreter:
+For a new environment, install Python 3.12.13 with `uv`, then create the
+environment from that managed interpreter. An existing 3.12.12 or 3.12.13
+environment can be kept; use the validation commands below:
 
 ```bash
 cd /workspace/storage-shared/nlp/minhpn19/SpecNaacl
 nvidia-smi
-uv python install 3.12.12
-uv venv --python 3.12.12 --seed .venv
+uv python install 3.12.13
+uv venv --python 3.12.13 --seed .venv
 source .venv/bin/activate
 export PYTHON_BIN="$(command -v python)"
 python scripts/validate_environment.py --python-only
@@ -41,14 +43,14 @@ python -c 'import torch; print(torch.__version__, torch.version.cuda, torch.cuda
 
 ## Preparing an offline wheelhouse
 
-Run this on an Internet-connected Linux x86-64 machine with Python 3.12.12, then
+Run this on an Internet-connected Linux x86-64 machine with Python 3.12.13, then
 copy both the project and `wheelhouse/` to the B200 machine. `pip wheel` is used
 instead of `pip download` so source distributions are built before transfer.
 
 ```bash
 cd /workspace/storage-shared/nlp/minhpn19/SpecNaacl
-uv python install 3.12.12
-uv venv --python 3.12.12 --seed .wheel-builder
+uv python install 3.12.13
+uv venv --python 3.12.13 --seed .wheel-builder
 source .wheel-builder/bin/activate
 python -m pip install --upgrade pip wheel setuptools
 mkdir -p wheelhouse
@@ -63,9 +65,10 @@ On the offline B200 machine:
 
 ```bash
 cd /workspace/storage-shared/nlp/minhpn19/SpecNaacl
-python3.12 -c 'import sys; assert sys.version_info[:3] == (3, 12, 12), sys.version'
+python3.12 scripts/validate_environment.py --python-only
 python3.12 -m venv .venv
 source .venv/bin/activate
+export PYTHON_BIN="$(command -v python)"
 python -m pip install --no-index --find-links wheelhouse torch==2.13.0
 python -m pip install --no-index --find-links wheelhouse -r requirements.txt
 python -m pip install --no-deps -e third_party/SpecForge --no-build-isolation
@@ -82,37 +85,28 @@ PyTorch flex attention. SGLang 0.5.18 has its own mandatory `flash-attn-4`
 dependency; it remains governed by SGLang's package metadata and must be present
 for `pip check` to pass.
 
-## Fixing `Python 3.12.12 is required; found 3.12.13`
+## Using an existing Python 3.12.13 environment
 
-The launchers require the exact patch pinned in `.python-version`. Activating a
-virtual environment created with Python 3.12.13 still uses 3.12.13; installing
-3.12.12 does not change that existing environment. Create a separate environment
-so the previous `.venv` is preserved:
+Both launchers accept 3.12.12 and 3.12.13. `.python-version` selects 3.12.13
+for new uv environments; it does not change the interpreter in an existing venv.
+CPython documents ABI compatibility across patch releases within the same minor
+release when builds match (see [C API stability](https://docs.python.org/3/c-api/stable.html)).
+The project still checks dependency versions, imports, and required runtime APIs.
+
+If an older checkout reports `Python 3.12.12 is required; found 3.12.13`, update
+the project code and keep the existing environment:
 
 ```bash
 cd /workspace/storage-shared/nlp/minhpn19/SpecNaacl
-uv python install 3.12.12
-uv venv --python 3.12.12 --seed .venv-py31212
-source .venv-py31212/bin/activate
+source .venv/bin/activate
 export PYTHON_BIN="$(command -v python)"
 "$PYTHON_BIN" --version
 "$PYTHON_BIN" scripts/validate_environment.py --python-only
-
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install torch==2.13.0 \
-  --index-url https://download.pytorch.org/whl/cu130
-python -m pip install -r requirements.txt
-python -m pip install --no-deps -e third_party/SpecForge --no-build-isolation
-python scripts/validate_environment.py --require-cuda
-python -m pip check
+"$PYTHON_BIN" scripts/validate_environment.py --require-cuda
+"$PYTHON_BIN" -m pip check
 ```
 
-Then rerun the original pretrain command in the same shell. `PYTHON_BIN` is
-exported explicitly because an older value may still point to the previous
-environment. `--seed` supplies pip for the `python -m pip` commands (see the
-[uv venv reference](https://docs.astral.sh/uv/reference/cli/#uv-venv)). If `uv`
-is unavailable, install it using the
-[official instructions](https://docs.astral.sh/uv/getting-started/installation/).
-On an offline server, provision the 3.12.12 interpreter first and use the
-wheelhouse installation commands above for the new environment; package wheels
-alone do not install Python.
+Then rerun the original pretrain command in the same shell. Export `PYTHON_BIN`
+explicitly because an older value may still point to a different environment.
+If dependency validation reports missing or incompatible packages, install the
+pinned dependencies using the online or offline commands above.
