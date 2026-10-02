@@ -145,6 +145,8 @@ printf 'Run name : %s\nRun dir  : %s\nModel    : %s\nDataset  : %s\nDraft    : %
 printf 'Command  :'; printf ' %q' "${cmd[@]}"; printf '\n'
 if [[ "${DRY_RUN:-false}" == "true" ]]; then return 0 2>/dev/null || exit 0; fi
 
+"$PYTHON_BIN" "$PROJECT_DIR/scripts/validate_environment.py" --python-only
+
 [[ -f "$MODEL/config.json" ]] || { echo "ERROR: model config not found: $MODEL/config.json" >&2; exit 2; }
 [[ -f "$DATASET_PATH" ]] || { echo "ERROR: dataset not found: $DATASET_PATH" >&2; exit 2; }
 [[ -f "$DRAFT_CONFIG" ]] || { echo "ERROR: EAGLE-3 config not found: $DRAFT_CONFIG" >&2; exit 2; }

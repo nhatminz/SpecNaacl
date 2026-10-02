@@ -21,6 +21,24 @@ IMPORT_NAMES = {
 }
 
 
+def validate_python_version():
+    required = (Path(__file__).resolve().parents[1] / ".python-version").read_text(
+        encoding="utf-8"
+    ).strip()
+    expected = tuple(int(part) for part in required.split("."))
+    if sys.version_info[:3] != expected:
+        raise RuntimeError(
+            f"Python {required} is required; found {sys.version.split()[0]}\n"
+            f"Interpreter: {sys.executable}\n"
+            "Create a separate environment from the project directory:\n"
+            f"  uv python install {required}\n"
+            f"  uv venv --python {required} --seed .venv-py31212\n"
+            "  source .venv-py31212/bin/activate\n"
+            '  export PYTHON_BIN="$(command -v python)"\n'
+            "Install the project dependencies in this environment; see ENVIRONMENT.md."
+        )
+
+
 def pinned_requirements(path: Path):
     for raw_line in path.read_text(encoding="utf-8").splitlines():
         line = raw_line.split("#", 1)[0].strip()
@@ -36,9 +54,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--requirements", type=Path, default=Path("requirements.txt"))
     parser.add_argument("--require-cuda", action="store_true")
+    parser.add_argument("--python-only", action="store_true",
+                        help="check the pinned interpreter without importing dependencies")
     args = parser.parse_args()
-    if sys.version_info[:3] != (3, 12, 12):
-        raise RuntimeError(f"Python 3.12.12 is required; found {sys.version.split()[0]}")
+    validate_python_version()
+    if args.python_only:
+        return
 
     failures = []
     for distribution, expected in pinned_requirements(args.requirements):
@@ -82,4 +103,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from None

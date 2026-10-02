@@ -15,9 +15,11 @@ managed interpreter:
 cd /workspace/storage-shared/nlp/minhpn19/SpecNaacl
 nvidia-smi
 uv python install 3.12.12
-uv venv --python 3.12.12 .venv
+uv venv --python 3.12.12 --seed .venv
 source .venv/bin/activate
-python -m pip install --upgrade pip
+export PYTHON_BIN="$(command -v python)"
+python scripts/validate_environment.py --python-only
+python -m pip install --upgrade pip setuptools wheel
 
 python -m pip install torch==2.13.0 \
   --index-url https://download.pytorch.org/whl/cu130
@@ -46,7 +48,7 @@ instead of `pip download` so source distributions are built before transfer.
 ```bash
 cd /workspace/storage-shared/nlp/minhpn19/SpecNaacl
 uv python install 3.12.12
-uv venv --python 3.12.12 .wheel-builder
+uv venv --python 3.12.12 --seed .wheel-builder
 source .wheel-builder/bin/activate
 python -m pip install --upgrade pip wheel setuptools
 mkdir -p wheelhouse
@@ -79,3 +81,38 @@ implementation catches the optional `flash_attn` v2 import and falls back to
 PyTorch flex attention. SGLang 0.5.18 has its own mandatory `flash-attn-4`
 dependency; it remains governed by SGLang's package metadata and must be present
 for `pip check` to pass.
+
+## Fixing `Python 3.12.12 is required; found 3.12.13`
+
+The launchers require the exact patch pinned in `.python-version`. Activating a
+virtual environment created with Python 3.12.13 still uses 3.12.13; installing
+3.12.12 does not change that existing environment. Create a separate environment
+so the previous `.venv` is preserved:
+
+```bash
+cd /workspace/storage-shared/nlp/minhpn19/SpecNaacl
+uv python install 3.12.12
+uv venv --python 3.12.12 --seed .venv-py31212
+source .venv-py31212/bin/activate
+export PYTHON_BIN="$(command -v python)"
+"$PYTHON_BIN" --version
+"$PYTHON_BIN" scripts/validate_environment.py --python-only
+
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install torch==2.13.0 \
+  --index-url https://download.pytorch.org/whl/cu130
+python -m pip install -r requirements.txt
+python -m pip install --no-deps -e third_party/SpecForge --no-build-isolation
+python scripts/validate_environment.py --require-cuda
+python -m pip check
+```
+
+Then rerun the original pretrain command in the same shell. `PYTHON_BIN` is
+exported explicitly because an older value may still point to the previous
+environment. `--seed` supplies pip for the `python -m pip` commands (see the
+[uv venv reference](https://docs.astral.sh/uv/reference/cli/#uv-venv)). If `uv`
+is unavailable, install it using the
+[official instructions](https://docs.astral.sh/uv/getting-started/installation/).
+On an offline server, provision the 3.12.12 interpreter first and use the
+wheelhouse installation commands above for the new environment; package wheels
+alone do not install Python.

@@ -1,5 +1,10 @@
 # Hướng dẫn chạy nhanh trên B200
 
+Chuẩn bị môi trường Python **3.12.12** và các dependency theo
+[ENVIRONMENT.md](ENVIRONMENT.md) trước khi chạy. Nếu `.venv` hiện tại dùng
+3.12.13, làm theo mục sửa lỗi phiên bản Python trong tài liệu đó để tạo môi
+trường 3.12.12 riêng.
+
 ```bash
 cd /workspace/storage-shared/nlp/minhpn19/SpecNaacl
 export PYTHON_BIN="$(command -v python)"

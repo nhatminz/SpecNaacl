@@ -87,6 +87,8 @@ publish_latest() {
   ln -sfn "$PRETRAIN_ROOT" "$SCRIPT_DIR/outputs/pretrain/latest_run"
 }
 
+"$PYTHON_BIN" "$SCRIPT_DIR/scripts/validate_environment.py" --python-only
+
 [[ -f "$TARGET_MODEL_PATH/config.json" ]] || fail "target model not found: $TARGET_MODEL_PATH"
 [[ -f "$SHAREGPT_PATH" ]] || fail "ShareGPT file not found: $SHAREGPT_PATH"
 [[ -f "$SPECFORGE_DIR/VENDORED_COMMIT" ]] || fail "vendored SpecForge is incomplete: $SPECFORGE_DIR"
@@ -127,8 +129,6 @@ import sys
 from pathlib import Path
 from packaging.version import Version
 
-if sys.version_info[:3] != (3, 12, 12):
-    raise SystemExit(f"Python 3.12.12 is required; found {sys.version.split()[0]}")
 modules = {}
 for name in ("torch", "transformers", "datasets", "accelerate", "yaml", "sglang", "specforge"):
     try:
