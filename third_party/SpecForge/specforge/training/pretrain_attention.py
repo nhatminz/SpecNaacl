@@ -43,6 +43,10 @@ def validate_attention_backend(backend: str, *, probe: bool = False) -> str:
     except Exception as exc:
         raise RuntimeError(
             "PRETRAIN_ATTENTION_BACKEND=fa is unavailable on this runtime/device. "
+            "EAGLE requires flash_attn.flash_attn_varlen_func, "
+            "flash_attn.flash_attn_interface._flash_attn_varlen_backward and "
+            "flash_attn.bert_padding.{pad_input,unpad_input}; an importable "
+            "flash_attn namespace alone does not establish compatibility. "
             "Install a compatible FlashAttention build or explicitly choose "
             "PRETRAIN_ATTENTION_BACKEND=sdpa (or flex_attention). "
             f"No fallback was selected. Cause: {type(exc).__name__}: {exc}"

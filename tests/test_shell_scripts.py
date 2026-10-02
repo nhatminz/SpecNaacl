@@ -24,7 +24,8 @@ def test_all_launch_shells_have_valid_syntax_and_dry_run():
         ROOT / "scripts" / "run_specnaacl.sh",
     ]
     scripts += [ROOT / "scripts" / "plot_training_time.sh"]
-    for script in scripts:
+    for script in scripts + [ROOT / "pretrain_eagle3_sharegpt_b200.sh",
+                             ROOT / "scripts/benchmark_pretrain.sh"]:
         subprocess.run([BASH, "-n", str(script)], check=True)
     for script in scripts[:-1]:
         result = subprocess.run(

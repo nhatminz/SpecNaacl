@@ -247,12 +247,13 @@ PY
 # Probe the actual EAGLE FA CUDA varlen forward/backward, not just an import.
 # Backend changes are explicit: missing FA never selects another implementation.
 if [[ "$DRY_RUN" != "true" ]]; then
-  env CUDA_VISIBLE_DEVICES="$TRAIN_CUDA_VISIBLE_DEVICES" \
-    "$PYTHON_BIN" - "$PRETRAIN_ATTENTION_BACKEND" <<'PY'
-import sys
-from specforge.training.pretrain_attention import validate_attention_backend
-print("Validated pretraining attention:", validate_attention_backend(sys.argv[1], probe=True))
-PY
+  if ! env CUDA_VISIBLE_DEVICES="$TRAIN_CUDA_VISIBLE_DEVICES" \
+    "$PYTHON_BIN" "$SCRIPT_DIR/scripts/check_pretrain_attention.py" \
+    --backend "$PRETRAIN_ATTENTION_BACKEND" --probe; then
+    printf 'Backend check failed before feature capture/training. For the model wrapper, reuse this run with RESUME=%q and an explicitly selected backend.\n' \
+      "$PRETRAIN_ROOT" >&2
+    exit 2
+  fi
 fi
 
 "$PYTHON_BIN" - "$TARGET_MODEL_PATH/config.json" "$DRAFT_CONFIG" <<'PY'

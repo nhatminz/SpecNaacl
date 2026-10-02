@@ -124,6 +124,62 @@ def test_unavailable_flashattention_fails_without_fallback(monkeypatch):
     assert validate_attention_backend("sdpa") == "sdpa"
 
 
+def test_flashattention_error_names_the_required_api(monkeypatch):
+    fake = SimpleNamespace(
+        _std_flash_attn_varlen_func=None, _std_flash_attn_varlen_backward=None,
+        _std_flash_unpad_input=None, _std_flash_pad_input=None,
+        _raise_standard_flash_attn_unavailable=mock.Mock(side_effect=RuntimeError(
+            "cannot import name 'flash_attn_varlen_func' from 'flash_attn' (unknown location)")),
+    )
+    monkeypatch.setitem(sys.modules, "specforge.modeling.draft", SimpleNamespace(llama3_eagle=fake))
+    with pytest.raises(RuntimeError) as error:
+        validate_attention_backend("fa", probe=True)
+    message = str(error.value)
+    assert "flash_attn.flash_attn_varlen_func" in message
+    assert "_flash_attn_varlen_backward" in message
+    assert "PRETRAIN_ATTENTION_BACKEND=sdpa" in message
+    assert "unknown location" in message
+    assert "No fallback was selected" in message
+
+
+def test_sdpa_cached_seven_step_forward_backward_without_flashattention(monkeypatch):
+    from transformers.models.llama.configuration_llama import LlamaConfig
+    from specforge.modeling.draft import llama3_eagle as eagle
+
+    # Exercise the existing TTT attention implementation, not an alternate loss.
+    # Disable only helper compilation for this tiny CPU regression (no MSVC/GPU
+    # compiler required); the attention, cache and autograd code are unchanged.
+    monkeypatch.setattr(eagle, "apply_rotary_pos_emb",
+                        eagle.apply_rotary_pos_emb._torchdynamo_orig_callable)
+    monkeypatch.setattr(eagle.LlamaRotaryEmbedding, "forward",
+                        eagle.LlamaRotaryEmbedding.forward._torchdynamo_orig_callable)
+    monkeypatch.setattr(eagle.LlamaRMSNorm, "forward",
+                        eagle.LlamaRMSNorm.forward._torchdynamo_orig_callable)
+    for name in ("_std_flash_attn_varlen_func", "_std_flash_attn_varlen_backward",
+                 "_std_flash_unpad_input", "_std_flash_pad_input"):
+        monkeypatch.setattr(eagle, name, None)
+    cfg = LlamaConfig(hidden_size=16, intermediate_size=32, num_attention_heads=4,
+                      num_key_value_heads=2, head_dim=4, max_position_embeddings=2048,
+                      pretraining_tp=1)
+    layer = eagle.LlamaDecoderLayer(cfg, attention_backend="sdpa")
+    assert type(layer.self_attn) is eagle.LlamaAttention
+    input_emb = torch.randn(2, 8, 16, requires_grad=True)
+    hidden = torch.randn(2, 8, 16, requires_grad=True)
+    positions = torch.arange(8).unsqueeze(0).expand(2, -1)
+    mask = torch.zeros(2, 1, 8, 8).masked_fill(
+        torch.ones(8, 8, dtype=torch.bool).triu(1), float("-inf"))
+    cache = [[], []]
+    for _ in range(7):
+        hidden = layer(input_emb, hidden, cache_hidden=cache,
+                       attention_mask=mask, position_ids=positions)
+    assert len(cache[0]) == len(cache[1]) == 7
+    assert torch.isfinite(hidden).all()
+    hidden.square().mean().backward()
+    assert torch.isfinite(input_emb.grad).all()
+    for parameter in layer.parameters():
+        assert parameter.grad is not None and torch.isfinite(parameter.grad).all()
+
+
 def plan(lengths, rank=0, world=1, epoch=0, batch=4):
     return bucketed_indices(lengths, batch_size=batch, dp_rank=rank, dp_size=world,
                             seed=42, epoch=epoch, boundaries=BOUNDS)

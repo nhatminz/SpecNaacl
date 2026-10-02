@@ -90,6 +90,39 @@ SGLang 0.5.18 has its own mandatory `flash-attn-4`
 dependency; it remains governed by SGLang's package metadata and must be present
 for `pip check` to pass.
 
+### Recovery: `cannot import name 'flash_attn_varlen_func'`
+
+This means the selected EAGLE `fa` backend cannot import the standard varlen
+interface it uses. An importable `flash_attn` namespace or a successful SGLang
+dependency check is not proof that this interface is available. The launcher
+stops before feature capture/training; this particular error is not an OOM.
+Do not remove SGLang dependencies or change the pinned Torch stack to bypass it.
+
+Choose the existing backend that does not need the external FA interface:
+
+```bash
+export PRETRAIN_ATTENTION_BACKEND=sdpa
+# Rerun the original pretrain command with its model/dataset/batch settings.
+bash pretrain_qwen25_3b.sh  # include your original environment assignments
+```
+
+To check the choice independently of dataset preparation:
+
+```bash
+python scripts/check_pretrain_attention.py --backend sdpa
+# If you want to use standard FA, validate its real CUDA forward/backward:
+CUDA_VISIBLE_DEVICES=0 python scripts/check_pretrain_attention.py --backend fa --probe
+```
+
+SDPA is an explicit choice, not a silent fallback, and its existing EAGLE cached
+TTT implementation is unchanged. Checking `sdpa` only validates the selection;
+it is not a CUDA execution/throughput benchmark. On backend-check failure the
+launcher now prints the SDPA override and the prepared run path. A model wrapper
+can reuse that directory with `RESUME=/absolute/run/path`. If a real checkpoint
+exists, normal resume validation still applies; never change its saved backend
+implicitly. Batch size 64 in the reported command was not changed by this fix;
+whether it fits at length 2048/TTT 7 must be established on the GPU separately.
+
 ## Using an existing Python 3.12.13 environment
 
 Both launchers accept 3.12.12 and 3.12.13 without a `.python-version` file.

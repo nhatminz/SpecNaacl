@@ -290,3 +290,57 @@ the slowest elapsed time and summed samples. CUDA synchronization exists only
 in this opt-in benchmark; no heavy profiling was added to default training.
 The benchmark retains this repo's strict environment validator and accepts both
 `PRETRAIN_GRADIENT_ACCUMULATION` and wrapper `PRETRAIN_ACCUMULATION_STEPS` aliases.
+
+## Standard FlashAttention import failure recovery (2026-10-02)
+
+The supplied B200 log passes the pinned runtime dependency check, then fails
+before capture/pretraining because `flash_attn_varlen_func` cannot be imported
+from `flash_attn` (unknown location). This establishes that the standard EAGLE
+FA interface is missing/incompatible, not that training ran out of memory.
+The log alone does not establish which package/build caused the missing API.
+
+Changed files:
+
+- `third_party/SpecForge/specforge/training/pretrain_attention.py`: report the
+  concrete varlen forward/backward and padding APIs required by EAGLE. Importing
+  a namespace alone is not considered backend validation.
+- `scripts/check_pretrain_attention.py`: standalone selected-backend check;
+  optional real FA CUDA forward/backward probe. On failure return exit code 2
+  with the explicit SDPA override and original cause, without a redundant
+  Python exception traceback. SDPA selection is not advertised as a CUDA probe.
+- `pretrain_eagle3_sharegpt_b200.sh`: use the checker and report the prepared run
+  directory so a model wrapper can retry with an explicit backend and reuse
+  preparation. Failure still stops before feature capture/training.
+- `tests/test_pretrain_attention_check.py`, `tests/test_eagle3_pretrain.py`,
+  `tests/test_shell_scripts.py`: checker exit/status/diagnostics, original missing
+  API regression, real existing SDPA decoder attention with seven cached steps
+  and backward when external FA APIs are absent, and launcher syntax coverage.
+- `ENVIRONMENT.md`: diagnosis and explicit SDPA recovery instructions.
+
+No automatic fallback, dependency installation/downgrade, or training-math
+change was introduced. Default FA preference, checkpoint backend validation,
+max length 2048, TTT length 7, feature capture, vocab, data, batch size,
+accumulation, loss and optimizer behavior are unchanged. The supplied batch
+size 64 is preserved, not certified to fit in GPU memory. Runtime recovery is
+to add `PRETRAIN_ATTENTION_BACKEND=sdpa` to the original command; this explicitly
+uses the already-existing backend rather than trying to adapt incompatible FA
+APIs. No standard-FA package was installed on the remote host.
+
+Validation in `D:\VDT\SpecNaacl` on the local Windows/CPU environment:
+
+- `python -m compileall -q .`: pass.
+- `pytest -q` with `BASH_BIN=D:/Git/bin/bash.exe`: **83 passed, 1 skipped**.
+  The skipped two-process Gloo test has no supported transport on this Windows
+  PyTorch build. Eight warnings are the existing scheduler notices plus the
+  expected optional FA-unavailable warning in the SDPA regression.
+- The first targeted test run failed because the newly added CPU decoder test
+  invoked compiled helpers without a local MSVC compiler. The test now unwraps
+  only the RMSNorm/rotary helper decorators; production compilation is untouched.
+- `python scripts/check_pretrain_attention.py --backend sdpa --probe`: returns 0
+  and correctly describes an explicit selection, not a passed CUDA probe.
+- `git diff --check`: pass.
+
+No full pretrain, CUDA probe or B200 throughput benchmark has been run for this
+fix, and no speedup is claimed. The server's standard FA package remains absent
+or incompatible until the user installs a compatible build; the recovery above
+does not claim to repair that external package.
