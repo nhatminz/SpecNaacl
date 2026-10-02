@@ -357,7 +357,8 @@ class OnlineEagle3Model(Eagle3Model):
                     length=self.length,
                 )
             del target
-        torch.cuda.empty_cache()
+        # Reuse CUDA allocator blocks across micro-batches. Flushing here
+        # synchronizes the device and repeats large teacher allocations.
 
         # basic info
         batch_size, seq_length, _ = hidden_states.shape

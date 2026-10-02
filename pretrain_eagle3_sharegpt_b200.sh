@@ -49,7 +49,16 @@ PRETRAIN_GRADIENT_ACCUMULATION="${PRETRAIN_GRADIENT_ACCUMULATION:-1}"
 PRETRAIN_LR="${PRETRAIN_LR:-5e-5}"
 PRETRAIN_SAVE_INTERVAL="${PRETRAIN_SAVE_INTERVAL:-500}"
 PRETRAIN_SEED="${PRETRAIN_SEED:-42}"
-PRETRAIN_NPROC_PER_NODE="${PRETRAIN_NPROC_PER_NODE:-1}"
+PRETRAIN_NPROC_PER_NODE="${PRETRAIN_NPROC_PER_NODE:-${NPROC_PER_NODE:-1}}"
+PRETRAIN_MAX_LENGTH="${PRETRAIN_MAX_LENGTH:-2048}"
+PRETRAIN_DISTRIBUTED_MODE="${PRETRAIN_DISTRIBUTED_MODE:-auto}"
+# New runs request FA; an unset backend on resume retains the saved backend.
+PRETRAIN_ATTENTION_BACKEND="${PRETRAIN_ATTENTION_BACKEND:-}"
+PRETRAIN_LENGTH_BUCKETING="${PRETRAIN_LENGTH_BUCKETING:-true}"
+PRETRAIN_LENGTH_BUCKET_BOUNDARIES="${PRETRAIN_LENGTH_BUCKET_BOUNDARIES:-[512,768,1024,1280,1536,1792,2048]}"
+PRETRAIN_DATALOADER_WORKERS="${PRETRAIN_DATALOADER_WORKERS:-8}"
+PRETRAIN_COMPACT_TEACHER="${PRETRAIN_COMPACT_TEACHER:-false}"
+PRETRAIN_OPTIMIZER_CPU_OFFLOAD="${PRETRAIN_OPTIMIZER_CPU_OFFLOAD:-false}"
 
 CAPTURE_CUDA_VISIBLE_DEVICES="${CAPTURE_CUDA_VISIBLE_DEVICES:-0}"
 CAPTURE_NPROC_PER_NODE="${CAPTURE_NPROC_PER_NODE:-1}"
@@ -62,7 +71,7 @@ CAPTURE_NUM_WORKERS="${CAPTURE_NUM_WORKERS:-4}"
 CAPTURE_IO_THREADS="${CAPTURE_IO_THREADS:-16}"
 CAPTURE_COMPRESS="${CAPTURE_COMPRESS:-false}"
 
-TRAIN_CUDA_VISIBLE_DEVICES="${TRAIN_CUDA_VISIBLE_DEVICES:-0}"
+TRAIN_CUDA_VISIBLE_DEVICES="${TRAIN_CUDA_VISIBLE_DEVICES:-${CUDA_VISIBLE_DEVICES:-0}}"
 FORCE_CAPTURE="${FORCE_CAPTURE:-false}"
 PREPARE_ONLY="${PREPARE_ONLY:-false}"
 DRY_RUN="${DRY_RUN:-false}"
@@ -100,6 +109,15 @@ fi
 if [[ "$DRAFT_INITIALIZATION_MODE" == "pretrained" && -z "$INITIAL_DRAFT_CHECKPOINT" ]]; then
   fail "pretrained initialization requires INITIAL_DRAFT_CHECKPOINT"
 fi
+case "$PRETRAIN_NPROC_PER_NODE" in
+  1|2|4|8) ;;
+  *) fail "PRETRAIN_NPROC_PER_NODE/NPROC_PER_NODE must be 1, 2, 4 or 8" ;;
+esac
+case "$PRETRAIN_DISTRIBUTED_MODE" in
+  auto|ddp|fsdp) ;;
+  *) fail "PRETRAIN_DISTRIBUTED_MODE must be auto, ddp or fsdp" ;;
+esac
+[[ "$PRETRAIN_MAX_LENGTH" == "2048" ]] || fail "EAGLE-3 pretraining preserves PRETRAIN_MAX_LENGTH=2048"
 
 export PYTHONPATH="$SPECFORGE_DIR:$SCRIPT_DIR:$WORKSPACE${PYTHONPATH:+:$PYTHONPATH}"
 export HF_HUB_OFFLINE=1
@@ -107,6 +125,30 @@ export TRANSFORMERS_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 export WANDB_MODE="${WANDB_MODE:-offline}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+if [[ -z "$PRETRAIN_ATTENTION_BACKEND" ]]; then
+  if [[ "$RESUME_PRETRAIN" == "true" && -f "$LATEST_CHECKPOINT/training_state.pt" ]]; then
+    PRETRAIN_ATTENTION_BACKEND="$("$PYTHON_BIN" - "$LATEST_CHECKPOINT/training_state.pt" <<'PY'
+import sys, torch
+from torch._subclasses.fake_tensor import FakeTensorMode
+with FakeTensorMode():
+    state = torch.load(sys.argv[1], map_location="cpu", weights_only=False)
+print(state.get("eagle3_attention_backend", "flex_attention"))
+PY
+)"
+  else
+    PRETRAIN_ATTENTION_BACKEND=fa
+  fi
+fi
+case "$PRETRAIN_ATTENTION_BACKEND" in
+  fa|sdpa|flex_attention) ;;
+  *) fail "PRETRAIN_ATTENTION_BACKEND must be fa, sdpa or flex_attention" ;;
+esac
+printf 'Pretrain: attention=%s distributed=%s GPUs=%s max_length=%s ttt_length=7\n' \
+  "$PRETRAIN_ATTENTION_BACKEND" "$PRETRAIN_DISTRIBUTED_MODE" "$PRETRAIN_NPROC_PER_NODE" "$PRETRAIN_MAX_LENGTH"
+printf 'Effective batch: %s * %s * %s = %s samples per optimizer step (final short batch may be smaller)\n' \
+  "$PRETRAIN_BATCH_SIZE" "$PRETRAIN_GRADIENT_ACCUMULATION" "$PRETRAIN_NPROC_PER_NODE" \
+  "$((PRETRAIN_BATCH_SIZE * PRETRAIN_GRADIENT_ACCUMULATION * PRETRAIN_NPROC_PER_NODE))"
 
 mkdir -p "$MODEL_OUTPUT_ROOT" "$PRETRAIN_ROOT"
 ln -sfn "$PRETRAIN_ROOT" "$ACTIVE_RUN_LINK"
@@ -201,6 +243,17 @@ temporary.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encodi
 os.replace(temporary, path)
 print("Runtime dependency check passed:", json.dumps(report, sort_keys=True))
 PY
+
+# Probe the actual EAGLE FA CUDA varlen forward/backward, not just an import.
+# Backend changes are explicit: missing FA never selects another implementation.
+if [[ "$DRY_RUN" != "true" ]]; then
+  env CUDA_VISIBLE_DEVICES="$TRAIN_CUDA_VISIBLE_DEVICES" \
+    "$PYTHON_BIN" - "$PRETRAIN_ATTENTION_BACKEND" <<'PY'
+import sys
+from specforge.training.pretrain_attention import validate_attention_backend
+print("Validated pretraining attention:", validate_attention_backend(sys.argv[1], probe=True))
+PY
+fi
 
 "$PYTHON_BIN" - "$TARGET_MODEL_PATH/config.json" "$DRAFT_CONFIG" <<'PY'
 import json, sys
@@ -312,14 +365,22 @@ train_overrides=(
   "model.draft_model_config=$DRAFT_CONFIG"
   "model.vocab_mapping_path=$VOCAB_MAPPING"
   "data.hidden_states_path=$FEATURE_DIR"
-  "data.max_length=$CAPTURE_MAX_LENGTH"
+  "data.max_length=$PRETRAIN_MAX_LENGTH"
   "data.chat_template=$CHAT_TEMPLATE"
+  "data.length_bucketing=$PRETRAIN_LENGTH_BUCKETING"
+  "data.length_bucket_boundaries=$PRETRAIN_LENGTH_BUCKET_BOUNDARIES"
+  "data.dataloader_num_workers=$PRETRAIN_DATALOADER_WORKERS"
   "training.num_epochs=$PRETRAIN_EPOCHS"
   "training.batch_size=$PRETRAIN_BATCH_SIZE"
   "training.accumulation_steps=$PRETRAIN_GRADIENT_ACCUMULATION"
   "training.learning_rate=$PRETRAIN_LR"
   "training.save_interval=$PRETRAIN_SAVE_INTERVAL"
   "training.seed=$PRETRAIN_SEED"
+  "training.ttt_length=7"
+  "training.attention_backend=$PRETRAIN_ATTENTION_BACKEND"
+  "training.distributed_mode=$PRETRAIN_DISTRIBUTED_MODE"
+  "training.compact_teacher=$PRETRAIN_COMPACT_TEACHER"
+  "training.optimizer_cpu_offload=$PRETRAIN_OPTIMIZER_CPU_OFFLOAD"
   "deployment.trainer.nproc_per_node=$PRETRAIN_NPROC_PER_NODE"
   "run_id=$RUN_ID"
   "output_dir=$CHECKPOINT_DIR"
@@ -337,7 +398,9 @@ train_cmd=(
 )
 printf 'Train CUDA_VISIBLE_DEVICES=%s\n' "$TRAIN_CUDA_VISIBLE_DEVICES"
 printf 'Run:'; printf ' %q' env CUDA_VISIBLE_DEVICES="$TRAIN_CUDA_VISIBLE_DEVICES" "${train_cmd[@]}"; printf '\n'
-env CUDA_VISIBLE_DEVICES="$TRAIN_CUDA_VISIBLE_DEVICES" "${train_cmd[@]}" \
+env CUDA_VISIBLE_DEVICES="$TRAIN_CUDA_VISIBLE_DEVICES" \
+  OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}" MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}" \
+  "${train_cmd[@]}" \
   2>&1 | tee -a "$PRETRAIN_ROOT/logs/train.log"
 
 [[ -f "$LATEST_CHECKPOINT/training_state.pt" ]] || fail "SpecForge did not create $LATEST_CHECKPOINT/training_state.pt"

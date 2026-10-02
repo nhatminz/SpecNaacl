@@ -8,7 +8,7 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """TrainingBackend: model wrapping / backward / optimizer step / state dict.
 
-FSDP-only for now. ``ParallelConfig`` carries the process groups created by the
+Plain, DDP and FSDP execution. ``ParallelConfig`` carries groups created by the
 single distributed lifecycle: trainer TP (fixed at one by public builders) plus
 draft DP/USP topology.
 """
@@ -25,6 +25,17 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+
+
+def resolve_distributed_mode(mode: str, world_size: int) -> str:
+    """Single-rank execution never needs a distributed model wrapper."""
+    if mode not in {"auto", "ddp", "fsdp"}:
+        raise ValueError(f"unknown distributed_mode={mode!r}; choose auto, ddp or fsdp")
+    if world_size < 1:
+        raise ValueError("world_size must be positive")
+    if world_size == 1:
+        return "plain"
+    return "ddp" if mode == "auto" else mode
 
 
 def _foreach_scale_(tensors: List[torch.Tensor], factor: torch.Tensor) -> None:
@@ -151,6 +162,9 @@ class TrainingBackend(abc.ABC):
     #: ``TrainerCore`` skip its own synchronizing check.
     checks_loss_denominator: bool = False
 
+    def microstep_context(self, *, is_boundary: bool):
+        return contextlib.nullcontext()
+
     @abc.abstractmethod
     def prepare_model(self, model: nn.Module) -> nn.Module: ...
 
@@ -198,7 +212,7 @@ class FSDPTrainingBackend(TrainingBackend):
     @property
     def optimizer_state_is_replicated(self) -> bool:
         """Whether every rank owns the same complete optimizer state."""
-        return self._wrapper_kind == "ddp"
+        return self._wrapper_kind in {"none", "ddp"}
 
     @staticmethod
     def _frozen_target_modules(model: nn.Module) -> tuple[nn.Module, ...]:
@@ -232,7 +246,7 @@ class FSDPTrainingBackend(TrainingBackend):
 
         Replicated ``NO_SHARD`` recipes use DDP; sharded recipes use FSDP.
         """
-        if not wrap:
+        if not wrap or self.parallel_config.world_size == 1:
             self.module = model
             self._wrapped = False
             self._wrapper_kind = "none"
@@ -344,6 +358,13 @@ class FSDPTrainingBackend(TrainingBackend):
             with self.module.no_sync():
                 loss.backward()
 
+    def microstep_context(self, *, is_boundary: bool):
+        # DDP needs no_sync around FORWARD as well as backward. A context
+        # entered only at backward still all-reduces every micro-batch.
+        if self._wrapped and not is_boundary:
+            return self.module.no_sync()
+        return contextlib.nullcontext()
+
     def scale_gradients(self, factor: torch.Tensor) -> None:
         if self.module is None:
             raise RuntimeError("scale_gradients called before prepare_model")
@@ -384,6 +405,7 @@ class FSDPTrainingBackend(TrainingBackend):
             raise RuntimeError("state_dict called before prepare_model")
         return {
             "model": self._module_state_dict(),
+            "wrapper_kind": self._wrapper_kind,
             "optimizer": (
                 self.optimizer.state_dict() if self.optimizer is not None else None
             ),
@@ -472,4 +494,4 @@ class FSDPTrainingBackend(TrainingBackend):
         module.set_rng_state(state, module.current_device())
 
 
-__all__ = ["ParallelConfig", "TrainingBackend", "FSDPTrainingBackend"]
+__all__ = ["ParallelConfig", "TrainingBackend", "FSDPTrainingBackend", "resolve_distributed_mode"]

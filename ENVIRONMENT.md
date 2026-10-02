@@ -81,9 +81,12 @@ python -m compileall -q .
 pytest -q
 ```
 
-No `requirements-optional.txt` is needed for this pipeline. SpecForge's EAGLE
-implementation catches the optional `flash_attn` v2 import and falls back to
-PyTorch flex attention. SGLang 0.5.18 has its own mandatory `flash-attn-4`
+No `requirements-optional.txt` is needed for this pipeline. New EAGLE pretraining
+runs request the optional standard `flash_attn` v2 backend and explicitly fail
+if its CUDA forward/backward interface is unavailable; there is no silent
+fallback. Install a compatible build or set `PRETRAIN_ATTENTION_BACKEND=sdpa`
+(or `flex_attention`) explicitly. Resumed runs retain their saved backend.
+SGLang 0.5.18 has its own mandatory `flash-attn-4`
 dependency; it remains governed by SGLang's package metadata and must be present
 for `pip check` to pass.
 

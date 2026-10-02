@@ -421,6 +421,11 @@ class DataConfig(StrictConfigModel):
     #: Ordered background feature-loader workers. ``None`` preserves the
     #: former strategy defaults (EAGLE/P-EAGLE=4, DFlash-family=8).
     dataloader_num_workers: Optional[int] = Field(default=None, ge=0)
+    #: Offline EAGLE3: shuffle length buckets, keep the final short batch.
+    length_bucketing: bool = False
+    length_bucket_boundaries: List[int] = Field(
+        default_factory=lambda: [512, 768, 1024, 1280, 1536, 1792, 2048]
+    )
     cache_dir: str = "./cache"
     cache_key: Optional[str] = None
     max_prompts: Optional[int] = Field(default=None, ge=0)
@@ -900,6 +905,9 @@ class TrainingConfig(StrictConfigModel):
     batch_size: int = Field(default=1, gt=0)
     accumulation_steps: int = Field(default=1, gt=0)
     fsdp_sharding: Literal["SHARD_GRAD_OP", "FULL_SHARD", "NO_SHARD"] = "SHARD_GRAD_OP"
+    #: EAGLE3 auto uses plain execution at one rank and DDP at multiple ranks.
+    #: Other algorithms retain their existing FSDP recipes.
+    distributed_mode: Literal["auto", "ddp", "fsdp"] = "auto"
     learning_rate: float = Field(default=1e-4, gt=0.0)
     lr_scheduler: Literal["cosine", "constant"] = "cosine"
     warmup_ratio: float = Field(default=0.015, ge=0.0, le=1.0)

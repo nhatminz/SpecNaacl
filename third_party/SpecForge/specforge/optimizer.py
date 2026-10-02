@@ -301,9 +301,15 @@ class BF16Optimizer:
         # so toggling it on resume is safe and intentionally not gated here.
         self.optimizer.load_state_dict(state_dict["optimizer_state_dict"])
         self._restore_adamw_implementation()
-        print_on_rank0("Successfully loaded optimizer state_dict.")
+        if dist.is_initialized():
+            print_on_rank0("Successfully loaded optimizer state_dict.")
+        else:
+            print("Successfully loaded optimizer state_dict.")
         self.scheduler.load_state_dict(state_dict["scheduler_state_dict"])
-        print_on_rank0("Successfully loaded scheduler state_dict.")
+        if dist.is_initialized():
+            print_on_rank0("Successfully loaded scheduler state_dict.")
+        else:
+            print("Successfully loaded scheduler state_dict.")
         saved_fp32 = state_dict.get("fp32_params")
         if saved_fp32 is not None:
             if len(saved_fp32) != len(self.fp32_params):

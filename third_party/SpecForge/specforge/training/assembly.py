@@ -647,6 +647,9 @@ def build_training_run(
             use_usp_preprocess=(t.attention_backend == "usp"),
             seed=t.seed,
             resume_from=t.resume_from,
+            distributed_mode=t.distributed_mode if algorithm.name == "eagle3" else None,
+            length_bucketing=cfg.data.length_bucketing,
+            length_bucket_boundaries=cfg.data.length_bucket_boundaries,
             **_common_launch_kwargs(
                 cfg,
                 bundle,

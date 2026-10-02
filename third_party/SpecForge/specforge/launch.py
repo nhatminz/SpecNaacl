@@ -72,6 +72,8 @@ def _assemble_trainer(
     sp_ulysses_size: int = 1,
     sp_ring_size: int = 1,
     dataloader_num_workers: int = 0,
+    distributed_mode: Optional[str] = None,
+    drop_last: bool = True,
     profiling_options=None,
     fit_context=None,
     on_fit_success: Optional[Callable[[int], None]] = None,
@@ -147,6 +149,8 @@ def _assemble_trainer(
         sp_ulysses_size=sp_ulysses_size,
         sp_ring_size=sp_ring_size,
         dataloader_num_workers=dataloader_num_workers,
+        distributed_mode=distributed_mode,
+        drop_last=drop_last,
         profiling_options=profiling_options,
         fit_context=fit_context,
         on_fit_success=on_fit_success,
@@ -182,6 +186,9 @@ def _shard_offline_refs(
     shuffle=True,
     dp_rank=None,
     dp_size=None,
+    lengths=None,
+    batch_size=1,
+    boundaries=None,
 ):
     """Match ``DistributedSampler`` over metadata-only refs for one epoch.
 
@@ -207,14 +214,24 @@ def _shard_offline_refs(
             dp_rank, dp_size = 0, 1
     if dp_size < 1 or not 0 <= dp_rank < dp_size:
         raise ValueError(f"invalid data-DP layout rank={dp_rank}, size={dp_size}")
-    indices = _distributed_sampler_indices(
-        len(refs),
-        dp_rank=dp_rank,
-        dp_size=dp_size,
-        seed=seed,
-        epoch=epoch,
-        shuffle=shuffle,
-    )
+    if lengths is not None:
+        from specforge.training.length_bucketing import bucketed_indices
+
+        if len(lengths) != len(refs):
+            raise ValueError("length index does not match offline feature refs")
+        indices = bucketed_indices(
+            lengths, batch_size=batch_size, dp_rank=dp_rank, dp_size=dp_size,
+            seed=seed, epoch=epoch, boundaries=boundaries,
+        )
+    else:
+        indices = _distributed_sampler_indices(
+            len(refs),
+            dp_rank=dp_rank,
+            dp_size=dp_size,
+            seed=seed,
+            epoch=epoch,
+            shuffle=shuffle,
+        )
     return [refs[index] for index in indices]
 
 
@@ -570,6 +587,9 @@ def build_offline_runtime(
     max_checkpoints: int = 0,
     strategy_kwargs: Optional[Mapping[str, Any]] = None,
     dataloader_num_workers: int = 0,
+    distributed_mode: Optional[str] = None,
+    length_bucketing: bool = False,
+    length_bucket_boundaries=None,
     profiling_options=None,
 ):
     """Assemble the colocated offline dataflow (``LocalFeatureStore``).
@@ -596,12 +616,66 @@ def build_offline_runtime(
         hidden_states_path, run_id=run_id, ttt_length=ttt_length, max_len=max_len
     ).read()
 
+    # Read once, before choosing a sampler, and pass the same state to Trainer.
+    # Old checkpoints retain their exact DistributedSampler/drop_last plan;
+    # changing its order halfway through an epoch would repeat/skip samples.
+    resume_state = None
+    if resume_from:
+        from specforge.training.checkpoint import CheckpointManager
+
+        resume_state = CheckpointManager.read_resume_state(resume_from)
+    sampler_version = (
+        int(resume_state.get("offline_sampler_version", 1))
+        if resume_state is not None else (2 if algorithm.name == "eagle3" else 1)
+    )
+    if sampler_version not in {1, 2}:
+        raise ValueError(f"unsupported offline_sampler_version={sampler_version}")
+    if length_bucketing and (
+        algorithm.name != "eagle3" or use_usp_preprocess
+        or sp_ulysses_size * sp_ring_size != 1
+    ):
+        raise ValueError("length bucketing supports offline EAGLE3 with trainer TP/SP=1")
+    if sampler_version == 1 and length_bucketing:
+        logging.getLogger(__name__).warning("Resuming legacy sampler v1: retaining original order/drop_last; length bucketing is deferred to a new run")
+        length_bucketing = False
+    boundaries = list(length_bucket_boundaries or [512, 768, 1024, 1280, 1536, 1792, 2048])
+    lengths = None
+    sampler_contract = {
+        "offline_sampler_version": sampler_version,
+        "sampler_seed": seed,
+        "source_dataset_size": len(source_refs),
+    }
+    if resume_state is not None and sampler_version == 1:
+        # Historical checkpoints predate these data-order metadata fields.
+        # Keep their v1 sampler, using the original seed/config supplied by the
+        # caller, then record that same contract in the next checkpoint. This
+        # migration does NOT relax any objective/model resume validation.
+        for key, value in sampler_contract.items():
+            resume_state.setdefault(key, value)
+    if sampler_version == 2:
+        sampler_contract.update({
+            "length_bucketing": length_bucketing,
+            "length_bucket_boundaries": boundaries if length_bucketing else None,
+        })
+    if length_bucketing:
+        from specforge.training.length_bucketing import distributed_length_index
+
+        logging.getLogger(__name__).info("Building/reusing offline feature length index (%d samples)", len(source_refs))
+        lengths, identity = distributed_length_index(
+            [ref.feature_store_uri.removeprefix("file://") for ref in source_refs],
+            os.path.join(output_dir, "offline_lengths.json"), max_len,
+        )
+        sampler_contract["length_index_identity"] = identity
+
     def refs_for_epoch(epoch):
         return _shard_offline_refs(
             source_refs,
             use_usp_preprocess=use_usp_preprocess,
             seed=seed,
             epoch=epoch,
+            lengths=lengths,
+            batch_size=batch_size,
+            boundaries=boundaries,
         )
 
     refs = refs_for_epoch(0)
@@ -649,11 +723,10 @@ def build_offline_runtime(
         per_sample_transform=per_sample_transform,
         durable_ack=False,
         resume_from=resume_from,
-        checkpoint_extra={
-            "offline_sampler_version": 1,
-            "sampler_seed": seed,
-            "source_dataset_size": len(source_refs),
-        },
+        resume_state=resume_state,
+        checkpoint_extra=sampler_contract,
+        drop_last=sampler_version == 1,
+        distributed_mode=distributed_mode,
         max_checkpoints=max_checkpoints,
         tp_size=tp_size,
         sp_ulysses_size=sp_ulysses_size,

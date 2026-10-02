@@ -29,10 +29,10 @@ try:
     from flash_attn.flash_attn_interface import (
         _flash_attn_varlen_backward as _std_flash_attn_varlen_backward,
     )
-except ImportError as exc:
+except (ImportError, OSError) as exc:
     warnings.warn(
-        "flash_attn is not found, falling back to flex_attention. "
-        "Please install flash_attn if you want to use the flash attention backend."
+        "FlashAttention is unavailable; requesting attention_backend='fa' "
+        "will fail. Explicitly choose 'sdpa' or 'flex_attention' to use another backend."
     )
     _std_flash_attn_varlen_func = None
     _std_flash_pad_input = None

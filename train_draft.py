@@ -397,7 +397,15 @@ if resume_checkpoint:
         f"epoch={start_epoch + 1}, next_batch={start_batch}, step={step}"
     )
 
-epoch_bar = tqdm(range(start_epoch, num_epochs), desc="Draft epoch", dynamic_ncols=True)
+progress_disabled = (
+    os.environ.get("TQDM_DISABLE", "").strip().lower() in {"1", "true", "yes", "on"}
+    or int(os.environ.get("RANK", "0")) != 0
+)
+epoch_bar = tqdm(
+    range(start_epoch, num_epochs), total=num_epochs, initial=start_epoch,
+    desc="Draft pretrain epoch", unit="epoch", dynamic_ncols=True,
+    mininterval=1.0, disable=progress_disabled, position=0,
+)
 for epoch in epoch_bar:
 
     log_file = log_dir + f"/epoch_{epoch}.log"
@@ -408,8 +416,9 @@ for epoch in epoch_bar:
     batch_bar = tqdm(
         dataloader,
         total=len(dataloader),
-        desc=f"Draft epoch {epoch + 1}/{num_epochs}",
+        desc=f"Draft pretrain epoch {epoch + 1}/{num_epochs}",
         dynamic_ncols=True,
+        unit="batch", mininterval=1.0, disable=progress_disabled, position=1,
         leave=False,
     )
     for i,batch in enumerate(batch_bar):

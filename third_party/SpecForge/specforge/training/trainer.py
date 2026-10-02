@@ -31,7 +31,7 @@ from specforge.algorithms.common.providers import (
     checkpoint_key_fingerprint,
 )
 from specforge.runtime.data_plane import FeatureDataLoader, FeatureStore
-from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+from specforge.training.backend import FSDPTrainingBackend, ParallelConfig, resolve_distributed_mode
 from specforge.training.checkpoint import CheckpointManager
 from specforge.training.controller import TrainerController, TrainerCore
 
@@ -113,6 +113,8 @@ class Trainer:
         sp_ulysses_size: int = 1,
         sp_ring_size: int = 1,
         dataloader_num_workers: int = 0,
+        distributed_mode: Optional[str] = None,
+        drop_last: bool = True,
         profiling_options=None,
         fit_context=None,
         on_fit_success: Optional[Callable[[int], None]] = None,
@@ -157,13 +159,21 @@ class Trainer:
             batch_size=batch_size,
             collate_fn=collate_fn,
             per_sample_transform=per_sample_transform,
-            drop_last=True,
+            drop_last=drop_last,
             strategy=algorithm_name,
             ack=not defer_queue_ack,
             num_workers=dataloader_num_workers,
             # Pin in the existing loader workers so Domino's non-blocking H2D
             # copies do not add pinning work to the training thread.
             pin_memory=dataloader_num_workers > 0 and torch.cuda.is_available(),
+            # File reads return newly-owned tensors. Their defensive clone
+            # otherwise copies every large feature twice before collation.
+            clone_on_fetch=(
+                False if algorithm_name == "eagle3" and "refs" in ref_source and all(
+                    ref.feature_store_uri.startswith("file://")
+                    for ref in ref_source["refs"]
+                ) else None
+            ),
         )
         if refs_for_epoch is not None:
             expected_refs = len(ref_source["refs"])
@@ -201,6 +211,7 @@ class Trainer:
                 accumulation_steps=accumulation_steps,
                 num_epochs=num_epochs,
                 max_steps=max_steps,
+                drop_last=drop_last,
             )
         if isinstance(strategy_kwargs, StepRuntimeConfig):
             algorithm_checkpoint_extra = dict(strategy_kwargs.resume_contract)
@@ -245,6 +256,7 @@ class Trainer:
                 batch_size=batch_size,
                 accumulation_steps=accumulation_steps,
                 num_epochs=num_epochs,
+                drop_last=drop_last,
             )
 
         configure_schedule = getattr(optimizer_factory, "configure_total_steps", None)
@@ -265,6 +277,7 @@ class Trainer:
             "tp_size": tp_size,
             "sp_ulysses_size": sp_ulysses_size,
             "sp_ring_size": sp_ring_size,
+            "drop_last": drop_last,
         }
         explicit_checkpoint_extra = dict(checkpoint_extra or {})
         duplicate_algorithm_keys = (
@@ -395,14 +408,19 @@ class Trainer:
                     f"but still records epoch_samples={samples}"
                 )
             if "refs" in ref_source or data_prepositioned:
-                if samples % batch_size:
+                at_short_tail = (
+                    not drop_last and dataset_size is not None
+                    and samples == dataset_size
+                )
+                if samples % batch_size and not at_short_tail:
                     raise ValueError(
                         f"checkpoint {resume_from} stopped mid-epoch after "
                         f"{samples} samples, which is not a whole number of "
                         f"batches at batch_size={batch_size}; resume with the "
                         f"batch size the checkpoint was written with"
                     )
-                start_batch, start_samples = samples // batch_size, samples
+                start_batch = -(-samples // batch_size) if at_short_tail else samples // batch_size
+                start_samples = samples
                 persisted_batch = state.get("epoch_batch")
                 if persisted_batch is not None and int(persisted_batch) != start_batch:
                     raise ValueError(
@@ -414,6 +432,13 @@ class Trainer:
                 raise ValueError(
                     f"checkpoint {resume_from} has a streamed mid-epoch position, "
                     "but the queue was not rebuilt as prepositioned"
+                )
+            if state["backend"].get("wrapper_kind") is None:
+                # Old replicated DDP checkpoints already identify themselves
+                # by the shared optimizer payload; old FSDP uses rank shards.
+                state["backend"]["wrapper_kind"] = (
+                    "none" if world_size == 1 else
+                    "ddp" if "replicated_optimizer_state" in state else "fsdp"
                 )
             resume = {
                 "backend": state["backend"],
@@ -430,11 +455,37 @@ class Trainer:
             sp_ulysses_size=sp_ulysses_size,
             sp_ring_size=sp_ring_size,
         )
+        # EAGLE3 opts into the new topology policy. Other recipes keep their
+        # existing FSDP_SHARDING setting unless they explicitly request a mode.
+        requested_mode = distributed_mode or (
+            "auto" if algorithm_name == "eagle3" else
+            "ddp" if parallel.sharding_strategy == "NO_SHARD" else "fsdp"
+        )
+        mode = resolve_distributed_mode(requested_mode, parallel.world_size)
+        if mode == "ddp":
+            if parallel.sp_size > 1 or parallel.tp_size > 1:
+                raise ValueError("DDP pretraining requires trainer TP/SP=1; choose fsdp for a sharded recipe")
+            parallel.sharding_strategy = "NO_SHARD"
+        elif (distributed_mode == "fsdp" and mode == "fsdp"
+              and parallel.sharding_strategy == "NO_SHARD"):
+            # Explicit FSDP selection must not turn into the legacy DDP alias.
+            parallel.sharding_strategy = "SHARD_GRAD_OP"
+        if resume is not None:
+            saved_mode = resume["backend"]["wrapper_kind"]
+            if parallel.world_size > 1 and saved_mode is not None and saved_mode != mode:
+                raise ValueError(f"cannot resume {saved_mode} optimizer shards as {mode}; select the saved distributed mode")
         backend = FSDPTrainingBackend(parallel, optimizer_factory=optimizer_factory)
-        # FSDP-wrap the composite model and build the optimizer over the inner draft
-        # AFTER wrapping; the strategy MUST run forward through the wrapped module so
-        # FSDP is actually in the forward/backward path (not bypassed at >1 rank).
-        wrapped = backend.prepare_model(model, optimizer_target=model.draft_model)
+        # Build the optimizer over the inner draft AFTER any wrapping. The
+        # strategy must run forward through that same plain/DDP/FSDP module.
+        wrapped = backend.prepare_model(
+            model, wrap=parallel.world_size > 1, optimizer_target=model.draft_model
+        )
+        logger_module = logging.getLogger(__name__)
+        logger_module.info(
+            "Pretraining topology: mode=%s world_size=%d effective_batch=%d * %d * %d = %d",
+            mode, parallel.world_size, batch_size, accumulation_steps, parallel.world_size,
+            batch_size * accumulation_steps * parallel.world_size,
+        )
         if resume is not None:
             backend.load_state_dict(resume["backend"])
         strategy = make_step_strategy(

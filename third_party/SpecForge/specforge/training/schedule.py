@@ -13,6 +13,7 @@ def resolve_total_steps(
     batch_size: int,
     accumulation_steps: int,
     num_epochs: int,
+    drop_last: bool = True,
 ) -> int:
     """Resolve one optimizer-step horizon from explicit limits or finite data."""
     if total_steps is not None:
@@ -25,7 +26,9 @@ def resolve_total_steps(
             "training.max_steps so optimizer and loss schedules share a horizon"
         )
 
-    micro_batches_per_epoch = num_samples // batch_size
+    micro_batches_per_epoch = (
+        num_samples // batch_size if drop_last else -(-num_samples // batch_size)
+    )
     optimizer_steps = (micro_batches_per_epoch * num_epochs) // accumulation_steps
     if optimizer_steps < 1:
         raise ValueError(
@@ -83,16 +86,21 @@ def validate_fixed_accumulation_plan(
     accumulation_steps: int,
     num_epochs: int,
     max_steps: Optional[int],
+    drop_last: bool = True,
 ) -> None:
     """Reject a known partial accumulation before model/optimizer assembly.
 
-    Fixed-ref loaders drop an incomplete sample batch. Gradient accumulation,
-    however, spans epochs. If natural exhaustion would leave a partial
+    Fixed-ref loaders optionally retain the last short sample batch. Gradient
+    accumulation spans epochs. If natural exhaustion would leave a partial
     optimizer window, training cannot commit that work durably; detect it up
     front unless an explicit ``max_steps`` cap stops at an earlier complete
     boundary.
     """
-    micro_batches = (int(num_samples) // int(batch_size)) * int(num_epochs)
+    batches = (
+        int(num_samples) // int(batch_size)
+        if drop_last else -(-int(num_samples) // int(batch_size))
+    )
+    micro_batches = batches * int(num_epochs)
     complete_steps, remainder = divmod(micro_batches, int(accumulation_steps))
     stops_before_remainder = max_steps is not None and int(max_steps) <= complete_steps
     if remainder and not stops_before_remainder:

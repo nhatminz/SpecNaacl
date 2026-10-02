@@ -16,11 +16,11 @@ unchanged — only the strategy differs.
 
 from __future__ import annotations
 
+import contextlib
 import itertools
 import logging
 import math
 import os
-import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -425,6 +425,17 @@ class TrainerCore:
         return self._micro % self.accumulation_steps
 
     def train_step(
+        self, batch: TrainBatch, ctx: Optional[StepContext] = None
+    ) -> StepResult:
+        context = getattr(self.backend, "microstep_context", None)
+        sync_context = (
+            context(is_boundary=(self._micro + 1) % self.accumulation_steps == 0)
+            if context is not None else contextlib.nullcontext()
+        )
+        with sync_context:
+            return self._train_step(batch, ctx)
+
+    def _train_step(
         self, batch: TrainBatch, ctx: Optional[StepContext] = None
     ) -> StepResult:
         out: StepOutput = self.strategy.forward_loss(batch, ctx)
@@ -838,8 +849,8 @@ class TrainerController:
         return metrics
 
     def _make_progress_bar(self):
-        """Build a rank-0 optimizer-step bar for interactive terminals only."""
-        if not sys.stderr.isatty() or (
+        """Rank-0 optimizer progress, including piped/tee launcher output."""
+        if os.environ.get("TQDM_DISABLE", "").strip().lower() in {"1", "true", "yes", "on"} or (
             self.max_steps is not None and self.global_step >= self.max_steps
         ):
             return None
@@ -850,13 +861,15 @@ class TrainerController:
         from tqdm import tqdm
 
         total = self.max_steps if self.max_steps is not None else self.total_steps
+        strategy_name = self.core.strategy.name
         return tqdm(
             total=total,
             initial=self.global_step,
-            desc="Training",
-            unit="step",
+            desc="EAGLE3 pretrain" if strategy_name == "eagle3" else f"{strategy_name} train",
+            unit="opt_step",
             mininterval=1.0,
             dynamic_ncols=True,
+            disable=False,
         )
 
     def fit(self, data: Iterable[TrainBatch]) -> int:
@@ -925,6 +938,7 @@ class TrainerController:
         perf_data_wait_s = 0.0
         perf_train_compute_s = 0.0
         perf_durable_ack_s = 0.0
+        progress_metrics = {}
         for epoch in range(self.epoch, self.num_epochs):
             self.epoch = epoch
             if hasattr(data, "set_epoch"):
@@ -1068,6 +1082,15 @@ class TrainerController:
                             }
                         )
                     self.logger(log_metrics, self.global_step)
+                    if progress is not None:
+                        # Reuse already-materialized logging values: no extra
+                        # .item()/CUDA synchronization just to render tqdm.
+                        progress_metrics = {
+                            "loss": f"{log_metrics['loss']:.4f}",
+                            "samples/s": f"{log_metrics['perf/global_samples_per_second']:.1f}",
+                        }
+                        if "lr" in log_metrics:
+                            progress_metrics["lr"] = f"{log_metrics['lr']:.2e}"
                     perf_window_started = time.perf_counter()
                     perf_window_steps = 0
                     perf_window_samples = 0
@@ -1098,6 +1121,11 @@ class TrainerController:
                         self.global_step, eval_metrics
                     )
                 if progress is not None:
+                    progress.set_postfix(
+                        {"epoch": f"{epoch + 1}/{self.num_epochs}",
+                         "batch": self._epoch_batch, **progress_metrics},
+                        refresh=False,
+                    )
                     progress.update(1)
                 if self.max_steps is not None and self.global_step >= self.max_steps:
                     return self.global_step
@@ -1229,6 +1257,7 @@ class TrainerController:
             rank_state={
                 "optimizer": None if replicated_optimizer else full["optimizer"],
                 "rng": full["rng"],
+                "wrapper_kind": full.get("wrapper_kind"),
             },
         )
         self.last_checkpoint_step = step

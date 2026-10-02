@@ -1575,9 +1575,14 @@ dataloader=DataLoader(
     drop_last=False,
 )
 
+progress_disabled = (
+    os.environ.get("TQDM_DISABLE", "").strip().lower() in {"1", "true", "yes", "on"}
+    or not is_main_process
+)
 epoch_bar = tqdm(
-    range(start_epoch, num_epochs), desc="Epoch", dynamic_ncols=True,
-    disable=not is_main_process,
+    range(start_epoch, num_epochs), total=num_epochs, initial=start_epoch,
+    desc="GRPO epoch", unit="epoch", dynamic_ncols=True,
+    mininterval=1.0, disable=progress_disabled, position=0,
 )
 for epoch in epoch_bar:
     if train_sampler is not None:
@@ -1592,10 +1597,11 @@ for epoch in epoch_bar:
     batch_bar = tqdm(
         dataloader,
         total=len(dataloader),
-        desc=f"Epoch {epoch + 1}/{num_epochs}",
+        desc=f"GRPO epoch {epoch + 1}/{num_epochs}",
         dynamic_ncols=True,
+        unit="batch", mininterval=1.0, position=1,
         leave=False,
-        disable=not is_main_process,
+        disable=progress_disabled,
     )
     for i,batch in enumerate(batch_bar):
         if epoch == start_epoch and i < start_batch:

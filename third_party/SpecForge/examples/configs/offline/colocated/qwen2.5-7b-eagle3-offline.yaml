@@ -7,7 +7,10 @@ model:
   torch_dtype: "bfloat16"
 data:
   hidden_states_path: "./cache/hidden_states/qwen2.5-7b"
-  max_length: 4096
+  max_length: 2048
+  length_bucketing: true
+  length_bucket_boundaries: [512, 768, 1024, 1280, 1536, 1792, 2048]
+  dataloader_num_workers: 8
   chat_template: "qwen"
   cache_dir: "./cache"
 training:
@@ -17,7 +20,10 @@ training:
   learning_rate: 0.00005
   max_grad_norm: 0.5
   ttt_length: 7
-  attention_backend: "flex_attention"
+  attention_backend: "fa"
+  distributed_mode: "auto"
+  compact_teacher: false
+  optimizer_cpu_offload: false
   save_interval: 1000
   log_interval: 50
   dist_timeout: 20
