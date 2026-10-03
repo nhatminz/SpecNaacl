@@ -16,7 +16,7 @@ from transformers import AutoTokenizer,AutoConfig,AutoModelForCausalLM,Generatio
 from helper.rewards import accuracy_reward_func , format_reward_func
 from helper.get_QAs import get_test_QAs , get_train_QAs, get_QAs_from_path, select_train_subset
 from helper.specualtive_generate import speculative_generate
-from helper.eagle3_specforge import Eagle3FastGRPOAdapter
+from helper.eagle3_specforge import Eagle3FastGRPOAdapter, rollout_tensor_for_training
 from helper.checkpointing import capture_rng_state, restore_rng_state
 from helper.method_config import resolve_method
 from policy_lag_analysis import (
@@ -1216,13 +1216,17 @@ def training_eagle3_specforge(model, outputs, prompt_mask, token_budget=None):
         cur_valid = int(loss_mask.sum().item())
         if cur_valid == 0:
             continue
+        # Rollout uses inference_mode for speed. Its tensors must become ordinary
+        # tensors before autograd saves inputs for draft parameter gradients.
+        # Convert per response, after dtype casting, without copying the whole
+        # rollout or changing teacher values / loss masks / TTT semantics.
         result = training_model(
-            input_ids=input_ids_row.unsqueeze(0),
+            input_ids=rollout_tensor_for_training(input_ids_row.unsqueeze(0)),
             attention_mask=torch.ones((1, seq_len), device=model.device, dtype=torch.long),
             target=None,
             loss_mask=loss_mask,
-            hidden_states=features.unsqueeze(0).to(model.dtype),
-            target_hidden_for_compact=target_hidden.unsqueeze(0).to(model.dtype),
+            hidden_states=rollout_tensor_for_training(features.unsqueeze(0).to(model.dtype)),
+            target_hidden_for_compact=rollout_tensor_for_training(target_hidden.unsqueeze(0).to(model.dtype)),
             target_head_weight=target_head,
         )
         plosses, acceptance_rates = result[0], result[1]

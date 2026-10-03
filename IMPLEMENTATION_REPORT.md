@@ -488,3 +488,52 @@ scheduler and optional FlashAttention availability notices. `git diff --check`
 passes. No actual CUDA/B200 GRPO training or full pretrain was run; no speedup is claimed. Deploy
 the two modified helper files to the server and rerun the original train command;
 pretrained draft checkpoints do not need to be regenerated for this dtype fix.
+
+## EAGLE inference-rollout / autograd boundary fix (2026-10-03)
+
+The supplied Qwen2.5-3B/SimpleLR log gets past generation, then fails on the
+first EAGLE draft training forward at `draft_model.fc(hidden_states)` with
+`RuntimeError: Inference tensors cannot be saved for backward`. Both regular
+GRPO rollout and policy-lag fresh rollout run under `torch.inference_mode()`.
+Their feature/target/token rows retain inference status after views or no-op
+dtype conversions, but autograd must save draft inputs to compute weight
+gradients. The optional FlashAttention/deprecated-dtype warnings are not the
+cause; torchrun's `ChildFailedError` is the worker-exit wrapper.
+
+Changed files:
+
+- `helper/eagle3_specforge.py`: add `rollout_tensor_for_training`, which clones
+  only inference tensors with inference mode disabled. Ordinary tensors are
+  returned unchanged, preserving storage and any existing autograd graph.
+- `grpo_speculative.py`: normalize input IDs, concatenated EAGLE features and
+  final target hidden states at the shared `training_eagle3_specforge` boundary,
+  per supervised response and after dtype conversion. Both ordinary GRPO and
+  policy-lag draft-training branches use this function. Do not clone the target
+  LM head or the entire rollout, and do not disable inference-mode generation.
+- `tests/test_eagle3_training_inputs.py`: 21 regressions cover integer/FP32/BF16
+  conversion, inherited inference contexts, ordinary-input graph preservation,
+  successful embedding/linear backward, and real tiny EAGLE projection, SDPA,
+  compact teacher and seven-step TTT. KL and alpha/TV/lambda LK tests compare
+  identical metrics and every draft gradient against normal-tensor inputs in
+  FP32/BF16, with and without a token budget. Original rollout values remain
+  unchanged; target parameters receive no gradient; a zero budget skips training.
+- `IMPLEMENTATION_REPORT.md`: record the cause, scoped fix and validation.
+
+The local Windows CPU runtime has no Triton/CUDA compiler. These tests execute
+the real OnlineEagle3Model source with its CUDA-only loss import replaced by
+SpecForge's own reference loss function, and unwrap norm/RoPE compilation only
+in the fixture. This validates the autograd boundary and objective parity, not
+the production Triton kernel or CUDA execution. The first targeted test run
+exposed a test-fixture issue: a uniform full-vocab teacher gave zero gradients
+for acceptance-only losses. A concentrated teacher now exercises nonzero
+gradients for all four objectives; no production loss code was changed.
+
+Validation: targeted tests **21 passed**; `python -m compileall -q .` passes;
+full `pytest -q` with `BASH_BIN=D:/Git/bin/bash.exe` reports **141 passed,
+1 skipped, 8 warnings**. The skip is unsupported Windows Gloo transport;
+warnings are existing scheduler notices and optional FlashAttention availability.
+`git diff --check` passes. No real CUDA/B200 training, full pretrain or throughput
+benchmark was run, and no speedup is claimed. Loss/objective, TTT length, feature
+capture, sampling, Reflex, optimizer, vocab, dataset and checkpoint/resume remain
+unchanged. Deploy both modified production files together and rerun the original
+training command; pretrained checkpoints do not need to be regenerated.

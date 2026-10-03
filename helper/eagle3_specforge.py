@@ -21,6 +21,19 @@ from torch import nn
 SPECFORGE_COMMIT = "3cb0510f0bd0e8c195ac6e9c5c62f6b50580ff83"
 
 
+def rollout_tensor_for_training(tensor: torch.Tensor) -> torch.Tensor:
+    """Make inference-only rollout inputs safe to save for draft backward.
+
+    Views, detach(), and same-dtype/device to() do not remove inference status.
+    Clone only those inputs, outside inference mode; ordinary inputs keep their
+    storage and autograd graph. Values, dtype and device are unchanged.
+    """
+    if not torch.is_inference(tensor):
+        return tensor
+    with torch.inference_mode(False):
+        return tensor.clone()
+
+
 def require_specforge():
     try:
         import specforge  # noqa: F401
