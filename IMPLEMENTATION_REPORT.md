@@ -850,3 +850,59 @@ not a SpecNaacl/FastGRPO end-to-end win. Zero overhead is not promised.
   separate end-to-end costs. They were not changed to manufacture baseline gains.
 - CUDA compiler/numerical/runtime behavior, race checks on real hardware and
   production quality/throughput remain deployment validation requirements.
+
+## Reflex FP32 division JIT fix (2026-10-03)
+
+### Root cause and minimal production change
+
+The supplied training traceback fails in `_path_update`, reached through
+`propose(root=True) -> sample_target_from_logits -> update_from_target_probs ->
+_update_cached_root -> update_visited`. `count` is an integer, but Triton's
+`tl.div_rn` requires both operands to be FP32. Unlike ordinary Torch division,
+it does not silently promote the integer divisor. The Transformers deprecation,
+FlashAttention warning and outer torchrun `ChildFailedError` are not this error.
+
+`helper/fast_lk_reflex_kernels.py` now casts `max(count, 1)` to FP32 inside the
+existing update kernel. The eligible-head mean, single decay/write per round,
+LK objective, target sampling and GRPO math are unchanged. No new kernel launch,
+CUDA allocation, host transfer/synchronization, target forward, or backend
+fallback was added. Feedback still uses three fused launches per round. This is
+a scalar cast in the existing kernel, NOT a measured throughput claim.
+
+### Regression coverage / changed files
+
+- `tests/test_reflex_kernel_equations.py`: CPU `div_rn` simulation now rejects
+  non-FP32 operands, with tests for integer numerator/divisor. The former
+  `torch.div` simulation silently promoted them and missed this JIT restriction.
+- `tests/test_reflex_fused_source.py`: execute actual source with the strict
+  simulator for root-only WIDTH=1 and visited paths with 1, 2 and 3 eligible
+  heads, both greedy/stochastic feedback and feature dimensions 4/8.
+- `tests/test_reflex_cuda_pipeline.py`: 16 additional real CUDA/JIT cases cover
+  the production root proposal -> sampler -> native cached-root update path
+  across three successive rounds, FP16/BF16, greedy/stochastic sampling, batches
+  1/3 and feature dimensions 4/8. Check parity against Torch and retention of the
+  Triton backend (no silent fallback).
+- `IMPLEMENTATION_REPORT.md`: this fix and validation record.
+
+### Validation and deployment limitation
+
+- Before the kernel fix, the stricter simulator reproduced the offending
+  division failure in the actual `_path_update` source (1 failed, stopped at
+  first failure). After the fix: targeted kernel/source/CUDA suite **63 passed,
+  112 skipped**.
+- `python -m compileall -q .`: passed.
+- Full `python -m pytest -q` with Git Bash configured: **261 passed, 119 skipped,
+  8 warnings**. Skips are 118 CUDA/Triton cases and one unavailable Windows Gloo
+  transport case. No full training/pretraining was run.
+- Local PyTorch is 2.9.0+cpu, without CUDA. Real JIT compilation, GPU numerical
+  parity and B200 throughput have NOT been verified here; no speedup or exact
+  zero-cost promise is made. No slowdown-oriented fallback was introduced.
+
+Sync the updated kernel to the server's actual SpecNaacl checkout, retain the
+existing Reflex backend settings, and restart the original training process.
+Triton recompiles changed kernel source; deleting its cache is not necessary.
+For GPU regression validation on that server (without loading model weights):
+
+```bash
+python -m pytest -q tests/test_reflex_cuda_pipeline.py
+```

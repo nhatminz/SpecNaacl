@@ -56,7 +56,15 @@ class CpuTL:
 
     arange = staticmethod(torch.arange)
     sqrt = staticmethod(torch.sqrt)
-    div_rn = staticmethod(torch.div)
+
+    @staticmethod
+    def div_rn(x, y):
+        # Triton's div_rn requires FP32 operands; torch.div would silently
+        # promote an integer divisor and hide real JIT compilation failures.
+        x, y = torch.as_tensor(x), torch.as_tensor(y)
+        if x.dtype != torch.float32 or y.dtype != torch.float32:
+            raise ValueError("div_rn requires FP32 operands")
+        return torch.div(x, y)
 
     @staticmethod
     def sum(value, axis):
@@ -103,6 +111,14 @@ def kernel_source():
 
 def pow2(value):
     return 1 << (value - 1).bit_length()
+
+
+@pytest.mark.parametrize("integer_operand", [0, 1])
+def test_cpu_div_rn_rejects_integer_operands(integer_operand):
+    operands = [torch.tensor(1., dtype=torch.float32), torch.tensor(2., dtype=torch.float32)]
+    operands[integer_operand] = operands[integer_operand].to(torch.int32)
+    with pytest.raises(ValueError, match="requires FP32"):
+        CpuTL.div_rn(*operands)
 
 
 @pytest.mark.parametrize("greedy", [False, True])

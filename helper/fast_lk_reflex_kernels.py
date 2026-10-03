@@ -395,7 +395,10 @@ def _path_update(RAW, PSI, NORM, A, TARGET, MAP, PATH, CONTEXT, MASS, STATS, ALP
         count += valid.to(tl.int32)
         if tile == 0:
             tl.store(ALPHA + batch * WIDTH + slot, alpha)
-    new = tl.where(count > 0, old * DECAY - LR * tl.div_rn(delta, tl.maximum(count, 1)), old)
+    # div_rn accepts FP32 operands only (unlike '/' it does not promote ints).
+    # Cast the scalar count inside this same kernel; keep the fused mean update.
+    denominator = tl.maximum(count, 1).to(tl.float32)
+    new = tl.where(count > 0, old * DECAY - LR * tl.div_rn(delta, denominator), old)
     tl.store(A + batch * VOCAB * DIM + v[:, None] * DIM + d[None, :], new,
              (v[:, None] < VOCAB) & (d[None, :] < DIM))
 

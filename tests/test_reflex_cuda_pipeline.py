@@ -3,10 +3,64 @@ import importlib.util
 import pytest
 import torch
 from helper.fast_lk_reflex import FastLKReflex
+from helper.sampling import sample_target_from_logits
 from helper.tree_verification import PackedTree, VerifiedPath, trace_verified_path
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available() or importlib.util.find_spec("triton") is None,
                                 reason="real CUDA + Triton required (CPU equations are separate tests)")
+
+
+@pytest.mark.parametrize("batch", [1, 3])
+@pytest.mark.parametrize("dim", [4, 8])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("greedy", [False, True])
+def test_real_root_proposal_sampling_feedback(batch, dim, dtype, greedy, monkeypatch):
+    """Regression for the actual propose -> sampler -> cached-root JIT path."""
+    from helper import fast_lk_reflex_kernels as kernels
+
+    torch.manual_seed(119)
+    vocab, hidden_size, k = 521, 32, 8
+    engines = [FastLKReflex(feature_dim=dim, backend=backend, feedback_scope="root", weight_decay=.1)
+               for backend in ("torch", "triton")]
+    for engine in engines:
+        engine.start(batch, vocab, hidden_size, "cuda")
+    reference, candidate = engines
+    reference.state.normal_(std=.1)
+    candidate.state.copy_(reference.state)
+    mapping = torch.arange(vocab, device="cuda") + 3
+    feedback_calls = []
+    original_update_path = kernels.update_path
+
+    def record_update_path(*args, **kwargs):
+        feedback_calls.append((args[6].shape[1], kwargs["greedy"]))
+        return original_update_path(*args, **kwargs)
+
+    monkeypatch.setattr(kernels, "update_path", record_update_path)
+    for round_index in range(3):
+        raw = torch.randn(batch, 1, vocab * 2, device="cuda", dtype=dtype)[..., ::2]
+        hidden = torch.randn(batch, 1, hidden_size, device="cuda", dtype=dtype)
+        target_logits = torch.randn(batch, 3, vocab + 9, device="cuda", dtype=dtype)
+        # Exercise both in-compact and out-of-compact greedy root supervision.
+        if greedy:
+            target_logits[:, 0, 10 if round_index % 2 == 0 else vocab + 8] = 20.
+        proposals = [engine.propose(raw, hidden, k, mapping, root=True) for engine in engines]
+        torch.testing.assert_close(proposals[1][0], proposals[0][0], rtol=2e-4, atol=2e-7)
+        assert candidate._root_q is None  # native cache, not the legacy full-q API
+        assert candidate._round_contexts == 1
+        outputs = []
+        for engine in engines:
+            torch.cuda.manual_seed(711 + round_index)
+            outputs.append(sample_target_from_logits(
+                target_logits, do_sample=not greedy, temperature=1., top_p=.95, top_k=17,
+                eos_token_id=2, reflex=engine, compact_to_target=mapping,
+            ))
+        assert torch.equal(outputs[0][0], outputs[1][0])
+        if not greedy:
+            torch.testing.assert_close(outputs[0][1], outputs[1][1], rtol=0, atol=0)
+        torch.testing.assert_close(candidate.state, reference.state, rtol=3e-4, atol=3e-6)
+        assert candidate.backend == "triton" and candidate._kernels is kernels
+        assert candidate._round_contexts == 0
+    assert feedback_calls == [(1, greedy)] * 3
 
 
 @pytest.mark.parametrize("batch", [1, 3, 64])

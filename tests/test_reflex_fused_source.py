@@ -47,7 +47,8 @@ def test_multicontext_fused_topk_actual_source(contexts, dim, dtype, ties):
 @pytest.mark.parametrize("greedy", [False, True])
 @pytest.mark.parametrize("dim", [4, 8])
 @pytest.mark.parametrize("extra_head", [False, True])
-def test_fused_visited_update_actual_source(greedy, dim, extra_head):
+@pytest.mark.parametrize("root_only", [False, True])
+def test_fused_visited_update_actual_source(greedy, dim, extra_head, root_only):
     torch.manual_seed(5)
     tl, kernels = kernel_source()
     batch, vocab, cache, width, tiles, bv = 2, 521, 4, 3, 3, 256
@@ -61,7 +62,12 @@ def test_fused_visited_update_actual_source(greedy, dim, extra_head):
     indices = torch.tensor([[0, 4, -1], [0, 1, 5]])
     contexts = torch.tensor([[0, 2, -1], [0, 1, -1]])
     if extra_head:
+        contexts[0, 1] = -1  # counts differ across trajectories: one vs three
         contexts[1, 2] = 3
+    if root_only:
+        # Production root feedback uses this same kernel with WIDTH=1.
+        indices, contexts = indices[:, :1].contiguous(), contexts[:, :1].contiguous()
+        width = 1
     valid = contexts >= 0
     expected = state.clone() * .99
     for b in range(batch):
