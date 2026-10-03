@@ -296,7 +296,14 @@ class Eagle3FastGRPOAdapter(nn.Module):
         value = attn.v_proj(mixed).view(bsz, q_len, attn.num_key_value_heads, attn.head_dim).transpose(1, 2)
         past_len = 0 if not past_key_values else past_key_values[0][0].shape[-2]
         if position_ids is None:
-            position_ids = torch.arange(past_len, past_len + q_len, device=mixed.device).unsqueeze(0)
+            position_ids = torch.arange(
+                past_len, past_len + q_len, device=mixed.device, dtype=torch.long,
+            ).unsqueeze(0)
+        else:
+            # RoPE indexes its cos/sin tables with these IDs. Legacy Model
+            # already normalizes supplied IDs to long; preserve that contract
+            # here too without casting positions to the BF16 model dtype.
+            position_ids = position_ids.to(device=mixed.device, dtype=torch.long)
         cos, sin = attn.rotary_emb(value, seq_len=past_len + q_len)
         # Import the exact rotary/repeat helpers used by the pinned SpecForge model.
         from specforge.modeling.draft.llama3_eagle import apply_rotary_pos_emb, repeat_kv

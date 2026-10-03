@@ -440,3 +440,51 @@ CPU/source-isolated import/backend selection, not the complete production stack.
 `git diff --check` passes. No loss, sampling,
 Reflex update, optimizer, data, checkpoint/resume or GPU assignment was changed.
 No real GRPO run, full pretrain or B200 benchmark was launched.
+
+## EAGLE rollout RoPE position-ID dtype fix (2026-10-03)
+
+The supplied Qwen2.5-3B/SimpleLR log loads the target and pretrained EAGLE draft
+successfully, then fails during the first draft prefill at `cos[position_ids]`.
+Dynamo reports that the indexing tensor is not an integer type. The warning
+about `torch_dtype` deprecation and the optional FlashAttention warning are not
+the fatal errors; torchrun's `ChildFailedError` only reports the worker exit.
+
+Root cause in the project: prefill position IDs concatenate default floating
+`torch.zeros` with integer `torch.arange`, promoting the result to floating point.
+The legacy draft converts incoming positions with `.long()`, but the EAGLE flat
+KV adapter previously forwarded them to SpecForge's compiled RoPE unchanged.
+The indexing operation would also fail without compilation; disabling Dynamo
+would not fix the invalid dtype.
+
+Changed files:
+
+- `helper/specualtive_generate.py`: specify `dtype=torch.long` on both parts of
+  prefill position construction. Left-padding positions and token indices are
+  unchanged; IDs no longer acquire a floating dtype during concatenation.
+- `helper/eagle3_specforge.py`: explicitly use long default IDs and normalize
+  supplied IDs to long on the draft/query device before RoPE. This restores the
+  legacy input contract without modifying the actual rotary helper or model
+  equations. Already-correct same-device long IDs require no conversion copy.
+- `tests/test_eagle3_position_ids.py`: execute the real prefill construction
+  block for bool/int masks; real tiny SpecForge EAGLE weights plus the adapter
+  forward compare float32/float64/BF16/int32/int64 position inputs to a long-ID
+  reference under FP32/BF16 model weights, including left-padding, flat-cache
+  decode, default cache offsets, no-cache mode, backward and Dynamo RoPE tracing.
+  Model/target/checkpoint loading is bypassed only for this tiny CPU fixture.
+
+Position values, attention masks, RoPE equations, loss/TTT, feature capture,
+sampling, Reflex, vocab, checkpoints/resume and optimizer behavior are unchanged.
+No production compilation was disabled and no dependencies were changed. The
+first targeted run passed 13 tests but the dynamic-shape Dynamo test required
+an unavailable MSVC compiler for symbolic guards. That test now uses fixed
+shapes with the eager graph backend; this is test-only and still exercises real
+fake-tensor indexing/tracing, not an Inductor/CUDA compilation benchmark.
+
+Validation: the targeted regression suite reports **14 passed**; final
+`python -m compileall -q .` passes and `pytest -q` with
+`BASH_BIN=D:/Git/bin/bash.exe` reports **120 passed, 1 skipped, 8 warnings**.
+The skip is the unsupported Windows Gloo transport; warnings are the existing
+scheduler and optional FlashAttention availability notices. `git diff --check`
+passes. No actual CUDA/B200 GRPO training or full pretrain was run; no speedup is claimed. Deploy
+the two modified helper files to the server and rerun the original train command;
+pretrained draft checkpoints do not need to be regenerated for this dtype fix.
