@@ -21,7 +21,7 @@ from helper.tree_verification import PackedTree, trace_verified_path
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--device', default='cuda')
+    parser.add_argument('--device', default='cuda:0')
     parser.add_argument('--backend', choices=['torch', 'triton', 'auto'], default='auto')
     parser.add_argument('--batch', type=int, default=64)
     parser.add_argument('--vocab', type=int, default=16000)

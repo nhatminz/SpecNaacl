@@ -282,6 +282,12 @@ parser.add_argument('--reflex_feedback_scope', '--reflex_update_scope', dest='re
 parser.add_argument('--reflex_profile', default='0')
 parser.add_argument('--reflex_diagnostics', default='0')
 parser.add_argument('--reflex_backend', default='auto', choices=['auto', 'torch', 'triton'])
+parser.add_argument('--reflex_proposal_strategy', default='fused', choices=['fused', 'sort', 'hybrid', 'torch'])
+parser.add_argument('--reflex_correction_strategy', default='serial', choices=['serial', 'parallel', 'tiled'])
+parser.add_argument('--reflex_feedback_strategy', default='serial', choices=['serial', 'parallel'])
+parser.add_argument('--reflex_feature_strategy', default='auto', choices=['auto', 'triton', 'torch'])
+parser.add_argument('--reflex_update_stream', default='0', choices=['0', '1'])
+parser.add_argument('--kv_gather_strategy', default='stacked', choices=['stacked', 'per_layer'])
 parser.add_argument('--dtype', type=str, default='auto', choices=['auto', 'bf16', 'fp16', 'fp32'])
 parser.add_argument('--attn_implementation', type=str, default='')
 parser.add_argument('--temperature',type=float,default=1.0)
@@ -527,6 +533,12 @@ reflex_kwargs = {
     "reflex_diagnostics": _as_bool(args.reflex_diagnostics),
     "reflex_backend": args.reflex_backend,
     "reflex_feedback_scope": args.reflex_feedback_scope,
+    "reflex_proposal_strategy": args.reflex_proposal_strategy,
+    "reflex_correction_strategy": args.reflex_correction_strategy,
+    "reflex_feedback_strategy": args.reflex_feedback_strategy,
+    "reflex_feature_strategy": args.reflex_feature_strategy,
+    "reflex_update_stream": _as_bool(args.reflex_update_stream),
+    "kv_gather_strategy": args.kv_gather_strategy,
 }
 effective_reflex_backend = 'off'
 reset_rng_on_resume = _as_bool(args.reset_rng_on_resume)

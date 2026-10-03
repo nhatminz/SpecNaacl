@@ -126,6 +126,12 @@ cmd=(
   --reflex_profile "$REFLEX_PROFILE"
   --reflex_diagnostics "$REFLEX_DIAGNOSTICS"
   --reflex_backend "$REFLEX_BACKEND"
+  --reflex_proposal_strategy "${REFLEX_PROPOSAL_STRATEGY:-fused}"
+  --reflex_correction_strategy "${REFLEX_CORRECTION_STRATEGY:-serial}"
+  --reflex_feedback_strategy "${REFLEX_FEEDBACK_STRATEGY:-serial}"
+  --reflex_feature_strategy "${REFLEX_FEATURE_STRATEGY:-auto}"
+  --reflex_update_stream "${REFLEX_UPDATE_STREAM:-0}"
+  --kv_gather_strategy "${KV_GATHER_STRATEGY:-stacked}"
   --log_interval "$LOG_INTERVAL"
   --log_file "$LOG_DIR/metrics.jsonl"
   --timing_file "$LOG_DIR/timing.csv"
@@ -181,6 +187,12 @@ ln -sfn "$RUN_DIR" "$TRAIN_MODEL_ROOT/active_run"
   --item "reflex_feature_dim=$REFLEX_FEATURE_DIM" --item "reflex_lr=$REFLEX_LR" \
   --item "reflex_weight_decay=$REFLEX_WEIGHT_DECAY" --item "reflex_backend=$REFLEX_BACKEND" \
   --item "reflex_feedback_scope=$REFLEX_FEEDBACK_SCOPE" \
+  --item "reflex_proposal_strategy=${REFLEX_PROPOSAL_STRATEGY:-fused}" \
+  --item "reflex_correction_strategy=${REFLEX_CORRECTION_STRATEGY:-serial}" \
+  --item "reflex_feedback_strategy=${REFLEX_FEEDBACK_STRATEGY:-serial}" \
+  --item "reflex_feature_strategy=${REFLEX_FEATURE_STRATEGY:-auto}" \
+  --item "reflex_update_stream=${REFLEX_UPDATE_STREAM:-0}" \
+  --item "kv_gather_strategy=${KV_GATHER_STRATEGY:-stacked}" \
   --item "nproc_per_node=$NPROC_PER_NODE"
 
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1

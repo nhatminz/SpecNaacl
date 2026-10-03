@@ -906,3 +906,38 @@ For GPU regression validation on that server (without loading model weights):
 ```bash
 python -m pytest -q tests/test_reflex_cuda_pipeline.py
 ```
+
+## Reflex parallelism and critical-path update (2026-10-03)
+
+This section supersedes earlier "remaining bottlenecks" notes for accepted-path
+host roundtrips and one-by-one finished-row removal. The implementation and
+B200 decision procedure are detailed in `REFLEX_B200_OPTIMIZATION.md`.
+
+- Added opt-in context-parallel/tiled correction; context-parallel bitonic
+  proposal selection; path-slot-parallel statistics and vectorized one-write
+  LK update; Torch/Triton feature selection. The existing serial/fused kernels
+  remain defaults because they won the available RTX 3090 B64/V16k synthetic
+  comparison. Shape/launch sweeps are in `scripts/benchmark_reflex_strategies.py`.
+- Replaced ACTIVE path token/index CPU roundtrip with one fused GPU padding
+  kernel and preallocated output buffers. Only lengths and small scheduling
+  metadata cross to CPU. Batched finished-row compaction applies once to all
+  response-local tensors and each KV layer. A per-layer target suffix gather
+  is opt-in; the former stacked path remains default. Synthetic before/after
+  measurements are in `scripts/benchmark_reflex_bookkeeping.py`.
+- Added opt-in side-stream LK feedback, with source/update events, allocator
+  stream recording and a wait at the true A dependency (before A compaction or
+  next proposal). Root feedback uses the exact same already-computed target
+  distribution/token; no additional target forward or sampling. OFF retains
+  its original asynchronous CPU tree transfer. Full CUDA tiny-model rollout
+  tests compare side-stream and single-stream root/visited modes.
+- Kept causal draft-depth and verified-tree-depth loops; those steps depend on
+  their predecessors. No claim of B200 speedup, zero end-to-end regression,
+  changed GRPO objective, or changed Reflex equation is made.
+
+Validation on local RTX 3090/Torch 2.5.1/Triton 3.1: targeted optimized
+strategy tests 10 passed; CPU+CUDA rollout tests 8 passed; previous kernel
+source/CUDA set 175 passed; `compileall`, launcher shell syntax and `pip check`
+passed. A broader local pytest run had 321 passes, but full collection is
+blocked by missing local `pydantic`/`transformers`; three pre-existing dirty
+`tests/test_requirements.py` cases reference absent offline-wheel files. No
+full model rollout/training or B200 benchmark was run on this machine.

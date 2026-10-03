@@ -41,17 +41,27 @@ def parse_args(argv=None):
     parser.add_argument('--feature-dim', type=int, default=8)
     parser.add_argument('--reflex-lr', type=float, default=.05)
     parser.add_argument('--reflex-weight-decay', type=float, default=0.)
+    parser.add_argument('--reflex-proposal-strategy', choices=['fused', 'sort', 'hybrid', 'torch'], default='fused')
+    parser.add_argument('--reflex-correction-strategy', choices=['serial', 'parallel', 'tiled'], default='serial')
+    parser.add_argument('--reflex-feedback-strategy', choices=['serial', 'parallel'], default='serial')
+    parser.add_argument('--reflex-feature-strategy', choices=['auto', 'triton', 'torch'], default='auto')
+    parser.add_argument('--reflex-update-stream', action='store_true')
+    parser.add_argument('--kv-gather-strategy', choices=['stacked', 'per_layer'], default='stacked')
     parser.add_argument('--attn-implementation', default='eager')
     parser.add_argument('--greedy', action='store_true')
     parser.add_argument('--modes', default='fastgrpo,torch-zero,torch-root,triton-root,torch-visited_path,triton-visited_path')
     parser.add_argument('--skip-zero-state-check', action='store_true')
     parser.add_argument('--profile-trace', default='', help='Optional Chrome/Perfetto trace of ONE extra rollout (not timed)')
+    parser.add_argument('--component-timing', action='store_true',
+                        help='Diagnostic target/draft phase timing; synchronizes and is not a throughput run')
     args = parser.parse_args(argv)
     for name in ('batch_size', 'responses', 'warmup', 'iterations', 'max_length', 'max_prompt_length',
                  'verification_capacity', 'max_verification_num', 'max_draft_k', 'max_draft_length', 'feature_dim'):
         if getattr(args, name) <= 0:
             parser.error(f'{name} must be positive')
-    valid_modes = {'fastgrpo', 'torch-zero', 'triton-zero', 'torch-root', 'triton-root', 'torch-visited_path', 'triton-visited_path'}
+    valid_modes = {'fastgrpo', 'torch-zero', 'triton-zero', 'torch-root', 'triton-root',
+                   'torch-visited_path', 'triton-visited_path', 'triton-root-stream',
+                   'triton-visited_path-stream'}
     if not set(args.modes.split(',')) <= valid_modes:
         parser.error('invalid --modes')
     return args
@@ -104,9 +114,14 @@ def benchmark(args):
         temperature=args.temperature, top_p=args.top_p, top_k=args.top_k or None,
         verification_capacity=args.verification_capacity, max_verification_num=args.max_verification_num,
         max_draft_k=args.max_draft_k, max_draft_token_length=args.max_draft_length,
-        max_length=args.max_length, statistical_time=False, reflex_feature_dim=args.feature_dim,
+        max_length=args.max_length, statistical_time=args.component_timing, reflex_feature_dim=args.feature_dim,
         reflex_weight_decay=args.reflex_weight_decay, reflex_seed=args.seed,
-        reflex_profile=False, reflex_diagnostics=False)
+        reflex_profile=False, reflex_diagnostics=False,
+        reflex_proposal_strategy=args.reflex_proposal_strategy,
+        reflex_correction_strategy=args.reflex_correction_strategy,
+        reflex_feedback_strategy=args.reflex_feedback_strategy,
+        reflex_feature_strategy=args.reflex_feature_strategy)
+    base['kv_gather_strategy'] = args.kv_gather_strategy
     forwards = [0]
     # Count actual backbone forwards, NOT inferred speculative rounds.
     backbone = target.model
@@ -115,13 +130,16 @@ def benchmark(args):
     def run(mode, batch, seed, lr=None):
         if seed is not None:
             torch.manual_seed(seed)  # identical seed schedule; no model state updates
-        backend, scope = ('torch', 'root') if mode == 'fastgrpo' else mode.split('-', 1)
+        stream_mode = mode.endswith('-stream')
+        core_mode = mode[:-7] if stream_mode else mode
+        backend, scope = ('torch', 'root') if core_mode == 'fastgrpo' else core_mode.split('-', 1)
         if scope == 'zero':
             scope, lr = 'root', 0.0  # isolate tensor-path engineering from learning
         before = forwards[0]
         output = speculative_generate(model, batch['input_ids'], batch['attention_mask'], tokenizer,
             reflex_mode='off' if mode == 'fastgrpo' else 'active', reflex_backend=backend,
-            reflex_feedback_scope=scope, reflex_lr=args.reflex_lr if lr is None else lr, **base)
+            reflex_feedback_scope=scope, reflex_lr=args.reflex_lr if lr is None else lr,
+            reflex_update_stream=stream_mode or args.reflex_update_stream, **base)
         return output, forwards[0] - before
 
     try:
@@ -148,6 +166,9 @@ def benchmark(args):
                 rows_out.append(dict(generation_wall_s=wall, generated_tokens=tokens, tokens_per_s=tokens / wall,
                     target_forwards=count, accepted_length_sum=output['total_acc_length'],
                     verification_rounds=output['total_decoded_token_num'],
+                    target_phase_s=output['target_time_cost'] if args.component_timing else None,
+                    draft_phase_s=output['draft_time_cost'] if args.component_timing else None,
+                    committed_draft_forward_s=output['check_time_cost'] if args.component_timing else None,
                     peak_allocated_bytes=torch.cuda.max_memory_allocated(),
                     peak_reserved_bytes=torch.cuda.max_memory_reserved()))
             total_wall = sum(row['generation_wall_s'] for row in rows_out)

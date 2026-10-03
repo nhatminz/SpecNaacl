@@ -47,6 +47,38 @@ def _correction_kernel(Z, PSI, A, OUT,
 
 
 @triton.jit
+def _correction_parallel(Z, PSI, A, OUT,
+                         ZS0, ZS1, ZS2, VOCAB: tl.constexpr, DIM: tl.constexpr,
+                         CONTEXTS: tl.constexpr, BV: tl.constexpr, BD: tl.constexpr):
+    tile, context, batch = tl.program_id(0), tl.program_id(1), tl.program_id(2).to(tl.int64)
+    v, d = tile * BV + tl.arange(0, BV), tl.arange(0, BD)
+    a = tl.load(A + batch * VOCAB * DIM + v[:, None] * DIM + d[None, :],
+                (v[:, None] < VOCAB) & (d[None, :] < DIM), other=0)
+    psi = tl.load(PSI + (batch * CONTEXTS + context) * DIM + d, d < DIM, other=0)
+    z = tl.load(Z + batch * ZS0 + context * ZS1 + v * ZS2, v < VOCAB, other=0).to(tl.float32)
+    tl.store(OUT + (batch * CONTEXTS + context) * VOCAB + v,
+             z + tl.sum(a * psi[None, :], axis=1), v < VOCAB)
+
+
+@triton.jit
+def _correction_tiled(Z, PSI, A, OUT,
+                      ZS0, ZS1, ZS2, VOCAB: tl.constexpr, DIM: tl.constexpr,
+                      CONTEXTS: tl.constexpr, BV: tl.constexpr, BC: tl.constexpr,
+                      BD: tl.constexpr):
+    tile, context_tile, batch = tl.program_id(0), tl.program_id(1), tl.program_id(2).to(tl.int64)
+    v, c, d = tile * BV + tl.arange(0, BV), context_tile * BC + tl.arange(0, BC), tl.arange(0, BD)
+    a = tl.load(A + batch * VOCAB * DIM + v[:, None] * DIM + d[None, :],
+                (v[:, None] < VOCAB) & (d[None, :] < DIM), other=0)
+    psi = tl.load(PSI + (batch * CONTEXTS + c[:, None]) * DIM + d[None, :],
+                  (c[:, None] < CONTEXTS) & (d[None, :] < DIM), other=0)
+    correction = tl.sum(a[:, None, :] * psi[None, :, :], axis=2)
+    z = tl.load(Z + batch * ZS0 + c[None, :] * ZS1 + v[:, None] * ZS2,
+                (v[:, None] < VOCAB) & (c[None, :] < CONTEXTS), other=0).to(tl.float32)
+    tl.store(OUT + (batch * CONTEXTS + c[None, :]) * VOCAB + v[:, None],
+             z + correction, (v[:, None] < VOCAB) & (c[None, :] < CONTEXTS))
+
+
+@triton.jit
 def _teacher_values(T, MAP, batch, v, VOCAB: tl.constexpr,
                     TS0, TS1, MS0,
                     GREEDY: tl.constexpr):
@@ -124,13 +156,16 @@ def _state_update_kernel(A, Q, PSI, T, MAP, MASS, STATS, ALPHA,
         tl.store(ptr, new, mask)
 
 
-def feature(hidden, projection):
+def feature(hidden, projection, *, strategy="auto"):
     """Fuse FP32 conversion, seeded projection and feature normalization."""
     batch, contexts, hidden_size = hidden.shape
     dim = projection.shape[1]
     # Large unusual feature matrices are better left to cuBLAS; correction and
     # update remain fused. This is a shape-only choice, never a device sync.
-    if triton.next_power_of_2(hidden_size) * triton.next_power_of_2(dim) > 32768:
+    if strategy not in {"auto", "triton", "torch"}:
+        raise ValueError("feature strategy must be auto, triton or torch")
+    if strategy == "torch" or (strategy == "auto" and
+                                triton.next_power_of_2(hidden_size) * triton.next_power_of_2(dim) > 32768):
         with torch.autocast(device_type=hidden.device.type, enabled=False):
             return torch.nn.functional.normalize(hidden.float().matmul(projection), dim=-1, eps=1e-6)
     output = torch.empty((batch, contexts, dim), device=hidden.device, dtype=torch.float32)
@@ -142,15 +177,31 @@ def feature(hidden, projection):
     return output
 
 
-def correct_logits(logits, psi, state):
+def correct_logits(logits, psi, state, *, strategy="serial", block_vocab=256,
+                   context_tile=2, num_warps=4, out=None):
     """Materialized diagnostic/reference API, not used by fused proposals."""
     batch, contexts, vocab = logits.shape
     dim = state.shape[-1]
-    output = torch.empty((batch, contexts, vocab), device=logits.device, dtype=torch.float32)
-    _correction_kernel[(triton.cdiv(vocab, 256), batch)](
-        logits, psi, state, output, *logits.stride(), vocab, dim, contexts,
-        256, triton.next_power_of_2(dim), num_warps=4, enable_fp_fusion=False,
-    )
+    if strategy not in {"serial", "parallel", "tiled"}:
+        raise ValueError("correction strategy must be serial, parallel or tiled")
+    if block_vocab not in {64, 128, 256} or context_tile not in {1, 2, 4, 8} or num_warps not in {2, 4, 8}:
+        raise ValueError("invalid correction launch configuration")
+    output = out if out is not None else torch.empty((batch, contexts, vocab), device=logits.device, dtype=torch.float32)
+    if output.shape != (batch, contexts, vocab) or output.dtype != torch.float32:
+        raise ValueError("invalid correction output workspace")
+    bd = triton.next_power_of_2(dim)
+    if strategy == "serial":
+        _correction_kernel[(triton.cdiv(vocab, block_vocab), batch)](
+            logits, psi, state, output, *logits.stride(), vocab, dim, contexts,
+            block_vocab, bd, num_warps=num_warps, enable_fp_fusion=False)
+    elif strategy == "parallel":
+        _correction_parallel[(triton.cdiv(vocab, block_vocab), contexts, batch)](
+            logits, psi, state, output, *logits.stride(), vocab, dim, contexts,
+            block_vocab, bd, num_warps=num_warps, enable_fp_fusion=False)
+    else:
+        _correction_tiled[(triton.cdiv(vocab, block_vocab), triton.cdiv(contexts, context_tile), batch)](
+            logits, psi, state, output, *logits.stride(), vocab, dim, contexts,
+            block_vocab, context_tile, bd, num_warps=num_warps, enable_fp_fusion=False)
     return output
 
 
@@ -237,10 +288,76 @@ def _proposal_merge(MAX, SUM, VALUES, IDS, PROBS, TOP_IDS, NORM,
         values = tl.where(ids == index, -float('inf'), values)
 
 
-def propose(logits, psi, state, k, workspace=None):
+@triton.jit
+def _rank_key(score, index):
+    """Monotone FP32 score plus deterministic lower-ID tie break."""
+    bits = score.to(tl.int32, bitcast=True)
+    ordered = tl.where(bits < 0, ~bits, bits ^ (-2147483648)).to(tl.uint32)
+    return (ordered.to(tl.uint64) << 32) | ((0xffffffff - index).to(tl.uint32).to(tl.uint64))
+
+
+@triton.jit
+def _unpack_rank_key(key):
+    ordered = (key >> 32).to(tl.uint32)
+    bits = tl.where((ordered & 0x80000000) != 0, ordered ^ 0x80000000, ~ordered)
+    value = bits.to(tl.float32, bitcast=True)
+    index = (0xffffffff - key.to(tl.uint32)).to(tl.int32)
+    return value, index
+
+
+@triton.jit
+def _proposal_tiles_sort(Z, PSI, A, MAX, SUM, VALUES, IDS,
+                         ZS0, ZS1, ZS2, VOCAB: tl.constexpr, DIM: tl.constexpr,
+                         CONTEXTS: tl.constexpr, K: tl.constexpr, TILES: tl.constexpr,
+                         BV: tl.constexpr, BD: tl.constexpr):
+    tile, context, batch = tl.program_id(0), tl.program_id(1), tl.program_id(2).to(tl.int64)
+    v, d = tile * BV + tl.arange(0, BV), tl.arange(0, BD)
+    a = tl.load(A + batch * VOCAB * DIM + v[:, None] * DIM + d[None, :],
+                (v[:, None] < VOCAB) & (d[None, :] < DIM), other=0)
+    psi = tl.load(PSI + (batch * CONTEXTS + context) * DIM + d, d < DIM, other=0)
+    raw = tl.load(Z + batch * ZS0 + context * ZS1 + v * ZS2, v < VOCAB, other=0).to(tl.float32)
+    z = tl.where(v < VOCAB, raw + tl.sum(a * psi[None, :], axis=1), -float('inf'))
+    maximum = tl.max(z, axis=0)
+    total = tl.sum(tl.exp(z - maximum), axis=0)
+    offset = (batch * CONTEXTS + context) * TILES + tile
+    tl.store(MAX + offset, maximum)
+    tl.store(SUM + offset, total)
+    ranked = tl.sort(_rank_key(z, v), descending=True)
+    value, index = _unpack_rank_key(ranked)
+    local = tl.arange(0, BV)
+    tl.store(VALUES + offset * K + local, value, local < K)
+    tl.store(IDS + offset * K + local, index, local < K)
+
+
+@triton.jit
+def _proposal_merge_sort(MAX, SUM, VALUES, IDS, PROBS, TOP_IDS, NORM,
+                         VOCAB: tl.constexpr, K: tl.constexpr, TILES: tl.constexpr,
+                         BT: tl.constexpr, BK: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    t = tl.arange(0, BT)
+    maxima = tl.load(MAX + row * TILES + t, t < TILES, other=-float('inf'))
+    maximum = tl.max(maxima, axis=0)
+    sums = tl.load(SUM + row * TILES + t, t < TILES, other=0)
+    total = tl.sum(sums * tl.exp(maxima - maximum), axis=0)
+    tl.store(NORM + row * 2, maximum)
+    tl.store(NORM + row * 2 + 1, total)
+    candidates = tl.arange(0, BK)
+    values = tl.load(VALUES + row * TILES * K + candidates,
+                     candidates < TILES * K, other=-float('inf'))
+    ids = tl.load(IDS + row * TILES * K + candidates,
+                  candidates < TILES * K, other=VOCAB)
+    ranked = tl.sort(_rank_key(values, ids), descending=True)
+    value, index = _unpack_rank_key(ranked)
+    tl.store(PROBS + row * K + candidates, tl.div_rn(tl.exp(value - maximum), total), candidates < K)
+    tl.store(TOP_IDS + row * K + candidates, index, candidates < K)
+
+
+def propose(logits, psi, state, k, workspace=None, *, strategy="fused", block_vocab=256, num_warps=4):
     """Two launches; only tile summaries/top-k leave registers, never full q."""
     batch, contexts, vocab = logits.shape
-    dim, tiles = state.shape[-1], triton.cdiv(vocab, 256)
+    if strategy not in {"fused", "sort"} or block_vocab not in {64, 128, 256} or num_warps not in {2, 4, 8}:
+        raise ValueError("invalid proposal strategy or launch configuration")
+    dim, tiles = state.shape[-1], triton.cdiv(vocab, block_vocab)
     sizes = [(batch, contexts, tiles), (batch, contexts, tiles),
              (batch, contexts, tiles, k), (batch, contexts, tiles, k)]
     # Flat pools avoid non-contiguous slices when active batch/C/K shrink.
@@ -253,12 +370,20 @@ def propose(logits, psi, state, k, workspace=None):
     probabilities = torch.empty((batch, contexts, k), device=logits.device, dtype=torch.float32)
     selected = torch.empty((batch, contexts, k), device=logits.device, dtype=torch.long)
     norm = torch.empty((batch, contexts, 2), device=logits.device, dtype=torch.float32)
-    _proposal_tiles[(tiles, batch)](logits, psi, state, maxima, sums, values, ids,
-        *logits.stride(), vocab, dim, contexts, k, tiles, 256, triton.next_power_of_2(dim),
-        num_warps=4, enable_fp_fusion=False)
-    _proposal_merge[(batch * contexts,)](maxima, sums, values, ids, probabilities, selected, norm,
-        contexts, vocab, k, tiles, triton.next_power_of_2(tiles), triton.next_power_of_2(tiles * k),
-        num_warps=4, enable_fp_fusion=False)
+    if strategy == "fused":
+        _proposal_tiles[(tiles, batch)](logits, psi, state, maxima, sums, values, ids,
+            *logits.stride(), vocab, dim, contexts, k, tiles, block_vocab, triton.next_power_of_2(dim),
+            num_warps=num_warps, enable_fp_fusion=False)
+        _proposal_merge[(batch * contexts,)](maxima, sums, values, ids, probabilities, selected, norm,
+            contexts, vocab, k, tiles, triton.next_power_of_2(tiles), triton.next_power_of_2(tiles * k),
+            num_warps=num_warps, enable_fp_fusion=False)
+    else:
+        _proposal_tiles_sort[(tiles, contexts, batch)](logits, psi, state, maxima, sums, values, ids,
+            *logits.stride(), vocab, dim, contexts, k, tiles, block_vocab, triton.next_power_of_2(dim),
+            num_warps=num_warps, enable_fp_fusion=False)
+        _proposal_merge_sort[(batch * contexts,)](maxima, sums, values, ids, probabilities, selected, norm,
+            vocab, k, tiles, triton.next_power_of_2(tiles), triton.next_power_of_2(tiles * k),
+            num_warps=num_warps, enable_fp_fusion=False)
     return probabilities, selected, norm
 
 
@@ -291,6 +416,50 @@ def trace_path(tree, samples, eos, tokens, indices, contexts, lengths):
     _trace_path[(batch,)](tree.parents, tree.tokens, tree.feedback_contexts, samples,
         tokens, indices, contexts, lengths, rows, tokens.shape[1], int(eos), *tokens.stride(),
         triton.next_power_of_2(rows), num_warps=4)
+
+
+@triton.jit
+def _pad_verified_path(TOKENS, INDICES, LENGTHS, OUT_TOKENS, OUT_INDICES, OUT_MASK, LAST,
+                       CAPACITY: tl.constexpr, WIDTH: tl.constexpr, PAST: tl.constexpr,
+                       EOS: tl.constexpr, TS0, TS1, IS0, IS1, OS0, OS1, BW: tl.constexpr):
+    batch = tl.program_id(0).to(tl.int64)
+    slot = tl.arange(0, BW)
+    length = tl.load(LENGTHS + batch)
+    index = tl.load(INDICES + batch * IS0 + slot * IS1, slot < CAPACITY, other=-1)
+    valid = slot < length
+    budget = WIDTH - length
+    before = tl.minimum(tl.maximum(index - slot, 0), budget)
+    destination = slot + before
+    candidates = tl.where((destination[None, :] == slot[:, None]) & valid[None, :],
+                          tl.broadcast_to(slot[None, :], (BW, BW)), BW)
+    source = tl.min(candidates, axis=1)
+    accepted = source < BW
+    safe_source = tl.minimum(source, CAPACITY - 1)
+    token = tl.load(TOKENS + batch * TS0 + safe_source * TS1, accepted & (slot < WIDTH), other=EOS)
+    chosen = tl.load(INDICES + batch * IS0 + safe_source * IS1, accepted & (slot < WIDTH), other=0)
+    tl.store(OUT_TOKENS + batch * OS0 + slot * OS1, tl.where(accepted, token, EOS), slot < WIDTH)
+    tl.store(OUT_INDICES + batch * OS0 + slot * OS1,
+             tl.where(accepted, chosen + PAST, slot + PAST), slot < WIDTH)
+    tl.store(OUT_MASK + batch * OS0 + slot * OS1, ~accepted, slot < WIDTH)
+    tl.store(LAST + batch, tl.max(tl.where(valid, destination, -1), axis=0))
+
+
+def pad_verified_path(path, past_length, width, eos_token_id, workspace=None):
+    batch, capacity = path.tokens.shape
+    if workspace is None:
+        tokens = torch.empty((batch, width), device=path.tokens.device, dtype=torch.long)
+        indices = torch.empty_like(tokens)
+        mask = torch.empty((batch, width), device=path.tokens.device, dtype=torch.bool)
+        last = torch.empty((batch, 1), device=path.tokens.device, dtype=torch.long)
+    else:
+        tokens, indices, mask = [buffer[:batch, :width] for buffer in workspace[:3]]
+        last = workspace[3][:batch, :1]
+    _pad_verified_path[(batch,)](path.tokens, path.packed_indices, path.lengths,
+        tokens, indices, mask, last, capacity, width, int(past_length), int(eos_token_id),
+        *path.tokens.stride(), *path.packed_indices.stride(), *tokens.stride(),
+        triton.next_power_of_2(capacity),
+        num_warps=4)
+    return tokens, indices, mask, last
 
 
 @triton.jit
@@ -368,6 +537,34 @@ def _path_stats(RAW, PSI, NORM, A, TARGET, MAP, PATH, CONTEXT, MASS, STATS,
 
 
 @triton.jit
+def _path_stats_parallel(RAW, PSI, NORM, A, TARGET, MAP, PATH, CONTEXT, MASS, STATS,
+                         VOCAB: tl.constexpr, DIM: tl.constexpr, CACHE: tl.constexpr,
+                         WIDTH: tl.constexpr, RS0, RS1, RS2, TS0, TS1, TS2,
+                         IS0, IS1, CS0, CS1, MS0, GREEDY: tl.constexpr, EPS: tl.constexpr,
+                         TILES: tl.constexpr, BT: tl.constexpr, BV: tl.constexpr, BD: tl.constexpr,
+                         MASS_ONLY: tl.constexpr):
+    tile, slot, batch = tl.program_id(0), tl.program_id(1), tl.program_id(2).to(tl.int64)
+    v, d = tile * BV + tl.arange(0, BV), tl.arange(0, BD)
+    if MASS_ONLY:
+        a = tl.full((BV, BD), 0., tl.float32)
+    else:
+        a = tl.load(A + batch * VOCAB * DIM + v[:, None] * DIM + d[None, :],
+                    (v[:, None] < VOCAB) & (d[None, :] < DIM), other=0)
+    q, p, psi, valid = _path_values(RAW, PSI, NORM, a, TARGET, MAP, PATH, CONTEXT,
+        batch, slot, v, d, VOCAB, DIM, CACHE, WIDTH, RS0, RS1, RS2, TS0, TS1, TS2,
+        IS0, IS1, CS0, CS1, MS0, GREEDY)
+    offset = (batch * WIDTH + slot) * TILES
+    if MASS_ONLY:
+        tl.store(MASS + offset + tile, tl.sum(p, axis=0))
+    else:
+        t = tl.arange(0, BT)
+        mass = tl.sum(tl.load(MASS + offset + t, t < TILES, other=0), axis=0) + EPS
+        p = tl.div_rn(p, mass)
+        tl.store(STATS + (offset + tile) * 2, tl.sum(tl.minimum(q, p), axis=0))
+        tl.store(STATS + (offset + tile) * 2 + 1, tl.sum(tl.where(q < p, q, 0.), axis=0))
+
+
+@triton.jit
 def _path_update(RAW, PSI, NORM, A, TARGET, MAP, PATH, CONTEXT, MASS, STATS, ALPHA,
                  VOCAB: tl.constexpr, DIM: tl.constexpr, CACHE: tl.constexpr,
                  WIDTH: tl.constexpr, RS0, RS1, RS2, TS0, TS1, TS2,
@@ -403,29 +600,96 @@ def _path_update(RAW, PSI, NORM, A, TARGET, MAP, PATH, CONTEXT, MASS, STATS, ALP
              (v[:, None] < VOCAB) & (d[None, :] < DIM))
 
 
+@triton.jit
+def _path_update_parallel(RAW, PSI, NORM, A, TARGET, MAP, PATH, CONTEXT, MASS, STATS, ALPHA,
+                          VOCAB: tl.constexpr, DIM: tl.constexpr, CACHE: tl.constexpr,
+                          WIDTH: tl.constexpr, RS0, RS1, RS2, TS0, TS1, TS2,
+                          IS0, IS1, CS0, CS1, MS0, GREEDY: tl.constexpr, EPS: tl.constexpr,
+                          LR: tl.constexpr, DECAY: tl.constexpr,
+                          TILES: tl.constexpr, BT: tl.constexpr, BV: tl.constexpr,
+                          BP: tl.constexpr, BD: tl.constexpr):
+    tile, batch = tl.program_id(0), tl.program_id(1).to(tl.int64)
+    v, s, d, t = (tile * BV + tl.arange(0, BV), tl.arange(0, BP),
+                  tl.arange(0, BD), tl.arange(0, BT))
+    ptr = A + batch * VOCAB * DIM + v[:, None] * DIM + d[None, :]
+    mask = (v[:, None] < VOCAB) & (d[None, :] < DIM)
+    old = tl.load(ptr, mask, other=0)
+    context = tl.load(CONTEXT + batch * CS0 + s * CS1, s < WIDTH, other=-1)
+    row = tl.load(PATH + batch * IS0 + s * IS1, s < WIDTH, other=-1)
+    valid = (s < WIDTH) & (context >= 0) & (row >= 0)
+    safe_context, safe_row = tl.maximum(context, 0), tl.maximum(row, 0)
+    feature = tl.load(PSI + (batch * CACHE + safe_context[:, None]) * DIM + d[None, :],
+                      valid[:, None] & (d[None, :] < DIM), other=0)
+    z = tl.load(RAW + batch * RS0 + safe_context[None, :] * RS1 + v[:, None] * RS2,
+                (v[:, None] < VOCAB) & valid[None, :], other=0).to(tl.float32)
+    correction = tl.sum(old[:, None, :] * feature[None, :, :], axis=2)
+    maximum = tl.load(NORM + (batch * CACHE + safe_context) * 2, valid, other=0)
+    denominator = tl.load(NORM + (batch * CACHE + safe_context) * 2 + 1, valid, other=1)
+    q = tl.where(valid[None, :] & (v[:, None] < VOCAB),
+                 tl.div_rn(tl.exp(z + correction - maximum[None, :]), denominator[None, :]), 0.)
+    ids = tl.load(MAP + v * MS0, v < VOCAB, other=0)
+    if GREEDY:
+        token = tl.load(TARGET + batch * TS0 + safe_row * TS1, valid, other=-1)
+        p = ((ids[:, None] == token[None, :]) & valid[None, :] & (v[:, None] < VOCAB)).to(tl.float32)
+    else:
+        p = tl.load(TARGET + batch * TS0 + safe_row[None, :] * TS1 + ids[:, None] * TS2,
+                    valid[None, :] & (v[:, None] < VOCAB), other=0).to(tl.float32)
+    offsets = (batch * WIDTH + s[:, None]) * TILES + t[None, :]
+    mass = tl.sum(tl.load(MASS + offsets, (s[:, None] < WIDTH) & (t[None, :] < TILES), other=0), axis=1) + EPS
+    stat_offsets = offsets * 2
+    alpha = tl.sum(tl.load(STATS + stat_offsets,
+                           (s[:, None] < WIDTH) & (t[None, :] < TILES), other=0), axis=1)
+    selected = tl.sum(tl.load(STATS + stat_offsets + 1,
+                              (s[:, None] < WIDTH) & (t[None, :] < TILES), other=0), axis=1)
+    if tile == 0:
+        tl.store(ALPHA + batch * WIDTH + s, alpha, s < WIDTH)
+    p = tl.div_rn(p, mass[None, :])
+    gradient = tl.div_rn(q * (selected[None, :] - (q < p).to(tl.float32)), alpha[None, :] + EPS)
+    delta = tl.sum(gradient[:, :, None] * feature[None, :, :], axis=1)
+    count = tl.maximum(tl.sum(valid.to(tl.float32), axis=0), 1.)
+    updated = tl.where(tl.sum(valid.to(tl.int32), axis=0) > 0,
+                       old * DECAY - LR * tl.div_rn(delta, count), old)
+    tl.store(ptr, updated, mask)
+
+
 def update_path(state, raw, psi, norm, target, mapping, indices, contexts, *, greedy,
-                eps, learning_rate, decay, workspace=None):
+                eps, learning_rate, decay, workspace=None, strategy="serial",
+                block_vocab=256, num_warps=4):
     """Gather/reconstruct only visited contexts; THREE launches per round.
 
     Statistics are computed against the pre-update A. A single write kernel
     aggregates the mean of all valid contexts and applies decay exactly once.
     """
+    if strategy not in {"serial", "parallel"}:
+        raise ValueError("feedback strategy must be serial or parallel")
+    if block_vocab not in {64, 128, 256} or num_warps not in {2, 4, 8}:
+        raise ValueError("invalid feedback launch configuration")
     batch, vocab, dim = state.shape
-    width, cache, tiles = indices.shape[1], psi.shape[1], triton.cdiv(vocab, 256)
+    width, cache, tiles = indices.shape[1], psi.shape[1], triton.cdiv(vocab, block_vocab)
     if workspace is None:
         mass = torch.empty((batch * width * tiles,), device=state.device)
         stats = torch.empty((batch * width * tiles * 2,), device=state.device)
+        alpha = torch.empty((batch, width), device=state.device, dtype=torch.float32)
     else:
-        mass, stats = workspace
-    alpha = torch.empty((batch, width), device=state.device, dtype=torch.float32)
+        mass, stats = workspace[:2]
+        alpha = (workspace[2][:batch * width].view(batch, width) if len(workspace) > 2
+                 else torch.empty((batch, width), device=state.device, dtype=torch.float32))
     strides = (*raw.stride(), target.stride(0), target.stride(1), 0 if greedy else target.stride(2),
                *indices.stride(), *contexts.stride(), mapping.stride(0))
     args = (raw, psi, norm, state, target, mapping, indices, contexts, mass, stats)
     constants = (vocab, dim, cache, width, *strides, greedy, eps)
+    stats_kernel = _path_stats if strategy == "serial" else _path_stats_parallel
+    stats_grid = (tiles, batch) if strategy == "serial" else (tiles, width, batch)
     for mass_only in (True, False):
-        _path_stats[(tiles, batch)](*args, *constants, tiles, triton.next_power_of_2(tiles),
-            256, triton.next_power_of_2(dim), mass_only, num_warps=4, enable_fp_fusion=False)
-    _path_update[(tiles, batch)](*args, alpha, *constants, learning_rate, decay,
-        tiles, triton.next_power_of_2(tiles), 256, triton.next_power_of_2(dim),
-        num_warps=4, enable_fp_fusion=False)
+        stats_kernel[stats_grid](*args, *constants, tiles, triton.next_power_of_2(tiles),
+            block_vocab, triton.next_power_of_2(dim), mass_only,
+            num_warps=num_warps, enable_fp_fusion=False)
+    if strategy == "serial":
+        _path_update[(tiles, batch)](*args, alpha, *constants, learning_rate, decay,
+            tiles, triton.next_power_of_2(tiles), block_vocab, triton.next_power_of_2(dim),
+            num_warps=num_warps, enable_fp_fusion=False)
+    else:
+        _path_update_parallel[(tiles, batch)](*args, alpha, *constants, learning_rate, decay,
+            tiles, triton.next_power_of_2(tiles), block_vocab, triton.next_power_of_2(width),
+            triton.next_power_of_2(dim), num_warps=num_warps, enable_fp_fusion=False)
     return alpha

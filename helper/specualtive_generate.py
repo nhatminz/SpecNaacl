@@ -177,6 +177,12 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
                         reflex_diagnostics=False,
                         reflex_backend="auto",
                         reflex_feedback_scope="root",
+                        reflex_proposal_strategy="fused",
+                        reflex_correction_strategy="serial",
+                        reflex_feedback_strategy="serial",
+                        reflex_feature_strategy="auto",
+                        reflex_update_stream=False,
+                        kv_gather_strategy="stacked",
                         ):
 
     reflex_mode = str(reflex_mode).strip().lower()
@@ -187,6 +193,8 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
     reflex = None
     if reflex_feedback_scope not in {"root", "visited_path"}:
         raise ValueError("reflex_feedback_scope must be root or visited_path")
+    if kv_gather_strategy not in {"stacked", "per_layer"}:
+        raise ValueError("kv_gather_strategy must be stacked or per_layer")
     compact_to_target = None
 
 
@@ -515,6 +523,8 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
     
     transfer_stream = torch.cuda.Stream(device) if reflex_mode == "off" else None
     executor = ThreadPoolExecutor(max_workers=64) if reflex_mode == "off" else None
+    update_stream = (torch.cuda.Stream(device) if reflex_mode == "active" and reflex_update_stream
+                     and torch.device(device).type == "cuda" else None)
 
     prefill_time_start=time.time()
     target_time_start=time.time()
@@ -683,6 +693,10 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
             diagnostics=reflex_diagnostics,
             backend=reflex_backend,
             feedback_scope=reflex_feedback_scope,
+            proposal_strategy=reflex_proposal_strategy,
+            correction_strategy=reflex_correction_strategy,
+            feedback_strategy=reflex_feedback_strategy,
+            feature_strategy=reflex_feature_strategy,
         )
         reflex.start(
             bsz,
@@ -819,7 +833,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
                 top_p=top_p,
                 top_k=top_k,
                 eos_token_id=eos_token_id,
-                reflex=reflex if reflex_feedback_scope == "root" else None,
+                reflex=reflex if reflex_feedback_scope == "root" and update_stream is None else None,
                 compact_to_target=compact_to_target,
             )
             if reflex is None:
@@ -832,18 +846,49 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
         if reflex is not None:
             path = trace_verified_path(tensor_tree, target_next_token_tree, eos_token_id,
                                        kernels=reflex._kernels, workspace=reflex.path_workspace)
-            if reflex_feedback_scope == "visited_path":
-                reflex.update_visited(target_sampling_probs if do_sample else target_next_token_tree,
-                                      compact_to_target, path, greedy=not do_sample)
-            acc_length, chosen_index, next_token = path.host_bookkeeping(past_kv_len)
-            # Release full teacher distributions before the next draft, not after it.
-            del target_sampling_probs, target_outputs_logits
+            feedback_target = target_sampling_probs if do_sample else target_next_token_tree
+            if update_stream is not None:
+                source_ready = torch.cuda.Event()
+                source_ready.record(torch.cuda.current_stream(device))
+                update_stream.wait_event(source_ready)
+                for shared in (feedback_target, compact_to_target, reflex.state,
+                               reflex._feedback_raw, reflex._feedback_psi, reflex._feedback_norm,
+                               path.packed_indices, path.feedback_contexts):
+                    if isinstance(shared, torch.Tensor):
+                        shared.record_stream(update_stream)
+                if reflex._feedback_workspace is not None:
+                    for workspace_tensor in reflex._feedback_workspace:
+                        workspace_tensor.record_stream(update_stream)
+                with torch.cuda.stream(update_stream):
+                    if reflex_feedback_scope == "root":
+                        if do_sample:
+                            reflex.update_from_target_probs(feedback_target[:, 0], compact_to_target)
+                        else:
+                            reflex.update_from_target_tokens(feedback_target[:, 0], compact_to_target)
+                    else:
+                        reflex.update_visited(feedback_target, compact_to_target, path, greedy=not do_sample)
+                    update_done = torch.cuda.Event()
+                    update_done.record(update_stream)
+            elif reflex_feedback_scope == "visited_path":
+                reflex.update_visited(feedback_target, compact_to_target, path, greedy=not do_sample)
+            # The only host packet is small scheduling metadata. Accepted
+            # tokens and KV indices stay on GPU through gather/compaction.
+            acc_length = path.lengths.cpu().tolist()
+            max_acc_length = max(acc_length)
+            next_token, chosen_index, newly_padded, last_valid_index = path.padded_gpu(
+                past_kv_len, max_acc_length, eos_token_id,
+                kernels=reflex._kernels, workspace=reflex.padded_path_workspace)
+            scheduling_packet = torch.cat((next_token.gather(1, last_valid_index).eq(eos_token_id).long(),
+                                           torch.where(newly_padded, chosen_index, -1)), dim=1).cpu().tolist()
+            end_sig = [int(row[0]) for row in scheduling_packet]
             for idx_tree, length in enumerate(acc_length):
-                end_sig[idx_tree] = int(next_token[idx_tree][-1] == eos_token_id)
+                padding_positions[idx_tree].update(index for index in scheduling_packet[idx_tree][1:] if index >= 0)
                 total_proposed_draft_tokens += draft_total_token
                 total_accepted_draft_tokens += max(length - 1, 0)
                 avg_acc_length[0] += length
                 avg_acc_length[1] += 1
+            # Release full teacher distributions before the next draft, not after it.
+            del target_sampling_probs, target_outputs_logits
         else:
             target_trees=transfer_thread.result()
             acc_length=[0]*bsz
@@ -916,9 +961,9 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
                 original_index = residual_index[active_index]
                 response_accepted_length_sum[original_index] += int(accepted_length)
                 response_verification_rounds[original_index] += 1
-        last_valid_index=[max_acc_length-1]*bsz 
-
-        for idx_batch in range(bsz):
+        if reflex is None:
+            last_valid_index=[max_acc_length-1]*bsz
+        for idx_batch in (range(bsz) if reflex is None else ()):
 
             cur_index_length=len(chosen_index[idx_batch])
             if cur_index_length<max_acc_length:
@@ -965,17 +1010,14 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
                 chosen_index[idx_batch]=new_chosen_index
                 next_token[idx_batch]=new_next_token
 
-        feature_states_index=[[] for _ in range(bsz)]
-
-        for idx_batch in range(bsz):
-            for index in chosen_index[idx_batch]:
-                
-                feature_states_index[idx_batch].append(index-past_kv_len)
-                    
-        next_token=torch.tensor(next_token, device=device)
-        last_valid_index=torch.tensor(last_valid_index, dtype=torch.int16).unsqueeze(-1).to(device).long() # [bsz, 1]
+        if reflex is None:
+            feature_states_index=[[index-past_kv_len for index in row] for row in chosen_index]
+            next_token=torch.tensor(next_token, device=device)
+            last_valid_index=torch.tensor(last_valid_index, dtype=torch.int16).unsqueeze(-1).to(device).long()
+            feature_states_index=torch.tensor(feature_states_index, dtype=torch.int16).to(device).long()
+        else:
+            feature_states_index=chosen_index-past_kv_len
         target_next_token=next_token.gather(index=last_valid_index, dim=-1)
-        feature_states_index=torch.tensor(feature_states_index, dtype=torch.int16).to(device).long()
         
 
         
@@ -997,89 +1039,59 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
         generated_sequences=torch.concat([generated_sequences,next_token],dim=-1)
 
         finished_indices = [index for index, finished in enumerate(end_sig) if finished]
-        if reflex is not None and finished_indices:
+        if reflex is not None and finished_indices and update_stream is None:
             # Compact A once for the whole verification round. The remaining
             # FastGRPO tensors are pruned below with their existing semantics.
             reflex.remove_finished(finished_indices)
         
         if 0 not in end_sig:
+            if update_stream is not None:
+                torch.cuda.current_stream(device).wait_event(update_done)
             break
         real_sequences_length=max([len(item1)+input_ids.shape[-1]-len(item2) for item1,item2 in zip(generated_sequences, padding_positions)])
         
         if real_sequences_length>=max_length:
+            if update_stream is not None:
+                torch.cuda.current_stream(device).wait_event(update_done)
             break
         
-        idx_batch=0
-        while idx_batch < bsz:
-            
-            if end_sig[idx_batch]==1:
-
-                delete_idx=idx_batch
-                ori_idx=residual_index[idx_batch] 
-                end_sig=[end_sig[_] for _ in range(bsz) if _ != delete_idx]
-
-                chosen_index=[chosen_index[_] for _ in range(bsz) if _ != delete_idx]
-                
-                for kv_idx in range(_cache_num_layers(target_past_key_values)):
-                    key, value = _cache_get_layer(target_past_key_values, kv_idx)
-                    
-                    _cache_set_layer(
-                        target_past_key_values,
-                        kv_idx,
-                        torch.concat([key[:delete_idx], key[delete_idx+1:]], dim=0),
-                        torch.concat([value[:delete_idx], value[delete_idx+1:]], dim=0),
-                    )
-                
-                new_past_key_values=[]
-                for cur_past_key_values in draft_past_key_values:
-                    
-                    draft_key=torch.concat(
-                        [cur_past_key_values[0][:delete_idx], cur_past_key_values[0][delete_idx+1:]], dim=0)
-                    draft_value=torch.concat(
-                        [cur_past_key_values[1][:delete_idx], cur_past_key_values[1][delete_idx+1:]], dim=0)
-                    new_past_key_values.append([draft_key, draft_value])
-                    
-                draft_past_key_values=new_past_key_values
-                        
-                next_token=torch.concat([next_token[:delete_idx], next_token[delete_idx+1:]], dim=0)
-                target_next_token=torch.concat([target_next_token[:delete_idx], target_next_token[delete_idx+1:]], dim=0)
-                
-                feature_states=torch.concat([feature_states[:delete_idx], feature_states[delete_idx+1:]], dim=0)
-                target_hidden_states=torch.concat(
-                    [target_hidden_states[:delete_idx], target_hidden_states[delete_idx+1:]], dim=0
-                )
-                last_valid_index=torch.concat([last_valid_index[:delete_idx], last_valid_index[delete_idx+1:]], dim=0)
-                
-                padding_positions_dict[str(ori_idx)]=padding_positions[delete_idx]
-                padding_positions=[padding_positions[_] for _ in range(bsz) if _ != delete_idx]
-                
-                past_position_ids=[item for idx_tmp, item in enumerate(past_position_ids) if idx_tmp != delete_idx]
-
-                generated_sequences_dict[str(ori_idx)]=generated_sequences[delete_idx]
-                generated_sequences=torch.concat(
-                    [generated_sequences[:delete_idx], generated_sequences[delete_idx+1:]], dim=0)
-                
+        if finished_indices:
+            keep_rows = [row for row, finished in enumerate(end_sig) if not finished]
+            keep = torch.tensor(keep_rows, device=device, dtype=torch.long)
+            for row in finished_indices:
+                original = residual_index[row]
+                padding_positions_dict[str(original)] = padding_positions[row]
+                generated_sequences_dict[str(original)] = generated_sequences[row]
                 if return_all_draft_input:
-                    draft_input_states_dict[str(ori_idx)]=all_draft_input_states[delete_idx]
-                    target_hidden_states_dict[str(ori_idx)]=all_target_hidden_states[delete_idx]
-                    all_draft_input_states=torch.concat(
-                        [all_draft_input_states[:delete_idx], all_draft_input_states[delete_idx+1:]], dim=0)
-                    all_target_hidden_states=torch.concat(
-                        [all_target_hidden_states[:delete_idx], all_target_hidden_states[delete_idx+1:]], dim=0)
-                    
-                    draft_input_ids_dict[str(ori_idx)]=all_draft_input_ids[delete_idx]
-                    all_draft_input_ids=torch.concat(
-                        [all_draft_input_ids[:delete_idx], all_draft_input_ids[delete_idx+1:]], dim=0)
-                    
-                residual_index=[residual_index[_] for _ in range(bsz) if _ != delete_idx]
-                bsz-=1
-                
-                draft_token_length, draft_k, draft_total_token = get_adaptive_hyperparameters(bsz, verification_capacity,
-                                max_draft_token_length, max_draft_k, max_verification_num,
-                                min_draft_token_length, draft_token_length_c)
-                
-            else:   
-                idx_batch+=1
+                    draft_input_states_dict[str(original)] = all_draft_input_states[row]
+                    target_hidden_states_dict[str(original)] = all_target_hidden_states[row]
+                    draft_input_ids_dict[str(original)] = all_draft_input_ids[row]
+            end_sig = [end_sig[row] for row in keep_rows]
+            padding_positions = [padding_positions[row] for row in keep_rows]
+            past_position_ids = [past_position_ids[row] for row in keep_rows]
+            residual_index = [residual_index[row] for row in keep_rows]
+            chosen_index = (chosen_index.index_select(0, keep) if reflex is not None
+                            else [chosen_index[row] for row in keep_rows])
+            for layer in range(_cache_num_layers(target_past_key_values)):
+                key, value = _cache_get_layer(target_past_key_values, layer)
+                _cache_set_layer(target_past_key_values, layer,
+                                 key.index_select(0, keep), value.index_select(0, keep))
+            draft_past_key_values = [[key.index_select(0, keep), value.index_select(0, keep)]
+                                     for key, value in draft_past_key_values]
+            next_token = next_token.index_select(0, keep)
+            target_next_token = target_next_token.index_select(0, keep)
+            feature_states = feature_states.index_select(0, keep)
+            target_hidden_states = target_hidden_states.index_select(0, keep)
+            last_valid_index = last_valid_index.index_select(0, keep)
+            generated_sequences = generated_sequences.index_select(0, keep)
+            if return_all_draft_input:
+                all_draft_input_states = all_draft_input_states.index_select(0, keep)
+                all_target_hidden_states = all_target_hidden_states.index_select(0, keep)
+                all_draft_input_ids = all_draft_input_ids.index_select(0, keep)
+            bsz = len(keep_rows)
+            draft_token_length, draft_k, draft_total_token = get_adaptive_hyperparameters(
+                bsz, verification_capacity, max_draft_token_length, max_draft_k,
+                max_verification_num, min_draft_token_length, draft_token_length_c)
                 
                 
                 
@@ -1095,57 +1107,64 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
             
         padding_positions_tensor=padding_positions_indices
 
-        for idx_batch in range(bsz):
-            chosen_index[idx_batch]=[x for x in range(past_kv_len)]+chosen_index[idx_batch] 
+        if reflex is not None:
+            # All accepted indices remain on GPU. Only the common-prefix
+            # length is materialized on host for HF DynamicCache.crop().
+            positions = torch.arange(max_acc_length, device=device)[None, :] + past_kv_len
+            extension = int((chosen_index == positions).long().cumprod(1).sum(1).min().item())
+            prefix_length = min(_cache_seq_length(target_past_key_values), past_kv_len + extension)
+            full_chosen_length = past_kv_len + max_acc_length
+        else:
+            for idx_batch in range(bsz):
+                chosen_index[idx_batch]=[x for x in range(past_kv_len)]+chosen_index[idx_batch]
+            prefix_length=_cache_seq_length(target_past_key_values)
+            for idx_batch in range(len(chosen_index)):
+                the_prefix_length=0
+                for idx,index in enumerate(chosen_index[idx_batch]):
+                    if idx==index:
+                        the_prefix_length=idx+1
+                    else:
+                        break
+                prefix_length=min(the_prefix_length,prefix_length)
+            full_chosen_length = len(chosen_index[0])
 
-        prefix_length=_cache_seq_length(target_past_key_values)
-        for idx_batch in range(len(chosen_index)):
-            the_prefix_length=0
-            
-            for idx,index in enumerate(chosen_index[idx_batch]):
-                if idx==index:
-                    the_prefix_length=idx+1
-                else:
-                    break
-            prefix_length=min(the_prefix_length,prefix_length)
-            
-        if prefix_length==len(chosen_index[0]):
+        if prefix_length==full_chosen_length:
             target_past_key_values.crop(prefix_length)
             
         else:
+            if reflex is not None:
+                gather_index = chosen_index[:, prefix_length - past_kv_len:] - prefix_length
+            else:
+                suffix_indices=[[x-prefix_length for x in item[prefix_length:]] for item in chosen_index]
+                gather_index=torch.tensor(suffix_indices,device=device)
             
-            chosen_index=[[x-prefix_length for x in item[prefix_length:]] for item in chosen_index]
-            chosen_index=torch.tensor(chosen_index,device=device)
-            
-            target_past_key_tensor=torch.stack(
-                [_cache_get_layer(target_past_key_values, idx_layer)[0]
-                 for idx_layer in range(_cache_num_layers(target_past_key_values))],
-                dim=0,
-            )
-            target_past_value_tensor=torch.stack(
-                [_cache_get_layer(target_past_key_values, idx_layer)[1]
-                 for idx_layer in range(_cache_num_layers(target_past_key_values))],
-                dim=0,
-            )
-            
-            L, B, H, T, D = target_past_key_tensor.shape
-            index_expanded = chosen_index.unsqueeze(1).unsqueeze(-1).unsqueeze(0) # shape: (1, B, 1, S, 1)
-            index_expanded = index_expanded.expand(L, B, H, -1, D)       # shape: (L, B, H, S, D)
-            
-            prefix_key=target_past_key_tensor[..., :prefix_length,:]
-            prefix_value=target_past_value_tensor[..., :prefix_length,:]
-            
-            suffix_key=target_past_key_tensor[..., prefix_length:,:]
-            suffix_value=target_past_value_tensor[..., prefix_length:,:]
-
-            suffix_key = suffix_key.gather(dim=-2, index=index_expanded)          # shape: (L, B, H, S-P, D)
-            suffix_value = suffix_value.gather(dim=-2, index=index_expanded)      # shape: (L, B, H, S-P, D)
-            
-            new_key=torch.concat([prefix_key,suffix_key],dim=-2)
-            new_value=torch.concat([prefix_value,suffix_value],dim=-2)
-        
-            for idx_L in range(L):
-                _cache_set_layer(target_past_key_values, idx_L, new_key[idx_L], new_value[idx_L])
+            if kv_gather_strategy == "per_layer":
+                for layer in range(_cache_num_layers(target_past_key_values)):
+                    key, value = _cache_get_layer(target_past_key_values, layer)
+                    heads, head_dim = key.shape[1], key.shape[-1]
+                    index_expanded = gather_index[:, None, :, None].expand(bsz, heads, -1, head_dim)
+                    new_key = torch.cat((key[..., :prefix_length, :],
+                                         key[..., prefix_length:, :].gather(-2, index_expanded)), dim=-2)
+                    new_value = torch.cat((value[..., :prefix_length, :],
+                                           value[..., prefix_length:, :].gather(-2, index_expanded)), dim=-2)
+                    _cache_set_layer(target_past_key_values, layer, new_key, new_value)
+            else:
+                target_past_key_tensor=torch.stack(
+                    [_cache_get_layer(target_past_key_values, idx_layer)[0]
+                     for idx_layer in range(_cache_num_layers(target_past_key_values))], dim=0)
+                target_past_value_tensor=torch.stack(
+                    [_cache_get_layer(target_past_key_values, idx_layer)[1]
+                     for idx_layer in range(_cache_num_layers(target_past_key_values))], dim=0)
+                L, B, H, T, D = target_past_key_tensor.shape
+                index_expanded = gather_index.unsqueeze(1).unsqueeze(-1).unsqueeze(0).expand(L, B, H, -1, D)
+                prefix_key=target_past_key_tensor[..., :prefix_length,:]
+                prefix_value=target_past_value_tensor[..., :prefix_length,:]
+                suffix_key=target_past_key_tensor[..., prefix_length:,:].gather(-2, index_expanded)
+                suffix_value=target_past_value_tensor[..., prefix_length:,:].gather(-2, index_expanded)
+                new_key=torch.concat([prefix_key,suffix_key],dim=-2)
+                new_value=torch.concat([prefix_value,suffix_value],dim=-2)
+                for layer in range(L):
+                    _cache_set_layer(target_past_key_values, layer, new_key[layer], new_value[layer])
                 
         draft_attention_mask=get_attention_mask(draft_past_key_values[0][0].shape[-2], max_acc_length,
                                                 model.dtype, bsz, padding_positions=padding_positions_tensor)
@@ -1196,6 +1215,14 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
             last_valid_index=last_valid_index.unsqueeze(-1).expand(-1,-1,D) # [bsz, 1] -> [bsz, 1, D]
             draft_hidden_states=draft_outputs['hidden_states'].gather(index=last_valid_index, dim=1)
             next_feature_states=draft_outputs['next_feature_states'].gather(index=last_valid_index, dim=1)
+
+            # Accepted gather, KV pruning, masks and committed-token draft
+            # forward are independent of the new A. The event is needed only
+            # before batch-compacting A or issuing the next proposal.
+            if update_stream is not None:
+                torch.cuda.current_stream(device).wait_event(update_done)
+                if finished_indices:
+                    reflex.remove_finished(finished_indices)
 
             outputs=draft_generate(model, next_feature_states, draft_hidden_states, draft_past_key_values,
                                 draft_token_length, past_position_ids_tensor, padding_positions_tensor,
@@ -1320,6 +1347,11 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
         'reflex_updates': 0 if reflex_stats is None else reflex_stats.updates,
         'reflex_backend': 'off' if reflex is None else reflex.backend,
         'reflex_feedback_scope': 'off' if reflex is None else reflex_feedback_scope,
+        'reflex_proposal_strategy': 'off' if reflex is None else reflex.proposal_strategy,
+        'reflex_correction_strategy': 'off' if reflex is None else reflex.correction_strategy,
+        'reflex_feedback_strategy': 'off' if reflex is None else reflex.feedback_strategy,
+        'reflex_feature_strategy': 'off' if reflex is None else reflex.feature_strategy,
+        'reflex_update_stream': bool(update_stream is not None),
     }
     if reflex_stats is not None and reflex_stats.alpha_sum is not None:
         result['reflex_alpha_sum'] = reflex_stats.alpha_sum

@@ -39,14 +39,14 @@ class Cache:
             layer.values = layer.values.repeat_interleave(repeats, 0)
 
 
-def load_rollout(source=None):
+def load_rollout(source=None, device="cpu"):
     path = Path(__file__).resolve().parents[1] / "helper/specualtive_generate.py"
     tree = ast.parse(path.read_text(encoding="utf-8") if source is None else source)
     functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
     # Only a test-device substitution. Never changes the production file.
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name == "get_attention_mask":
-            node.args.defaults[1] = ast.Constant("cpu")
+            node.args.defaults[1] = ast.Constant(device)
     scope = dict(torch=torch, time=time, math=math, deepcopy=deepcopy, DynamicCache=Cache,
         ThreadPoolExecutor=ThreadPoolExecutor, FastLKReflex=FastLKReflex,
         reflex_or_baseline_probabilities=reflex_or_baseline_probabilities,
@@ -133,3 +133,61 @@ def test_fixed_seed_rollout_tensor_reflex_preserves_legacy_verifier(sample, repe
         for key in ("all_draft_input_states", "all_target_hidden_states", "all_draft_input_ids"):
             for a, b in zip(candidate[0][key], baseline[0][key]):
                 torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("mode", ["off", "active"])
+def test_per_layer_kv_gather_matches_stacked_rollout(mode, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "Stream", lambda device: object())
+    monkeypatch.setattr(torch.cuda, "set_device", lambda device: None)
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
+    generate = load_rollout()
+    ids = torch.tensor([[0, 0, 4, 5], [3, 7, 8, 9]])
+    mask = torch.tensor([[0, 0, 1, 1], [1, 1, 1, 1]])
+    outcomes = []
+    for strategy in ("stacked", "per_layer"):
+        torch.manual_seed(511)
+        model = TinyModel()
+        with torch.inference_mode():
+            output = generate(model, ids, mask, SimpleNamespace(eos_token_id=16),
+                do_sample=True, repeated_generate_nums=2, max_length=18,
+                verification_capacity=48, max_verification_num=16, max_draft_k=3,
+                max_draft_token_length=3, min_draft_token_length=2,
+                reflex_mode=mode, reflex_backend="torch", reflex_lr=.05,
+                kv_gather_strategy=strategy)
+        outcomes.append((output, model.calls))
+    assert outcomes[0][1] == outcomes[1][1]
+    for key in ("generated_token_ids", "response_verification_rounds", "response_accepted_length_sum"):
+        assert outcomes[0][0][key] == outcomes[1][0][key]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="real CUDA required")
+@pytest.mark.parametrize("scope", ["root", "visited_path"])
+def test_cuda_streamed_reflex_rollout_matches_single_stream(scope):
+    class CudaTinyModel(TinyModel):
+        device = torch.device("cuda:0")
+
+        def __init__(self):
+            super().__init__()
+            self.embedding = self.embedding.cuda()
+            self.target_head.cuda()
+            self.draft_head.cuda()
+
+    generate = load_rollout(device="cuda:0")
+    ids = torch.tensor([[0, 0, 4, 5], [3, 7, 8, 9]], device="cuda")
+    mask = torch.tensor([[0, 0, 1, 1], [1, 1, 1, 1]], device="cuda")
+    outcomes = []
+    for streamed in (False, True):
+        torch.manual_seed(111)
+        model = CudaTinyModel()
+        with torch.inference_mode():
+            output = generate(model, ids, mask, SimpleNamespace(eos_token_id=16),
+                do_sample=True, repeated_generate_nums=2, max_length=18,
+                verification_capacity=48, max_verification_num=16, max_draft_k=3,
+                max_draft_token_length=3, min_draft_token_length=2,
+                reflex_mode="active", reflex_backend="triton", reflex_lr=.05,
+                reflex_feedback_scope=scope, reflex_update_stream=streamed)
+        torch.cuda.synchronize()
+        outcomes.append((output, model.calls))
+    assert outcomes[0][1] == outcomes[1][1]
+    for key in ("generated_token_ids", "response_verification_rounds", "response_accepted_length_sum"):
+        assert outcomes[0][0][key] == outcomes[1][0][key]

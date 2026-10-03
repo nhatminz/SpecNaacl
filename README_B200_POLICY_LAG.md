@@ -11,7 +11,7 @@ Expected placement:
 
 ```text
 /workspace/storage-shared/nlp/minhpn19/
-├── fastgrpo/                         # this entire folder
+├── SpecNaacl/                        # this entire folder
 └── data/
     ├── sharegpt/ShareGPT_V4.3_unfiltered_cleaned_split.json
     └── DAPO-Math-17k-Processed/en/train-00000-of-00001.parquet
@@ -25,10 +25,12 @@ matching one-layer EAGLE-3 config and capture layers automatically.
 
 ## Commands
 
-Activate the preinstalled Python 3.11 environment, then run both stages:
+Install and activate the offline Python 3.12 environment from `ENVIRONMENT.md`,
+then run both stages:
 
 ```bash
-cd /workspace/storage-shared/nlp/minhpn19/fastgrpo
+cd /workspace/storage-shared/nlp/minhpn19/SpecNaacl
+source .venv-offline/bin/activate
 PYTHON_BIN="$(command -v python)" bash run_b200_policy_lag_pipeline.sh
 ```
 

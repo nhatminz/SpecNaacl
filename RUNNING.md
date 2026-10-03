@@ -92,3 +92,8 @@ Plot selected runs by editing `RUN_DIRS` in `scripts/plot_training_time.sh` or:
 ```bash
 bash scripts/plot_training_time.sh /absolute/run1 /absolute/run2
 ```
+
+For the opt-in Reflex parallel kernels, GPU path bookkeeping, side-stream
+overlap, and B200 benchmark/selection commands, see
+[REFLEX_B200_OPTIMIZATION.md](REFLEX_B200_OPTIMIZATION.md). Production defaults
+keep unmeasured kernel/stream candidates disabled.

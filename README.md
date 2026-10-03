@@ -34,5 +34,13 @@ Start with [huongdanchay.md](huongdanchay.md). Technical details are in
 [METHOD_FAST_LK_REFLEX.md](METHOD_FAST_LK_REFLEX.md), and all launcher knobs are
 listed in [RUNNING.md](RUNNING.md).
 
+For a network-isolated B200, do not install directly from `requirements.txt`.
+Build and validate a binary wheelhouse first; the exact commands and the
+`cuda-tile` placeholder explanation are in
+[OFFLINE_INSTALL.md](OFFLINE_INSTALL.md) and [ENVIRONMENT.md](ENVIRONMENT.md).
+If the server can install ordinary packages itself and only NVIDIA's index is
+blocked, use the much smaller Hugging Face transfer described in
+[EXTERNAL_WHEELS_HF.md](EXTERNAL_WHEELS_HF.md).
+
 All new outputs are written under `SpecNaacl/outputs/{pretrain,train}/...`.
 No launcher clones repositories or downloads models/datasets.

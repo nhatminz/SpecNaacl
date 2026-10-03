@@ -1,4 +1,6 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
-
+.venv-offline/
+wheelhouse-cp312-cu130/
+external-wheels-cp312-linux-x86_64/

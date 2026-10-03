@@ -71,6 +71,39 @@ class VerifiedPath:
     feedback_contexts: torch.Tensor
     lengths: torch.Tensor
 
+    def padded_gpu(self, past_length: int, width: int, eos_token_id: int, *, kernels=None, workspace=None):
+        """Pad committed paths on device, preserving FastGRPO's gap-first rule.
+
+        Only ``width=max(lengths)`` is host metadata. Accepted tokens and KV
+        indices never make a CPU round trip. The mask marks synthetic EOS slots.
+        """
+        batch, capacity = self.tokens.shape
+        if not 1 <= width <= capacity:
+            raise ValueError("invalid committed path width")
+        if kernels is not None:
+            return kernels.pad_verified_path(self, past_length, width, eos_token_id, workspace)
+        device = self.tokens.device
+        slots = torch.arange(capacity, device=device)[None, :]
+        valid = slots < self.lengths[:, None]
+        # Each accepted tree row occupies its sorted absolute KV position until
+        # the per-response padding budget is exhausted. Remaining slots are
+        # synthetic EOS, indexed exactly as the original gap/tail insertion.
+        budget = width - self.lengths[:, None]
+        gaps = (self.packed_indices - slots).clamp_min(0)
+        inserted_before = torch.minimum(gaps, budget.clamp_min(0))
+        destination = slots + inserted_before
+        positions = torch.arange(width, device=device)[None, :, None]
+        accepted = (positions == destination[:, None, :]) & valid[:, None, :]
+        accepted_mask = accepted.any(-1)
+        source_slot = accepted.to(torch.int32).argmax(-1).long()
+        output_tokens = torch.where(accepted_mask,
+                                    self.tokens.gather(1, source_slot), int(eos_token_id))
+        output_indices = torch.where(accepted_mask,
+                                     self.packed_indices.gather(1, source_slot) + int(past_length),
+                                     torch.arange(width, device=device)[None, :] + int(past_length))
+        last_valid = torch.where(valid, destination, -1).amax(-1).long()[:, None]
+        return output_tokens, output_indices, ~accepted_mask, last_valid
+
     def host_bookkeeping(self, past_length):
         """One small D2H packet, only AFTER GPU feedback has consumed this path.
 

@@ -98,6 +98,10 @@ class FastLKReflex:
         diagnostics: bool = False,
         backend: str = "auto",
         feedback_scope: str = "root",
+        proposal_strategy: str = "fused",
+        correction_strategy: str = "serial",
+        feedback_strategy: str = "serial",
+        feature_strategy: str = "auto",
     ) -> None:
         if feature_dim <= 0:
             raise ValueError("feature_dim must be positive")
@@ -116,9 +120,23 @@ class FastLKReflex:
         if feedback_scope not in {"root", "visited_path"}:
             raise ValueError("feedback_scope must be root or visited_path")
         self.feedback_scope = feedback_scope
+        if proposal_strategy not in {"fused", "sort", "hybrid", "torch"}:
+            raise ValueError("proposal_strategy must be fused, sort, hybrid or torch")
+        if correction_strategy not in {"serial", "parallel", "tiled"}:
+            raise ValueError("correction_strategy must be serial, parallel or tiled")
+        if feedback_strategy not in {"serial", "parallel"}:
+            raise ValueError("feedback_strategy must be serial or parallel")
+        if feature_strategy not in {"auto", "triton", "torch"}:
+            raise ValueError("feature_strategy must be auto, triton or torch")
+        self.proposal_strategy = proposal_strategy
+        self.correction_strategy = correction_strategy
+        self.feedback_strategy = feedback_strategy
+        self.feature_strategy = feature_strategy
         self._round_contexts = 0
         self._feedback_raw = self._feedback_psi = self._feedback_norm = None
         self._proposal_workspace = self._feedback_workspace = self.path_workspace = self._root_indices = None
+        self.padded_path_workspace = None
+        self._corrected_workspace = None
         self.backend = "torch"
         self._kernels = None
         self.projection: Optional[torch.Tensor] = None
@@ -211,8 +229,13 @@ class FastLKReflex:
         self._feedback_raw = self._feedback_psi = self._feedback_norm = None
         self.path_workspace = [torch.empty((num_trajectories, self._path_capacity), device=device, dtype=torch.long)
                                for _ in range(3)] + [torch.empty(num_trajectories, device=device, dtype=torch.long)]
+        self.padded_path_workspace = [torch.empty((num_trajectories, self._path_capacity),
+                                                   device=device, dtype=torch.bool if index == 2 else torch.long)
+                                      for index in range(3)]
+        self.padded_path_workspace.append(torch.empty((num_trajectories, 1), device=device, dtype=torch.long))
         self._root_indices = torch.zeros((num_trajectories, 1), device=device, dtype=torch.long)
         self._proposal_workspace = self._feedback_workspace = None
+        self._corrected_workspace = None
         if self._kernels is not None:
             tiles = (compact_vocab_size + 255) // 256
             base = num_trajectories * int(max_proposal_contexts) * tiles
@@ -221,6 +244,12 @@ class FastLKReflex:
             feedback_size = num_trajectories * self._path_capacity * tiles
             self._feedback_workspace = [torch.empty(feedback_size * factor, device=device, dtype=torch.float32)
                                         for factor in (1, 2)]
+            self._feedback_workspace.append(torch.empty(num_trajectories * self._path_capacity,
+                                                        device=device, dtype=torch.float32))
+            if self.proposal_strategy == "hybrid":
+                self._corrected_workspace = torch.empty(
+                    num_trajectories * int(max_proposal_contexts) * compact_vocab_size,
+                    device=device, dtype=torch.float32)
 
     def _cache_contexts(self, raw, psi, norm):
         """Native logits only (usually BF16), psi and max/sum normalization.
@@ -258,20 +287,30 @@ class FastLKReflex:
                 raise ValueError("root proposal must contain one context")
             self._round_contexts = 0
             self._root_q = self._root_psi = None
+        needs_fp32_guard = (self._kernels is None or self.proposal_strategy in {"hybrid", "torch"}
+                            or self.feature_strategy == "torch")
         guard = (torch.autocast(device_type=compact_logits.device.type, enabled=False)
-                 if self._kernels is None and torch.is_autocast_enabled(compact_logits.device.type)
+                 if needs_fp32_guard and torch.is_autocast_enabled(compact_logits.device.type)
                  else nullcontext())
         with guard:
             psi = self._feature(native_hidden)
-            if self._kernels is not None:
+            if self._kernels is not None and self.proposal_strategy in {"fused", "sort"}:
                 values, ids, norm = self._kernels.propose(compact_logits, psi, self.state, k,
-                                                        self._proposal_workspace)
+                                                        self._proposal_workspace,
+                                                        strategy=self.proposal_strategy)
             else:
-                z = torch.baddbmm(compact_logits.float(), psi, self.state.transpose(1, 2))
+                if self._kernels is not None and self.proposal_strategy == "hybrid":
+                    corrected_size = compact_logits.numel()
+                    z = self._kernels.correct_logits(compact_logits, psi, self.state,
+                                                      strategy=self.correction_strategy,
+                                                      out=self._corrected_workspace[:corrected_size].view(
+                                                          compact_logits.shape))
+                else:
+                    z = torch.baddbmm(compact_logits.float(), psi, self.state.transpose(1, 2))
                 q = z.softmax(dim=-1)
                 values, ids = torch.topk(q, k=k, dim=-1)
                 norm = None
-                if self.feedback_scope == "visited_path":
+                if self.feedback_scope == "visited_path" or (root and self._kernels is not None):
                     maximum = z.amax(-1)
                     norm = torch.stack((maximum, (z - maximum.unsqueeze(-1)).exp().sum(-1)), -1)
                 if root and self.feedback_scope == "root":
@@ -311,7 +350,8 @@ class FastLKReflex:
             if self._kernels is not None:
                 alpha = self._kernels.update_path(self.state, raw, psi, norm, target, mapping,
                     indices, contexts, greedy=greedy, eps=self.eps, learning_rate=self.learning_rate,
-                    decay=1.0 - self.learning_rate * self.weight_decay, workspace=self._feedback_workspace)
+                    decay=1.0 - self.learning_rate * self.weight_decay, workspace=self._feedback_workspace,
+                    strategy=self.feedback_strategy)
             else:
                 rows = torch.arange(batch, device=self.state.device)[:, None]
                 safe = contexts.clamp_min(0)
@@ -352,7 +392,7 @@ class FastLKReflex:
         if self.projection is None:
             raise RuntimeError("FastLKReflex.start() must be called before correction")
         if self._kernels is not None:
-            return self._kernels.feature(hidden_states, self.projection)
+            return self._kernels.feature(hidden_states, self.projection, strategy=self.feature_strategy)
         return F.normalize(hidden_states.float().matmul(self.projection), dim=-1, eps=1.0e-6)
 
     @torch.no_grad()
@@ -376,7 +416,8 @@ class FastLKReflex:
         # an extra AMP context on its hot path. Torch needs the guard only when
         # the caller actually enabled model autocast.
         guard = (torch.autocast(device_type=compact_logits.device.type, enabled=False)
-                 if self._kernels is None and torch.is_autocast_enabled(compact_logits.device.type)
+                 if (self._kernels is None or self.feature_strategy == "torch")
+                 and torch.is_autocast_enabled(compact_logits.device.type)
                  else nullcontext())
         with guard:
             psi = self._feature(native_hidden)
@@ -526,6 +567,8 @@ class FastLKReflex:
     def clear(self) -> None:
         self._feedback_raw = self._feedback_psi = self._feedback_norm = None
         self._proposal_workspace = self._feedback_workspace = self.path_workspace = self._root_indices = None
+        self.padded_path_workspace = None
+        self._corrected_workspace = None
         self._round_contexts = 0
         self.projection = None
         self.state = None
