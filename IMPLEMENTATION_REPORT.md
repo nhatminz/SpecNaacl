@@ -390,3 +390,53 @@ warnings are the existing scheduler and optional FA availability notices.
 `git diff --check` passes. No production GPU training was launched.
 No dependencies, training math, optimizer settings, checkpoints or backend
 selection were changed by this interpreter-policy update.
+
+## GRPO helper import isolation fix (2026-10-03)
+
+The new log for Qwen2.5-3B/SimpleLR/SpecNaacl passes validation with Python
+3.12.3, Torch 2.13.0+cu130 and CUDA 13.0, then exits at the unconditional
+`from helper.modeling_draft import Model`. The following torchrun
+`ChildFailedError` is the worker-exit wrapper, not an additional root failure.
+This log is not an OOM or a draft-checkpoint loading failure.
+
+Two concrete issues in the local source were corrected:
+
+- `grpo_speculative.py` prepended the parent directory after inserting the
+  repository. A parent package named `helper` could therefore shadow the
+  project's helper package. The entrypoint now moves its own root to index 0
+  unconditionally and does not inject the parent. The project root was already
+  present during torchrun startup; merely skipping insertion was insufficient.
+- The legacy draft module was imported even for `--draft_backend=eagle3`.
+  It is now imported only inside the existing legacy construction branch. The
+  EAGLE adapter receives the same checkpoint/config/vocab and TTT options;
+  the legacy branch still constructs and loads its original model.
+
+The remote traceback does not prove which helper directory Python resolved or
+whether its checkout was incomplete. No remote filesystem access was available;
+the fix addresses both unnecessary legacy coupling and the provable local path
+ordering bug rather than asserting an unobserved server package origin.
+
+Additional changed files:
+
+- `scripts/check_training_sources.py`: read-only stdlib source-integrity check
+  for core helpers and the chosen backend. Missing files give their exact paths,
+  advise syncing the project's helper directory, and explicitly distinguish it
+  from a pip package. EAGLE is admitted without `modeling_draft.py`.
+- `scripts/launch/train_model.sh`: run that check after Python-version admission
+  and before full pinned runtime imports / torchrun / training-output writes.
+- `tests/test_training_imports.py`: subprocess reproduction with a foreign parent
+  helper, with/without the repo already in sys.path; execute the real AST backend
+  selection branches to verify EAGLE does not import legacy while legacy still
+  loads its checkpoint; incomplete-checkout errors and launcher precheck order.
+- `ENVIRONMENT.md`: deployment diagnosis and recovery commands.
+
+Targeted import/source tests: **11 passed**. Both native source-check commands
+(`--backend eagle3` and `--backend legacy`) pass on the local checkout.
+`python -m compileall -q .` passes; `pytest -q` with
+`BASH_BIN=D:/Git/bin/bash.exe` reports **106 passed, 1 skipped, 8 warnings**.
+The skip is the same unavailable Windows Gloo transport; warnings are existing
+scheduler notices and expected optional FlashAttention availability. Tests use
+CPU/source-isolated import/backend selection, not the complete production stack.
+`git diff --check` passes. No loss, sampling,
+Reflex update, optimizer, data, checkpoint/resume or GPU assignment was changed.
+No real GRPO run, full pretrain or B200 benchmark was launched.

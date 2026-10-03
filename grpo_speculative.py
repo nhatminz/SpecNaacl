@@ -4,15 +4,15 @@ import random
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-PROJECT_ROOT = REPO_ROOT.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+# Keep this checkout ahead of parent/PYTHONPATH packages named "helper", even
+# when torchrun has already inserted the repository further down sys.path.
+repo_import_path = str(REPO_ROOT)
+if repo_import_path in sys.path:
+    sys.path.remove(repo_import_path)
+sys.path.insert(0, repo_import_path)
 
 import pandas as pd
 from transformers import AutoTokenizer,AutoConfig,AutoModelForCausalLM,GenerationConfig
-from helper.modeling_draft import Model
 from helper.rewards import accuracy_reward_func , format_reward_func
 from helper.get_QAs import get_test_QAs , get_train_QAs, get_QAs_from_path, select_train_subset
 from helper.specualtive_generate import speculative_generate
@@ -650,6 +650,9 @@ if args.draft_backend == 'eagle3':
         kl_decay=args.eagle_kl_decay,
     )
 else:
+    # The legacy implementation is not a dependency of the EAGLE-3 backend.
+    from helper.modeling_draft import Model
+
     config.rope_scaling=None
     config.num_hidden_layers=1
     if model_torch_dtype != "auto":

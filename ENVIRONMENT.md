@@ -158,3 +158,31 @@ Then rerun the original pretrain command in the same shell. Export `PYTHON_BIN`
 explicitly because an older value may still point to a different environment.
 If dependency validation reports missing or incompatible packages, install the
 pinned dependencies using the online or offline commands above.
+
+## Recovery: `No module named 'helper.modeling_draft'` during EAGLE training
+
+`helper/` is project source, not a pip dependency. The reported server passed
+Python 3.12.3 / Torch 2.13.0+cu130 validation, then failed on an unconditional
+legacy draft import despite selecting `--draft_backend eagle3`. The old
+entrypoint also prepended the parent directory ahead of the project itself,
+allowing an unrelated parent `helper` package to shadow the local package.
+The traceback alone does not establish whether the remote checkout was
+incomplete or a foreign helper package was selected.
+
+Update the project code and keep the existing environment/checkpoints:
+
+```bash
+cd /workspace/storage-shared/nlp/minhpn19/SpecNaacl
+export PYTHON_BIN="$(command -v python)"
+"$PYTHON_BIN" scripts/check_training_sources.py --backend eagle3
+"$PYTHON_BIN" -c 'import helper; print(helper.__file__)'
+```
+
+The helper path should point inside this project's `helper/` directory. Sync
+the complete project revision, including `helper/__init__.py`, if source files
+are missing; do not install an unrelated `helper` package to work around it.
+Then rerun the original training command. The entrypoint now puts its own
+checkout first and imports `helper.modeling_draft` only for the legacy backend.
+The launcher checks required local sources before importing the full CUDA
+runtime or starting torchrun. EAGLE does not require the unused legacy module.
+The checker checks files only; it is not an end-to-end GPU/dependency benchmark.
