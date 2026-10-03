@@ -13,12 +13,16 @@ non-gradient tensors. `R` is fixed for the rollout and seeded reproducibly; `A`
 starts at zero separately for every response and is removed when that response
 leaves the active batch. `A` is defined on SpecForge's compact EAGLE vocabulary.
 
-Both `REFLEX_MODE=off` and `REFLEX_MODE=active` use the same EAGLE-3 compact
-logits, compact softmax, top-k and fixed `d2t` mapping. The only ACTIVE-mode
-difference is the additive `A psi` correction. Therefore a zero fast state is
-exactly proposal-equivalent to OFF mode.
+Both modes use the same EAGLE-3 compact logits and fixed `d2t` mapping.
+ACTIVE adds `A psi` before normalized top-k. Torch uses the unfused reference;
+Triton fuses correction/normalization/top-k, without dense branch q. Zero-state
+Torch proposals reproduce OFF exactly; fused rounding/tie order need not be
+bit-identical. The target sampler and token-matching verification stay authoritative.
 
-After each target verification, only the root proposal is updated. The target
+After each target verification, `REFLEX_FEEDBACK_SCOPE=root` (default) uses
+the root proposal; `visited_path` uses only actually entered proposal heads.
+Unexpanded leaves have no draft-head q/psi and are excluded, even when their
+target bonus token is emitted. Feedback stops at the first EOS. The target
 token is sampled from `build_sampling_probs`, which applies the configured
 temperature, top-p and top-k and returns the final normalized sampling
 distribution. For stochastic decoding Reflex reuses that same tensor. For
@@ -36,6 +40,11 @@ g_i   = q_i (S - m_i) / (alpha + eps)
 
 A <- (1 - lr * weight_decay) A - lr * g psi^T
 ```
+
+In `visited_path`, replace `g psi^T` by its **mean over eligible visited heads**,
+evaluated with the SAME pre-update A; apply decay and write A only once per round.
+This changes feedback, not what the verifier commits. `--reflex_update_scope`
+remains a CLI alias of `--reflex_feedback_scope`.
 
 Here `p` is the conditional compact-vocabulary teacher distribution:
 `p_full[d2t] / (sum(p_full[d2t]) + eps)`. This is a conditional
@@ -66,13 +75,20 @@ and EAGLE training precision are unchanged; this guard applies only to Reflex.
 - `triton`: require CUDA/Triton and dimension <=64, otherwise fail clearly.
   Compilation/runtime errors are surfaced, not silently swallowed or retried.
 
-The Triton path fuses conversion/projection/normalization, then conversion plus
-`A psi` addition (the shared Torch softmax/top-k/mapping stay unchanged). Large
+The Triton path fuses conversion/projection/normalization, then uses two proposal
+launches: tiled correction/max/sum/top-k and summary merge. One CTA reuses an A
+vocab tile across all small C contexts. Only selected ids/probabilities and FP32
+max/sum normalization leave the merge; compact-id ascending ties are deterministic
+(Torch top-k tie order is unspecified). Large
 projection shapes use guarded FP32 cuBLAS instead of the fused feature kernel.
 The LK update uses three tiled launches to condition the existing teacher,
 reduce alpha/selected mass, and update `A` in-place, without materializing dense
 compact teacher/mask/gradient/outer-product tensors. It supports full ~152k
-Qwen vocabulary too; no sample/token, feature dimension or update is dropped.
+Qwen vocabulary too. Visited feedback reconstructs q from native logits plus
+psi/max/sum; it never caches full tree q in FP32. Teacher-mass and LK-statistics
+launches span ALL visited slots; the third launch aggregates the mean and writes
+A once. There is no update launch per depth. The dense `correct()` API remains
+for reference/parity, not the production Triton proposal path.
 Runtime strides and 64-bit batch offsets support strided verification-root
 views and shrinking active batches without fixing a CUDA graph's batch size.
 
@@ -116,6 +132,69 @@ checks/benchmark pass. Use `REFLEX_BACKEND=torch` for the reference implementati
 or if a server/compiler-specific issue is encountered. Diagnostics/profile remain
 off by default; use the existing AAL/reward metrics on matched real runs to
 validate end-to-end benefit and task quality rather than assuming zero overhead.
+
+## Tensor-tree and deployment benchmark (2026-10-03)
+
+ACTIVE keeps full/packed parents, tokens and head-context ids on the GPU. The
+Triton verifier extracts the first matching child path in one launch, consuming
+the original sample-once target tokens, stopping at EOS. Feedback runs BEFORE
+the one small path packet goes to CPU. This replaces per-node D2H copies,
+CPU Node/link construction/traversal and the transfer thread pool. Legacy OFF
+code stays in place. KV padding/pruning still needs CPU bookkeeping; this is
+NOT a fully host-free rollout. Prefill transfers the attention metadata once
+instead of reading one GPU scalar per prompt token. Target tree masks have a
+reused flat pool and, on Triton, one construction launch.
+
+Proposal summaries, native-logit/psi/norm feedback pools, update partials, root
+indices and path buffers are reused. A compaction stays double-buffered; no
+unmeasured indirection, stream overlap or hybrid dispatch has been enabled.
+`auto` is the existing availability resolver, NOT an autotuner or speed claim.
+Start with explicit `REFLEX_BACKEND=torch`; qualify Triton on your actual server:
+
+```bash
+pytest -q tests/test_fast_lk_reflex.py tests/test_reflex_cuda_pipeline.py
+python scripts/benchmark_reflex_pipeline.py --backend triton --feedback-scope root \
+  --batch 64 --vocab 16000 --contexts 8 --feature-dim 8 --topk 8
+python scripts/benchmark_reflex_pipeline.py --backend triton --feedback-scope visited_path \
+  --batch 64 --vocab 16000 --contexts 8 --feature-dim 8 --topk 8
+```
+
+Repeat component measurements for actual vocab/H and C=1/4/7/8, D=4/8, K=4/8.
+They report correction-only, old dense pipeline, fused pipeline, path extraction,
+feedback and whole Reflex cycle, GPU-event and host-wall times, and numerical
+errors. CPU mode is smoke-only. Then measure REAL production-model rollout:
+
+```bash
+python scripts/benchmark_reflex_rollout.py \
+  --target-model "$TARGET_MODEL_PATH" --draft-config "$DRAFT_CONFIG" \
+  --draft-checkpoint "$DRAFT_CHECKPOINT" --vocab-mapping "$VOCAB_MAPPING" \
+  --dataset-path "$DATASET_PATH" --batch-size 8 --responses 8 \
+  --warmup 2 --iterations 5
+```
+
+Use `--target-adapter` for the same trained target LoRA. This benchmark loads
+existing local weights, reuses the production dataset loader AND training prompt
+collator, and measures synchronized generation wall clock/tokens/s, weighted AAL,
+actual backbone forwards and peak memory. `*-zero` controls isolate tensor-path
+engineering from acceptance learning. Frozen weights/no optimizer: these are NOT
+training throughput or task-quality results. Optional `--profile-trace NEW.json`
+records one extra, untimed rollout; there is no profiler in default training.
+
+For an explicit short end-to-end training comparison (creates NEW isolated runs):
+
+```bash
+MODEL_KEY=qwen25_3b REFLEX_BACKEND=torch REFLEX_FEEDBACK_SCOPE=visited_path \
+  BENCHMARK_STEPS=20 bash scripts/benchmark_reflex_training.sh
+```
+
+Keep the same data, seed, batch, accumulation, target/draft checkpoints, device
+count and scope when comparing Torch/Triton. The read-only summarizer separates
+tokens/generation-time from tokens/whole-job-time (the existing training summary's
+`generation_tokens_per_s` is historically a whole-job metric). Model/data startup
+and reward filtering are included in that short training benchmark. No full
+pretrain is invoked. Keep backend AND feedback scope fixed for comparable resumes.
+Choose the backend using repeated measured end-to-end runs, not component speed
+or AAL alone; no B200 result has been produced by the CPU-only development host.
 
 The default path neither profiles Reflex nor computes diagnostic LK loss.
 `REFLEX_DIAGNOSTICS=1` enables rollout-aggregate LK alpha/loss only;

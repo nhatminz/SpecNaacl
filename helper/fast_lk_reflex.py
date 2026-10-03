@@ -97,6 +97,7 @@ class FastLKReflex:
         profile: bool = False,
         diagnostics: bool = False,
         backend: str = "auto",
+        feedback_scope: str = "root",
     ) -> None:
         if feature_dim <= 0:
             raise ValueError("feature_dim must be positive")
@@ -112,6 +113,12 @@ class FastLKReflex:
         if backend not in {"auto", "torch", "triton"}:
             raise ValueError("Reflex backend must be auto, torch or triton")
         self.requested_backend = backend
+        if feedback_scope not in {"root", "visited_path"}:
+            raise ValueError("feedback_scope must be root or visited_path")
+        self.feedback_scope = feedback_scope
+        self._round_contexts = 0
+        self._feedback_raw = self._feedback_psi = self._feedback_norm = None
+        self._proposal_workspace = self._feedback_workspace = self.path_workspace = self._root_indices = None
         self.backend = "torch"
         self._kernels = None
         self.projection: Optional[torch.Tensor] = None
@@ -144,6 +151,7 @@ class FastLKReflex:
         compact_vocab_size: int,
         hidden_size: int,
         device: torch.device | str,
+        *, max_contexts=1, max_path_length=1, max_proposal_contexts=8, max_topk=8,
     ) -> None:
         """Create one zero fast state per response, once per rollout."""
         if num_trajectories <= 0 or compact_vocab_size <= 0 or hidden_size <= 0:
@@ -194,6 +202,151 @@ class FastLKReflex:
         )
         self._updates = 0
         self._profile_time_s = 0.0
+        self._batch_capacity = num_trajectories
+        self._context_capacity = int(max_contexts) if self.feedback_scope == "visited_path" else 1
+        self._path_capacity = int(max_path_length)
+        if min(self._context_capacity, self._path_capacity, int(max_proposal_contexts), int(max_topk)) <= 0:
+            raise ValueError("Reflex workspace capacities must be positive")
+        self._round_contexts = 0
+        self._feedback_raw = self._feedback_psi = self._feedback_norm = None
+        self.path_workspace = [torch.empty((num_trajectories, self._path_capacity), device=device, dtype=torch.long)
+                               for _ in range(3)] + [torch.empty(num_trajectories, device=device, dtype=torch.long)]
+        self._root_indices = torch.zeros((num_trajectories, 1), device=device, dtype=torch.long)
+        self._proposal_workspace = self._feedback_workspace = None
+        if self._kernels is not None:
+            tiles = (compact_vocab_size + 255) // 256
+            base = num_trajectories * int(max_proposal_contexts) * tiles
+            self._proposal_workspace = [torch.empty(base * (int(max_topk) if i >= 2 else 1),
+                device=device, dtype=torch.long if i == 3 else torch.float32) for i in range(4)]
+            feedback_size = num_trajectories * self._path_capacity * tiles
+            self._feedback_workspace = [torch.empty(feedback_size * factor, device=device, dtype=torch.float32)
+                                        for factor in (1, 2)]
+
+    def _cache_contexts(self, raw, psi, norm):
+        """Native logits only (usually BF16), psi and max/sum normalization.
+
+        Pools survive rounds and finished-row compaction. Every next draft round
+        overwrites its active rows; no old-cache compaction/copy is necessary.
+        """
+        batch, contexts, vocab = raw.shape
+        start, end = self._round_contexts, self._round_contexts + contexts
+        if end > self._context_capacity:
+            raise ValueError("feedback context capacity exceeded; pass max_contexts to start()")
+        if self._feedback_raw is None:
+            shape = (self._batch_capacity, self._context_capacity)
+            self._feedback_raw = torch.empty((*shape, vocab), device=raw.device, dtype=raw.dtype)
+            self._feedback_psi = torch.empty((*shape, self.feature_dim), device=raw.device, dtype=torch.float32)
+            self._feedback_norm = torch.empty((*shape, 2), device=raw.device, dtype=torch.float32)
+        elif self._feedback_raw.dtype != raw.dtype:
+            raise ValueError("proposal logits dtype must remain fixed within a rollout")
+        self._feedback_raw[:batch, start:end].copy_(raw)
+        self._feedback_psi[:batch, start:end].copy_(psi)
+        self._feedback_norm[:batch, start:end].copy_(norm)
+        self._round_contexts = end
+
+    @torch.no_grad()
+    def propose(self, compact_logits, native_hidden, k, mapping, *, root=False):
+        """Top-k without dense branch probabilities on the Triton backend."""
+        started = self._profile_start()
+        if self.state is None or compact_logits.shape[0] != self.active_trajectories:
+            raise ValueError("Reflex state is not aligned with the active batch")
+        k = int(k)
+        if not 1 <= k <= compact_logits.shape[-1]:
+            raise ValueError("invalid proposal top-k")
+        if root:
+            if compact_logits.shape[1] != 1:
+                raise ValueError("root proposal must contain one context")
+            self._round_contexts = 0
+            self._root_q = self._root_psi = None
+        guard = (torch.autocast(device_type=compact_logits.device.type, enabled=False)
+                 if self._kernels is None and torch.is_autocast_enabled(compact_logits.device.type)
+                 else nullcontext())
+        with guard:
+            psi = self._feature(native_hidden)
+            if self._kernels is not None:
+                values, ids, norm = self._kernels.propose(compact_logits, psi, self.state, k,
+                                                        self._proposal_workspace)
+            else:
+                z = torch.baddbmm(compact_logits.float(), psi, self.state.transpose(1, 2))
+                q = z.softmax(dim=-1)
+                values, ids = torch.topk(q, k=k, dim=-1)
+                norm = None
+                if self.feedback_scope == "visited_path":
+                    maximum = z.amax(-1)
+                    norm = torch.stack((maximum, (z - maximum.unsqueeze(-1)).exp().sum(-1)), -1)
+                if root and self.feedback_scope == "root":
+                    # Keep the exact existing Torch/root ablation, no reconstruction.
+                    self._root_q, self._root_psi = q.squeeze(1), psi.squeeze(1)
+        if self.feedback_scope == "visited_path" or (root and self._kernels is not None):
+            self._cache_contexts(compact_logits, psi, norm)
+        self._profile_end(started)
+        return values, ids, mapping[ids]
+
+    @torch.no_grad()
+    def update_visited(self, target, mapping, path, *, greedy=False, validate=False):
+        """One state write per round; mean over eligible visited proposal heads."""
+        started = self._profile_start()
+        if self._feedback_raw is None or self._round_contexts == 0:
+            raise RuntimeError("proposal feedback was not cached")
+        batch = self.active_trajectories
+        contexts, indices = path.feedback_contexts, path.packed_indices
+        if contexts.shape != indices.shape or indices.ndim != 2 or indices.shape[0] != batch:
+            raise ValueError("feedback path is not aligned with the active batch")
+        if indices.shape[1] > self._path_capacity:
+            raise ValueError("feedback path capacity exceeded")
+        # Production paths come from our bounded tensor verifier. Do NOT launch
+        # separate validation/reduction kernels per update in the default path.
+        # Explicit debug validation stays asynchronous (no GPU scalar on host).
+        valid = (contexts >= 0) & (indices >= 0) if self._kernels is None or self.diagnostics or validate else None
+        if validate:
+            torch._assert_async(((contexts[:, 0] == 0) & (indices[:, 0] == 0)).all(),
+                                "feedback path must start at the root")
+            torch._assert_async(((contexts < self._round_contexts) | ~valid).all(), "invalid feedback context")
+            torch._assert_async(((indices < target.shape[1]) | ~valid).all(), "invalid target row")
+        raw, psi, norm = self._feedback_raw[:batch], self._feedback_psi[:batch], self._feedback_norm[:batch]
+        guard = (torch.autocast(device_type=self.state.device.type, enabled=False)
+                 if self._kernels is None and torch.is_autocast_enabled(self.state.device.type)
+                 else nullcontext())
+        with guard:
+            if self._kernels is not None:
+                alpha = self._kernels.update_path(self.state, raw, psi, norm, target, mapping,
+                    indices, contexts, greedy=greedy, eps=self.eps, learning_rate=self.learning_rate,
+                    decay=1.0 - self.learning_rate * self.weight_decay, workspace=self._feedback_workspace)
+            else:
+                rows = torch.arange(batch, device=self.state.device)[:, None]
+                safe = contexts.clamp_min(0)
+                features = psi[rows, safe]
+                z = torch.baddbmm(raw[rows, safe].float(), features, self.state.transpose(1, 2))
+                norms = norm[rows, safe]
+                q = (z - norms[..., :1]).exp() / norms[..., 1:]
+                teacher = target[rows, indices.clamp_min(0)]
+                p = teacher.unsqueeze(-1).eq(mapping).float() if greedy else teacher.float().index_select(-1, mapping)
+                p = p / (p.sum(-1, keepdim=True) + self.eps)
+                alpha, gradient = lk_alpha_and_logit_gradient_without_loss(q, p, self.eps)
+                counts = valid.sum(1).clamp_min(1).float()
+                gradient = gradient * valid.unsqueeze(-1) / counts[:, None, None]
+                self.state.baddbmm_(gradient.transpose(1, 2), features,
+                    beta=1.0 - self.learning_rate * self.weight_decay, alpha=-self.learning_rate)
+                alpha = alpha * valid
+        # Diagnostics retain their per-trajectory denominator; average contexts.
+        loss = None
+        if self.diagnostics:
+            counts = valid.sum(1).clamp_min(1)
+            mean_alpha = alpha.sum(1) / counts
+            loss = (lk_diagnostic_loss(alpha, self.eps) * valid).sum(1) / counts
+            self._record_update(mean_alpha, loss)
+        else:
+            self._record_update(alpha[:, 0], None)  # shape only; no diagnostic reductions
+        self._round_contexts = 0
+        self._profile_end(started)
+        return alpha, loss
+
+    def _update_cached_root(self, target, mapping, *, greedy):
+        from helper.tree_verification import VerifiedPath
+        zeros = self._root_indices[:self.active_trajectories]
+        path = VerifiedPath(zeros, zeros, zeros, zeros[:, 0])
+        alpha, loss = self.update_visited(target.unsqueeze(1), mapping, path, greedy=greedy)
+        return alpha[:, 0], loss
 
     def _feature(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.projection is None:
@@ -249,6 +402,8 @@ class FastLKReflex:
         compact_to_target: torch.Tensor,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Perform one root-only analytic LK update using verification logits."""
+        if self._root_q is None and self._feedback_raw is not None:
+            return self._update_cached_root(target_root_probs, compact_to_target, greedy=False)
         if self.state is None or self._root_q is None or self._root_psi is None:
             raise RuntimeError("root q/psi were not cached before the Reflex update")
         mapping = compact_to_target.to(device=target_root_probs.device, dtype=torch.long)
@@ -267,6 +422,8 @@ class FastLKReflex:
         compact_to_target: torch.Tensor,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Apply greedy one-hot supervision without a full-vocabulary tensor."""
+        if self._root_q is None and self._feedback_raw is not None:
+            return self._update_cached_root(target_root_tokens, compact_to_target, greedy=True)
         if self.state is None or self._root_q is None or self._root_psi is None:
             raise RuntimeError("root q/psi were not cached before the Reflex update")
         mapping = compact_to_target.to(
@@ -367,6 +524,9 @@ class FastLKReflex:
         )
 
     def clear(self) -> None:
+        self._feedback_raw = self._feedback_psi = self._feedback_norm = None
+        self._proposal_workspace = self._feedback_workspace = self.path_workspace = self._root_indices = None
+        self._round_contexts = 0
         self.projection = None
         self.state = None
         self._state_workspace = None

@@ -27,6 +27,7 @@ import threading
 import math
 import warnings
 from concurrent.futures import ThreadPoolExecutor
+from helper.tree_verification import pack_tree, trace_verified_path
 
 from helper.fast_lk_reflex import (
     FastLKReflex,
@@ -175,6 +176,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
                         reflex_seed=42, reflex_profile=False,
                         reflex_diagnostics=False,
                         reflex_backend="auto",
+                        reflex_feedback_scope="root",
                         ):
 
     reflex_mode = str(reflex_mode).strip().lower()
@@ -183,6 +185,8 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
     if reflex_mode == "active" and not getattr(model, "is_eagle3_specforge", False):
         raise ValueError("Fast LK Reflex requires the SpecForge EAGLE-3 draft backend")
     reflex = None
+    if reflex_feedback_scope not in {"root", "visited_path"}:
+        raise ValueError("reflex_feedback_scope must be root or visited_path")
     compact_to_target = None
 
 
@@ -206,7 +210,11 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
         bsz=draft_hidden_states.shape[0]
         
         node_nums=draft_k+draft_k*draft_k*(draft_token_length-1)
-        trees=[[0] * node_nums for _ in range(bsz)] # (bsz, node_nums)
+        trees=[[0] * node_nums for _ in range(bsz)] if reflex is None else []
+        if reflex is not None:
+            full_parents = [torch.full((bsz, draft_k), -1, device=device, dtype=torch.long)]
+            full_contexts = torch.full((bsz, node_nums), -1, device=device, dtype=torch.long)
+            beam_node_ids = torch.arange(draft_k, device=device).expand(bsz, -1)
         parents_list=[]
         
         total_input_ids=[]
@@ -218,12 +226,13 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
         
         if getattr(model, "is_eagle3_specforge", False):
             compact_logits = model.compute_compact_logits(draft_hidden_states)
-            draft_logits = reflex_or_baseline_probabilities(
-                compact_logits, draft_hidden_states, reflex, cache_root=reflex is not None
-            )
-            next_token_values, _, draft_next_token = topk_compact_candidates(
-                draft_logits, compact_to_target, draft_k
-            )
+            if reflex is not None:
+                next_token_values, _, draft_next_token = reflex.propose(
+                    compact_logits, draft_hidden_states, draft_k, compact_to_target, root=True)
+            else:
+                draft_logits = reflex_or_baseline_probabilities(compact_logits)
+                next_token_values, _, draft_next_token = topk_compact_candidates(
+                    draft_logits, compact_to_target, draft_k)
         else:
             draft_logits = model.lm_head(draft_hidden_states.to(model.target_model.dtype))
             draft_logits = draft_logits.softmax(dim=-1)
@@ -233,7 +242,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
         past_kv_len=draft_past_key_values_tree[0][0].shape[-2]
         init_kv_len=draft_past_key_values_tree[0][0].shape[-2]
 
-        for idx_batch in range(bsz):
+        for idx_batch in range(bsz if reflex is None else 0):
             
             for idx_k in range(draft_k):
                 node=Node(depth=0, input_id=None)
@@ -300,12 +309,16 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
             
             if getattr(model, "is_eagle3_specforge", False):
                 compact_logits = model.compute_compact_logits(draft_hidden_states)
-                draft_logits = reflex_or_baseline_probabilities(
-                    compact_logits, draft_hidden_states, reflex, cache_root=False
-                )
-                next_token_values, _, draft_next_token = topk_compact_candidates(
-                    draft_logits, compact_to_target, draft_k
-                )
+                if reflex is not None:
+                    context_ids = 1 + (idx_token - 1) * draft_k + torch.arange(draft_k, device=device)
+                    full_contexts.scatter_(1, beam_node_ids, context_ids.expand(bsz, -1))
+                    full_parents.append(beam_node_ids.repeat_interleave(draft_k, dim=1))
+                    next_token_values, _, draft_next_token = reflex.propose(
+                        compact_logits, draft_hidden_states, draft_k, compact_to_target)
+                else:
+                    draft_logits = reflex_or_baseline_probabilities(compact_logits)
+                    next_token_values, _, draft_next_token = topk_compact_candidates(
+                        draft_logits, compact_to_target, draft_k)
             else:
                 draft_logits = model.lm_head(draft_hidden_states.to(model.target_model.dtype))
                 draft_logits = draft_logits.softmax(dim=-1)
@@ -313,6 +326,8 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
 
             draft_confidences=draft_confidences.unsqueeze(-1)*next_token_values
             draft_top_k_token_values, draft_top_k_token_indices=torch.topk(draft_confidences.view(bsz, -1), k=draft_k, dim=-1) # (bsz, draft_k)
+            if reflex is not None:
+                beam_node_ids = draft_k + draft_k * draft_k * (idx_token - 1) + draft_top_k_token_indices
 
             past_kv_len=draft_past_key_values_tree[0][0].shape[-2]
             
@@ -345,7 +360,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
             
             parents_list.append(draft_top_k_token_indices)
             
-        if draft_token_length>1:
+        if draft_token_length>1 and reflex is None:
             parents_list=torch.stack(parents_list, dim=1) # (bsz, draft_token_length-1, draft_k)    
             parents_list=parents_list.to(torch.int16).cpu().tolist()
                 
@@ -356,6 +371,12 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
         
         chosen_index=torch.topk(confidences, k=draft_total_token, dim=-1)
         chosen_index, _=torch.sort(chosen_index.indices, dim=-1, descending=False)
+        if reflex is not None:
+            tensor_tree = pack_tree(torch.cat(full_parents, dim=1), full_contexts, chosen_index,
+                                    total_input_ids, draft_token_length)
+            return {'trees': [], 'trees_chosen_index': None, 'tensor_tree': tensor_tree,
+                    'next_token_trees': total_input_ids.gather(1, chosen_index),
+                    'target_position_ids': total_position_ids.gather(1, chosen_index)}
         chosen_index_list=chosen_index.to(torch.int16).cpu().tolist()
         
         for idx_tree, tree in enumerate(trees):
@@ -492,8 +513,8 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
     end_sig=[0]*bsz
     device=model.target_model.device
     
-    transfer_stream = torch.cuda.Stream(device)
-    executor = ThreadPoolExecutor(max_workers=64)
+    transfer_stream = torch.cuda.Stream(device) if reflex_mode == "off" else None
+    executor = ThreadPoolExecutor(max_workers=64) if reflex_mode == "off" else None
 
     prefill_time_start=time.time()
     target_time_start=time.time()
@@ -506,6 +527,8 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
     all_target_hidden_states=None
     all_draft_input_ids=None
 
+    # A single metadata transfer replaces one GPU scalar sync per prompt token.
+    attention_mask = attention_mask.cpu() if reflex_mode == "active" else attention_mask
     position_ids=[torch.sum(item) for item in attention_mask]
     past_position_ids=[item.item()-1 for item in position_ids]
 
@@ -554,6 +577,8 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
         top_k=top_k,
         eos_token_id=eos_token_id,
     )
+    if reflex_mode == "active":
+        del _, target_logits
     
     generated_sequences=target_next_token
     
@@ -657,13 +682,26 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
             profile=reflex_profile,
             diagnostics=reflex_diagnostics,
             backend=reflex_backend,
+            feedback_scope=reflex_feedback_scope,
         )
         reflex.start(
             bsz,
             model.compact_vocab_size,
             int(draft_hidden_states.shape[-1]),
             draft_hidden_states.device,
+            max_contexts=1 + max_draft_k * (max_draft_token_length - 1),
+            max_path_length=max_draft_token_length + 1,
+            max_proposal_contexts=max_draft_k, max_topk=max_draft_k,
         )
+        mask_rows_capacity = max(verification_capacity + bsz, 2 * bsz)
+        # KV includes verification padding, not just real-token max_length.
+        # Bound every allowed round so unequal path lengths cannot exhaust the
+        # pool and reintroduce large per-round allocations.
+        mask_columns_capacity = (input_ids.shape[-1] + max_length * (max_draft_token_length + 1)
+                                 + max_verification_num)
+        tree_mask_workspace = torch.empty(
+            mask_rows_capacity * mask_columns_capacity,
+            device=device, dtype=model.target_model.dtype)
         
 
     if statistical_time:
@@ -682,6 +720,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
         trees_chosen_index=outputs['trees_chosen_index']
         next_token_trees=outputs['next_token_trees']
         target_position_ids=outputs['target_position_ids']
+        tensor_tree = outputs.get('tensor_tree')
 
     if statistical_time:
         torch.cuda.synchronize()
@@ -712,9 +751,13 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
                         
         min_dtype=torch.finfo(model.target_model.dtype).min
         
-        target_attention_mask=torch.zeros((q_length, kv_length), dtype=model.target_model.dtype,device=device)
-        target_attention_mask[..., past_kv_len+1:]=min_dtype
-        target_attention_mask=target_attention_mask.unsqueeze(0).unsqueeze(0).repeat(bsz,1,1,1)
+        if reflex is not None:
+            target_attention_mask = tensor_tree.attention_mask(past_kv_len, model.target_model.dtype,
+                kernels=reflex._kernels, workspace=tree_mask_workspace)
+        else:
+            target_attention_mask=torch.zeros((q_length, kv_length), dtype=model.target_model.dtype,device=device)
+            target_attention_mask[..., past_kv_len+1:]=min_dtype
+            target_attention_mask=target_attention_mask.unsqueeze(0).unsqueeze(0).repeat(bsz,1,1,1)
         
         indices=[]
         
@@ -751,7 +794,8 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
                         
             return trees
         
-        transfer_thread = executor.submit(transfer_input_ids, target_trees, trees_chosen_index, device, transfer_stream)
+        transfer_thread = (executor.submit(transfer_input_ids, target_trees, trees_chosen_index, device, transfer_stream)
+                           if reflex is None else None)
 
         if statistical_time:
             torch.cuda.synchronize()
@@ -768,28 +812,44 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
             target_hidden_states_tree=target_outputs['target_hidden_state']
             target_outputs_logits=model.target_model.lm_head(target_hidden_states_tree)
 
-            target_next_token_tree, _ = sample_target_from_logits(
+            target_next_token_tree, target_sampling_probs = sample_target_from_logits(
                 target_outputs_logits,
                 do_sample=do_sample,
                 temperature=temperature,
                 top_p=top_p,
                 top_k=top_k,
                 eos_token_id=eos_token_id,
-                reflex=reflex,
+                reflex=reflex if reflex_feedback_scope == "root" else None,
                 compact_to_target=compact_to_target,
             )
+            if reflex is None:
+                _ = target_sampling_probs  # preserve the legacy OFF tensor lifetime
         
         if statistical_time:
             torch.cuda.synchronize()
             total_target_time+=time.time()-target_time_start
         
-        target_trees=transfer_thread.result()
-
-        acc_length=[0]*bsz
-        chosen_index=[[] for _ in range(bsz)]
-        next_token=[[] for _ in range(bsz)]
-            
-        target_next_token_tree_list=target_next_token_tree.tolist()
+        if reflex is not None:
+            path = trace_verified_path(tensor_tree, target_next_token_tree, eos_token_id,
+                                       kernels=reflex._kernels, workspace=reflex.path_workspace)
+            if reflex_feedback_scope == "visited_path":
+                reflex.update_visited(target_sampling_probs if do_sample else target_next_token_tree,
+                                      compact_to_target, path, greedy=not do_sample)
+            acc_length, chosen_index, next_token = path.host_bookkeeping(past_kv_len)
+            # Release full teacher distributions before the next draft, not after it.
+            del target_sampling_probs, target_outputs_logits
+            for idx_tree, length in enumerate(acc_length):
+                end_sig[idx_tree] = int(next_token[idx_tree][-1] == eos_token_id)
+                total_proposed_draft_tokens += draft_total_token
+                total_accepted_draft_tokens += max(length - 1, 0)
+                avg_acc_length[0] += length
+                avg_acc_length[1] += 1
+        else:
+            target_trees=transfer_thread.result()
+            acc_length=[0]*bsz
+            chosen_index=[[] for _ in range(bsz)]
+            next_token=[[] for _ in range(bsz)]
+            target_next_token_tree_list=target_next_token_tree.tolist()
         
         for idx_tree, tree in enumerate(target_trees):
             
@@ -1145,6 +1205,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
             trees_chosen_index=outputs['trees_chosen_index']
             next_token_trees=outputs['next_token_trees']
             target_position_ids=outputs['target_position_ids']
+            tensor_tree = outputs.get('tensor_tree')
 
         if statistical_time:
             torch.cuda.synchronize()
@@ -1258,6 +1319,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
         'response_generated_tokens':[len(item) for item in filtered_generated_token_ids],
         'reflex_updates': 0 if reflex_stats is None else reflex_stats.updates,
         'reflex_backend': 'off' if reflex is None else reflex.backend,
+        'reflex_feedback_scope': 'off' if reflex is None else reflex_feedback_scope,
     }
     if reflex_stats is not None and reflex_stats.alpha_sum is not None:
         result['reflex_alpha_sum'] = reflex_stats.alpha_sum

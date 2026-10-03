@@ -43,6 +43,13 @@ The matching `train_<model>.sh` wrappers expose `MODEL`, `DATASET`,
 `REFLEX_WEIGHT_DECAY`, and `REFLEX_BACKEND=auto|torch|triton`. `METHOD=fastgrpo` disables Reflex and
 `METHOD=specnaacl` enables it; `DATASET` accepts `gsm8k`, `simplelr`, or `dapo`.
 
+`REFLEX_FEEDBACK_SCOPE=root|visited_path` defaults to root. Example:
+`METHOD=specnaacl REFLEX_BACKEND=torch REFLEX_FEEDBACK_SCOPE=visited_path bash train_qwen25_3b.sh`.
+Visited feedback uses only entered draft-head contexts and averages their gradients
+before one update per round. Qualify Triton with CUDA tests and the component/real
+rollout benchmarks in [METHOD_FAST_LK_REFLEX.md](METHOD_FAST_LK_REFLEX.md) before
+long GPU runs; `auto` chooses by availability, not by measured throughput.
+
 See [METHOD_FAST_LK_REFLEX.md](METHOD_FAST_LK_REFLEX.md) for backend requirements,
 numerical caveats and `scripts/benchmark_reflex.py`. Backend changes do not alter
 checkpoint contents, but fused reduction rounding can change near-tie proposals;

@@ -4,6 +4,7 @@ No model forward, autograd, RNG, target softmax, optimizer or host synchronizati
 Reductions are tiled to support both compact and full Qwen vocabularies.
 """
 
+import math
 import torch
 import triton
 import triton.language as tl
@@ -31,16 +32,18 @@ def _correction_kernel(Z, PSI, A, OUT,
                        ZS0, ZS1, ZS2,
                        VOCAB: tl.constexpr, DIM: tl.constexpr, CONTEXTS: tl.constexpr,
                        BV: tl.constexpr, BD: tl.constexpr):
-    tile, context, batch = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    tile, batch = tl.program_id(0), tl.program_id(1)
     batch = batch.to(tl.int64)
     v = tile * BV + tl.arange(0, BV)
     d = tl.arange(0, BD)
     a = tl.load(A + batch * VOCAB * DIM + v[:, None] * DIM + d[None, :],
                 (v[:, None] < VOCAB) & (d[None, :] < DIM), other=0)
-    psi = tl.load(PSI + (batch * CONTEXTS + context) * DIM + d, d < DIM, other=0)
-    z = tl.load(Z + batch * ZS0 + context * ZS1 + v * ZS2, v < VOCAB, other=0).to(tl.float32)
-    corrected = z + tl.sum(a * psi[None, :], axis=1)
-    tl.store(OUT + (batch * CONTEXTS + context) * VOCAB + v, corrected, v < VOCAB)
+    # One A tile, reused across ALL small contexts. No context grid dimension.
+    for context in range(CONTEXTS):
+        psi = tl.load(PSI + (batch * CONTEXTS + context) * DIM + d, d < DIM, other=0)
+        z = tl.load(Z + batch * ZS0 + context * ZS1 + v * ZS2, v < VOCAB, other=0).to(tl.float32)
+        corrected = z + tl.sum(a * psi[None, :], axis=1)
+        tl.store(OUT + (batch * CONTEXTS + context) * VOCAB + v, corrected, v < VOCAB)
 
 
 @triton.jit
@@ -139,16 +142,20 @@ def feature(hidden, projection):
     return output
 
 
-def correct(logits, psi, state):
-    """Fuse logit conversion, low-rank correction and addition; keep softmax."""
+def correct_logits(logits, psi, state):
+    """Materialized diagnostic/reference API, not used by fused proposals."""
     batch, contexts, vocab = logits.shape
     dim = state.shape[-1]
     output = torch.empty((batch, contexts, vocab), device=logits.device, dtype=torch.float32)
-    _correction_kernel[(triton.cdiv(vocab, 256), contexts, batch)](
+    _correction_kernel[(triton.cdiv(vocab, 256), batch)](
         logits, psi, state, output, *logits.stride(), vocab, dim, contexts,
         256, triton.next_power_of_2(dim), num_warps=4, enable_fp_fusion=False,
     )
-    return output.softmax(dim=-1)
+    return output
+
+
+def correct(logits, psi, state):
+    return correct_logits(logits, psi, state).softmax(dim=-1)
 
 
 def update(state, root_q, root_psi, target, mapping, *, greedy, eps, learning_rate, decay):
@@ -176,4 +183,246 @@ def update(state, root_q, root_psi, target, mapping, *, greedy, eps, learning_ra
         greedy, eps, learning_rate, decay, tiles, triton.next_power_of_2(tiles),
         128, triton.next_power_of_2(dim), num_warps=4, enable_fp_fusion=False,
     )
+    return alpha
+
+
+@triton.jit
+def _proposal_tiles(Z, PSI, A, MAX, SUM, VALUES, IDS,
+                    ZS0, ZS1, ZS2, VOCAB: tl.constexpr, DIM: tl.constexpr,
+                    CONTEXTS: tl.constexpr, K: tl.constexpr, TILES: tl.constexpr,
+                    BV: tl.constexpr, BD: tl.constexpr):
+    tile, batch = tl.program_id(0), tl.program_id(1).to(tl.int64)
+    v = tile * BV + tl.arange(0, BV)
+    d = tl.arange(0, BD)
+    a = tl.load(A + batch * VOCAB * DIM + v[:, None] * DIM + d[None, :],
+                (v[:, None] < VOCAB) & (d[None, :] < DIM), other=0)
+    for c in range(CONTEXTS):
+        psi = tl.load(PSI + (batch * CONTEXTS + c) * DIM + d, d < DIM, other=0)
+        raw = tl.load(Z + batch * ZS0 + c * ZS1 + v * ZS2, v < VOCAB, other=0).to(tl.float32)
+        z = tl.where(v < VOCAB, raw + tl.sum(a * psi[None, :], axis=1), -float('inf'))
+        maximum = tl.max(z, axis=0)
+        total = tl.sum(tl.exp(z - maximum), axis=0)
+        offset = (batch * CONTEXTS + c) * TILES + tile
+        tl.store(MAX + offset, maximum)
+        tl.store(SUM + offset, total)
+        for k in range(K):
+            value = tl.max(z, axis=0)
+            # Ties have deterministic compact-id order (Torch ties unspecified).
+            index = tl.min(tl.where((z == value) & (v < VOCAB), v, VOCAB), axis=0)
+            tl.store(VALUES + offset * K + k, value)
+            tl.store(IDS + offset * K + k, index)
+            z = tl.where(v == index, -float('inf'), z)
+
+
+@triton.jit
+def _proposal_merge(MAX, SUM, VALUES, IDS, PROBS, TOP_IDS, NORM,
+                    CONTEXTS: tl.constexpr, VOCAB: tl.constexpr, K: tl.constexpr,
+                    TILES: tl.constexpr, BT: tl.constexpr, BK: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    t = tl.arange(0, BT)
+    maxima = tl.load(MAX + row * TILES + t, t < TILES, other=-float('inf'))
+    maximum = tl.max(maxima, axis=0)
+    sums = tl.load(SUM + row * TILES + t, t < TILES, other=0)
+    total = tl.sum(sums * tl.exp(maxima - maximum), axis=0)
+    tl.store(NORM + row * 2, maximum)
+    tl.store(NORM + row * 2 + 1, total)
+    candidates = tl.arange(0, BK)
+    values = tl.load(VALUES + row * TILES * K + candidates, candidates < TILES * K, other=-float('inf'))
+    ids = tl.load(IDS + row * TILES * K + candidates, candidates < TILES * K, other=VOCAB)
+    for k in range(K):
+        value = tl.max(values, axis=0)
+        index = tl.min(tl.where(values == value, ids, VOCAB), axis=0)
+        tl.store(PROBS + row * K + k, tl.div_rn(tl.exp(value - maximum), total))
+        tl.store(TOP_IDS + row * K + k, index)
+        values = tl.where(ids == index, -float('inf'), values)
+
+
+def propose(logits, psi, state, k, workspace=None):
+    """Two launches; only tile summaries/top-k leave registers, never full q."""
+    batch, contexts, vocab = logits.shape
+    dim, tiles = state.shape[-1], triton.cdiv(vocab, 256)
+    sizes = [(batch, contexts, tiles), (batch, contexts, tiles),
+             (batch, contexts, tiles, k), (batch, contexts, tiles, k)]
+    # Flat pools avoid non-contiguous slices when active batch/C/K shrink.
+    if workspace is None:
+        buffers = [torch.empty(size, device=logits.device, dtype=torch.long if i == 3 else torch.float32)
+                   for i, size in enumerate(sizes)]
+    else:
+        buffers = [pool[:math.prod(size)].view(size) for pool, size in zip(workspace, sizes)]
+    maxima, sums, values, ids = buffers
+    probabilities = torch.empty((batch, contexts, k), device=logits.device, dtype=torch.float32)
+    selected = torch.empty((batch, contexts, k), device=logits.device, dtype=torch.long)
+    norm = torch.empty((batch, contexts, 2), device=logits.device, dtype=torch.float32)
+    _proposal_tiles[(tiles, batch)](logits, psi, state, maxima, sums, values, ids,
+        *logits.stride(), vocab, dim, contexts, k, tiles, 256, triton.next_power_of_2(dim),
+        num_warps=4, enable_fp_fusion=False)
+    _proposal_merge[(batch * contexts,)](maxima, sums, values, ids, probabilities, selected, norm,
+        contexts, vocab, k, tiles, triton.next_power_of_2(tiles), triton.next_power_of_2(tiles * k),
+        num_warps=4, enable_fp_fusion=False)
+    return probabilities, selected, norm
+
+
+@triton.jit
+def _trace_path(PARENTS, TOKENS, CONTEXTS, SAMPLES, OUT_T, OUT_I, OUT_C, LENGTHS,
+                ROWS: tl.constexpr, WIDTH: tl.constexpr, EOS: tl.constexpr,
+                OS0, OS1, BR: tl.constexpr):
+    batch = tl.program_id(0).to(tl.int64)
+    candidates = tl.arange(0, BR)
+    parents = tl.load(PARENTS + batch * ROWS + candidates, candidates < ROWS, other=-2)
+    tokens = tl.load(TOKENS + batch * ROWS + candidates, candidates < ROWS, other=-1)
+    current = tl.full((), 0, tl.int32)
+    live, length = current == 0, current
+    for j in range(WIDTH):
+        token = tl.load(SAMPLES + batch * ROWS + current)
+        context = tl.load(CONTEXTS + batch * ROWS + current)
+        tl.store(OUT_T + batch * OS0 + j * OS1, tl.where(live, token, -1))
+        tl.store(OUT_I + batch * OS0 + j * OS1, tl.where(live, current, -1))
+        tl.store(OUT_C + batch * OS0 + j * OS1, tl.where(live, context, -1))
+        length = length + live.to(tl.int32)
+        matches = (parents == current) & (tokens == token) & (candidates > 0) & (candidates < ROWS)
+        found = tl.min(tl.where(matches & live & (token != EOS), candidates, ROWS), axis=0)
+        live = live & (found < ROWS) & (token != EOS)
+        current = tl.minimum(found, ROWS - 1)
+    tl.store(LENGTHS + batch, length)
+
+
+def trace_path(tree, samples, eos, tokens, indices, contexts, lengths):
+    batch, rows = samples.shape
+    _trace_path[(batch,)](tree.parents, tree.tokens, tree.feedback_contexts, samples,
+        tokens, indices, contexts, lengths, rows, tokens.shape[1], int(eos), *tokens.stride(),
+        triton.next_power_of_2(rows), num_warps=4)
+
+
+@triton.jit
+def _tree_mask(PARENTS, MASK, ROWS: tl.constexpr, PAST: tl.constexpr,
+               WIDTH: tl.constexpr, MINIMUM: tl.constexpr, BK: tl.constexpr):
+    row, batch = tl.program_id(0), tl.program_id(1).to(tl.int64)
+    columns = tl.arange(0, BK)
+    visible = columns <= PAST  # prefix and root are shared by every query
+    current = row.to(tl.int64)  # parent loads are int64; stable loop-carried dtype
+    for depth in range(WIDTH):
+        visible = visible | ((current >= 0) & (columns == PAST + current))
+        current = tl.load(PARENTS + batch * ROWS + tl.maximum(current, 0))
+    tl.store(MASK + (batch * ROWS + row) * (PAST + ROWS) + columns,
+             tl.where(visible, 0., MINIMUM), columns < PAST + ROWS)
+
+
+def tree_mask(tree, past_length, mask):
+    batch, rows = tree.parents.shape
+    _tree_mask[(rows, batch)](tree.parents, mask, rows, past_length, tree.max_depth + 1,
+                             torch.finfo(mask.dtype).min, triton.next_power_of_2(past_length + rows), num_warps=4)
+
+
+@triton.jit
+def _path_values(RAW, PSI, NORM, a, TARGET, MAP, PATH, CONTEXT,
+                 batch, slot, v, d,
+                 VOCAB: tl.constexpr, DIM: tl.constexpr, CACHE: tl.constexpr,
+                 WIDTH: tl.constexpr, RS0, RS1, RS2, TS0, TS1, TS2,
+                 IS0, IS1, CS0, CS1, MS0, GREEDY: tl.constexpr):
+    context = tl.load(CONTEXT + batch * CS0 + slot * CS1)
+    row = tl.load(PATH + batch * IS0 + slot * IS1)
+    valid = (context >= 0) & (row >= 0)
+    safe = tl.maximum(context, 0)
+    psi = tl.load(PSI + (batch * CACHE + safe) * DIM + d, (d < DIM) & valid, other=0)
+    z = tl.load(RAW + batch * RS0 + safe * RS1 + v * RS2, (v < VOCAB) & valid, other=0).to(tl.float32)
+    maximum = tl.load(NORM + (batch * CACHE + safe) * 2, valid, other=0)
+    denominator = tl.load(NORM + (batch * CACHE + safe) * 2 + 1, valid, other=1)
+    q = tl.where(valid & (v < VOCAB), tl.div_rn(tl.exp(z + tl.sum(a * psi[None, :], axis=1) - maximum), denominator), 0.)
+    ids = tl.load(MAP + v * MS0, v < VOCAB, other=0)
+    if GREEDY:
+        token = tl.load(TARGET + batch * TS0 + tl.maximum(row, 0) * TS1, valid, other=-1)
+        p = ((ids == token) & valid & (v < VOCAB)).to(tl.float32)
+    else:
+        p = tl.load(TARGET + batch * TS0 + tl.maximum(row, 0) * TS1 + ids * TS2,
+                    valid & (v < VOCAB), other=0).to(tl.float32)
+    return q, p, psi, valid
+
+
+@triton.jit
+def _path_stats(RAW, PSI, NORM, A, TARGET, MAP, PATH, CONTEXT, MASS, STATS,
+                VOCAB: tl.constexpr, DIM: tl.constexpr, CACHE: tl.constexpr,
+                WIDTH: tl.constexpr, RS0, RS1, RS2, TS0, TS1, TS2,
+                IS0, IS1, CS0, CS1, MS0, GREEDY: tl.constexpr, EPS: tl.constexpr,
+                TILES: tl.constexpr, BT: tl.constexpr, BV: tl.constexpr, BD: tl.constexpr,
+                MASS_ONLY: tl.constexpr):
+    tile, batch = tl.program_id(0), tl.program_id(1).to(tl.int64)
+    v, d = tile * BV + tl.arange(0, BV), tl.arange(0, BD)
+    if MASS_ONLY:
+        a = tl.full((BV, BD), 0., tl.float32)  # dead along with q; no A read
+    else:
+        a = tl.load(A + batch * VOCAB * DIM + v[:, None] * DIM + d[None, :],
+                    (v[:, None] < VOCAB) & (d[None, :] < DIM), other=0)
+    for slot in range(WIDTH):
+        q, p, psi, valid = _path_values(RAW, PSI, NORM, a, TARGET, MAP, PATH, CONTEXT,
+            batch, slot, v, d, VOCAB, DIM, CACHE, WIDTH, RS0, RS1, RS2, TS0, TS1, TS2,
+            IS0, IS1, CS0, CS1, MS0, GREEDY)
+        offset = (batch * WIDTH + slot) * TILES
+        if MASS_ONLY:
+            tl.store(MASS + offset + tile, tl.sum(p, axis=0))
+        else:
+            t = tl.arange(0, BT)
+            mass = tl.sum(tl.load(MASS + offset + t, t < TILES, other=0), axis=0) + EPS
+            p = tl.div_rn(p, mass)
+            tl.store(STATS + (offset + tile) * 2, tl.sum(tl.minimum(q, p), axis=0))
+            tl.store(STATS + (offset + tile) * 2 + 1, tl.sum(tl.where(q < p, q, 0.), axis=0))
+
+
+@triton.jit
+def _path_update(RAW, PSI, NORM, A, TARGET, MAP, PATH, CONTEXT, MASS, STATS, ALPHA,
+                 VOCAB: tl.constexpr, DIM: tl.constexpr, CACHE: tl.constexpr,
+                 WIDTH: tl.constexpr, RS0, RS1, RS2, TS0, TS1, TS2,
+                 IS0, IS1, CS0, CS1, MS0, GREEDY: tl.constexpr, EPS: tl.constexpr,
+                 LR: tl.constexpr, DECAY: tl.constexpr,
+                 TILES: tl.constexpr, BT: tl.constexpr, BV: tl.constexpr, BD: tl.constexpr):
+    tile, batch = tl.program_id(0), tl.program_id(1).to(tl.int64)
+    v, d, t = tile * BV + tl.arange(0, BV), tl.arange(0, BD), tl.arange(0, BT)
+    old = tl.load(A + batch * VOCAB * DIM + v[:, None] * DIM + d[None, :],
+                  (v[:, None] < VOCAB) & (d[None, :] < DIM), other=0)
+    delta = tl.full((BV, BD), 0., tl.float32)
+    count = 0
+    for slot in range(WIDTH):
+        # All reads of A are this program's own tile, before its single write.
+        q, p, psi, valid = _path_values(RAW, PSI, NORM, old, TARGET, MAP, PATH, CONTEXT,
+            batch, slot, v, d, VOCAB, DIM, CACHE, WIDTH, RS0, RS1, RS2, TS0, TS1, TS2,
+            IS0, IS1, CS0, CS1, MS0, GREEDY)
+        offset = (batch * WIDTH + slot) * TILES
+        mass = tl.sum(tl.load(MASS + offset + t, t < TILES, other=0), axis=0) + EPS
+        alpha = tl.sum(tl.load(STATS + (offset + t) * 2, t < TILES, other=0), axis=0)
+        selected = tl.sum(tl.load(STATS + (offset + t) * 2 + 1, t < TILES, other=0), axis=0)
+        p = tl.div_rn(p, mass)
+        gradient = tl.div_rn(q * (selected - (q < p).to(tl.float32)), alpha + EPS)
+        delta += gradient[:, None] * psi[None, :]
+        count += valid.to(tl.int32)
+        if tile == 0:
+            tl.store(ALPHA + batch * WIDTH + slot, alpha)
+    new = tl.where(count > 0, old * DECAY - LR * tl.div_rn(delta, tl.maximum(count, 1)), old)
+    tl.store(A + batch * VOCAB * DIM + v[:, None] * DIM + d[None, :], new,
+             (v[:, None] < VOCAB) & (d[None, :] < DIM))
+
+
+def update_path(state, raw, psi, norm, target, mapping, indices, contexts, *, greedy,
+                eps, learning_rate, decay, workspace=None):
+    """Gather/reconstruct only visited contexts; THREE launches per round.
+
+    Statistics are computed against the pre-update A. A single write kernel
+    aggregates the mean of all valid contexts and applies decay exactly once.
+    """
+    batch, vocab, dim = state.shape
+    width, cache, tiles = indices.shape[1], psi.shape[1], triton.cdiv(vocab, 256)
+    if workspace is None:
+        mass = torch.empty((batch * width * tiles,), device=state.device)
+        stats = torch.empty((batch * width * tiles * 2,), device=state.device)
+    else:
+        mass, stats = workspace
+    alpha = torch.empty((batch, width), device=state.device, dtype=torch.float32)
+    strides = (*raw.stride(), target.stride(0), target.stride(1), 0 if greedy else target.stride(2),
+               *indices.stride(), *contexts.stride(), mapping.stride(0))
+    args = (raw, psi, norm, state, target, mapping, indices, contexts, mass, stats)
+    constants = (vocab, dim, cache, width, *strides, greedy, eps)
+    for mass_only in (True, False):
+        _path_stats[(tiles, batch)](*args, *constants, tiles, triton.next_power_of_2(tiles),
+            256, triton.next_power_of_2(dim), mass_only, num_warps=4, enable_fp_fusion=False)
+    _path_update[(tiles, batch)](*args, alpha, *constants, learning_rate, decay,
+        tiles, triton.next_power_of_2(tiles), 256, triton.next_power_of_2(dim),
+        num_warps=4, enable_fp_fusion=False)
     return alpha

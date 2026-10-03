@@ -33,6 +33,20 @@ class CpuTL:
     constexpr = int
     float32 = torch.float32
     int64 = torch.int64
+    int32 = torch.int32
+    exp = staticmethod(torch.exp)
+
+    @staticmethod
+    def full(shape, value, dtype):
+        return torch.full(shape, value, dtype=dtype)
+
+    @staticmethod
+    def max(value, axis):
+        return value.amax(dim=axis)
+
+    @staticmethod
+    def min(value, axis):
+        return value.amin(dim=axis)
 
     def __init__(self):
         self.ids = ()
@@ -71,7 +85,7 @@ class CpuTL:
     def store(ptr, value, mask=True):
         mask = torch.broadcast_to(torch.as_tensor(mask), ptr.offset.shape)
         value = torch.broadcast_to(torch.as_tensor(value), ptr.offset.shape)
-        ptr.storage[ptr.offset[mask]] = value[mask]
+        ptr.storage[ptr.offset[mask]] = value[mask].to(ptr.storage.dtype)
 
 
 def kernel_source():
@@ -111,11 +125,10 @@ def test_tiled_source_matches_projection_correction_and_update(greedy, vocab, le
     logits = torch.randn(batch, contexts, vocab * 2).bfloat16()[..., ::2]
     corrected = torch.empty(batch, contexts, vocab)
     for b in range(batch):
-        for context in range(contexts):
-            for tile in range(math.ceil(vocab / 256)):
-                tl.ids = (tile, context, b)
-                kernels._correction_kernel(Pointer(logits), Pointer(psi), Pointer(state), Pointer(corrected),
-                                           *logits.stride(), vocab, dim, contexts, 256, pow2(dim))
+        for tile in range(math.ceil(vocab / 256)):
+            tl.ids = (tile, b)
+            kernels._correction_kernel(Pointer(logits), Pointer(psi), Pointer(state), Pointer(corrected),
+                                       *logits.stride(), vocab, dim, contexts, 256, pow2(dim))
     reference_corrected = torch.baddbmm(logits.float(), psi, state.transpose(1, 2))
     torch.testing.assert_close(corrected, reference_corrected, rtol=2e-5, atol=5e-7)
     q = reference_corrected.softmax(-1)[:, 0]

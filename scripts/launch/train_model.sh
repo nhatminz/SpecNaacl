@@ -122,7 +122,7 @@ cmd=(
   --reflex_lr "$REFLEX_LR"
   --reflex_weight_decay "$REFLEX_WEIGHT_DECAY"
   --reflex_seed "$REFLEX_SEED"
-  --reflex_update_scope root
+  --reflex_feedback_scope "$REFLEX_FEEDBACK_SCOPE"
   --reflex_profile "$REFLEX_PROFILE"
   --reflex_diagnostics "$REFLEX_DIAGNOSTICS"
   --reflex_backend "$REFLEX_BACKEND"
@@ -180,6 +180,7 @@ ln -sfn "$RUN_DIR" "$TRAIN_MODEL_ROOT/active_run"
   --item "reflex_mode=$REFLEX_MODE" --item "reflex_diagnostics=$REFLEX_DIAGNOSTICS" \
   --item "reflex_feature_dim=$REFLEX_FEATURE_DIM" --item "reflex_lr=$REFLEX_LR" \
   --item "reflex_weight_decay=$REFLEX_WEIGHT_DECAY" --item "reflex_backend=$REFLEX_BACKEND" \
+  --item "reflex_feedback_scope=$REFLEX_FEEDBACK_SCOPE" \
   --item "nproc_per_node=$NPROC_PER_NODE"
 
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1

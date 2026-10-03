@@ -628,3 +628,225 @@ task-quality preservation is claimed. For numerical intent the kernels use
 [`tl.div_rn`](https://triton-lang.org/main/python-api/generated/triton.language.div_rn.html)
 for precise division rather than approximate reciprocal normalization. This
 documentation check is not a substitute for the skipped CUDA/compiler tests.
+
+## Multi-context / visited-path Reflex critical-path update (2026-10-03)
+
+Repository actually modified: **`D:/VDT/SpecNaacl`**. Pre-change revision:
+`a9d7daf8a2f186cc15ac4b5575db0e68cd3301a3`. No full pretrain, production GRPO run,
+dependency installation or remote-server mutation was performed. The development
+host has Python 3.13.9, PyTorch 2.9.0+cpu, no CUDA/GPU/Triton. Consequently CUDA
+compilation, B200 numerical parity, real-model rollout throughput and training
+speedup remain **unverified**, not inferred from CPU tests.
+
+### Files and functions
+
+- `helper/fast_lk_reflex_kernels.py`: multi-context `correct_logits/correct`,
+  `_proposal_tiles/_proposal_merge` and `propose`, `_trace_path/trace_path`,
+  `_tree_mask/tree_mask`, `_path_stats/_path_update/update_path`.
+- `helper/fast_lk_reflex.py`: `FastLKReflex.propose`, native feedback pools,
+  `update_visited`, cached-root reconstruction, reusable proposal/statistics/root/
+  path pools, diagnostics/profile accounting and cleanup.
+- `helper/tree_verification.py` (new): `PackedTree`, `pack_tree`, `VerifiedPath`,
+  GPU/tensor `trace_verified_path` plus one small host-bookkeeping packet.
+- `helper/specualtive_generate.py`: ACTIVE-only tensor tree construction, head
+  context mapping, packed masks, GPU traversal/feedback integration, prefill
+  metadata transfer, pooled masks and teacher tensor lifetime reduction.
+- `grpo_speculative.py`, `configs/_shared/b200_common.env`,
+  `scripts/launch/train_model.sh`: `REFLEX_FEEDBACK_SCOPE`, CLI alias compatibility,
+  forwarding and run/summary metadata. No reward/loss/optimizer/TTT changes.
+- `scripts/check_training_sources.py`: require the new helper before training;
+  sync the ENTIRE matching source revision to the server, not just the entrypoint.
+- New benchmark scripts: `scripts/benchmark_reflex_pipeline.py`,
+  `scripts/benchmark_reflex_rollout.py`, `scripts/benchmark_reflex_training.sh`,
+  `scripts/summarize_reflex_training.py`.
+- New tests: `tests/test_reflex_tensor_path.py`, `tests/test_reflex_fused_source.py`,
+  `tests/test_reflex_rollout.py`, `tests/test_reflex_cuda_pipeline.py`. Extended
+  `tests/test_reflex_kernel_equations.py`, `tests/test_reflex_benchmark.py`,
+  `tests/test_shell_scripts.py`.
+- Updated `README.md`, `RUNNING.md`, `METHOD_FAST_LK_REFLEX.md` and this report.
+  `helper/sampling.py`, the EAGLE adapter and pretraining math were inspected,
+  not modified in this update.
+
+### Data flow, verification and synchronization
+
+Before: dense corrected FP32 logits -> dense compact q -> top-k; Python Node
+allocation/parent linking; chosen/parents D2H; per-node token D2H in a thread pool;
+full packed sampled-token list D2H; per-sequence Python traversal; root feedback.
+
+After (ACTIVE only):
+
+```text
+draft head -> A-tile-reused correction/max/sum/top-k -> selected proposals
+                   | native logits + psi + norm pools
+packed tensor parents/tokens/context ids -> SAME packed target forward ONCE
+  -> SAME target sampler ONCE -> GPU first-matching-child path (stop EOS)
+  -> gather/reconstruct eligible feedback -> mean -> ONE A write per round
+  -> ONE small emitted-token/packed-index packet to CPU -> existing KV bookkeeping
+```
+
+The target temperature/top-p/top-k distribution, sample-once call, confidence
+selection/packing, matching-child order and EOS truncation semantics are retained.
+Root mode retains immediate root feedback before traversal; visited mode defers
+feedback until the authoritative path is known. There is no extra target forward
+or teacher softmax. Persistent EAGLE/target training, feature capture and
+checkpoint contents remain unchanged. Backend/scope should stay fixed for
+strictly comparable resumes; visited feedback intentionally changes A learning.
+
+Removed in ACTIVE: per-node `.cpu()`, candidate-parent/chosen `.tolist()`, packed
+target-token `.tolist()` for traversal, CPU Node linking/traversal and transfer
+thread/stream creation. Prompt mask metadata uses one bulk D2H instead of a GPU
+scalar test per token. Path extraction and feedback have no host scalar reads;
+CPU bookkeeping runs AFTER GPU feedback. No production `synchronize()` was added.
+Explicit existing statistical-time mode still synchronizes by user request.
+KV padding/pruning still requires host lists: the rollout is NOT completely
+GPU-resident. The unavoidable small path transfer and existing KV compaction are
+deliberately retained pending measured benefit of a more invasive rewrite.
+
+### Kernel design and update semantics
+
+For small D=4/8 and C<=8, correction/proposal grids are `(vocab_tile, batch)`,
+not `(vocab_tile, context, batch)`. Each program loads FP32 A `[256,D]` once
+outside the context loop, loads each psi and accumulates correction in FP32.
+Native BF16/FP16 logits convert in registers. No context is dropped or truncated.
+
+Fused proposal stage 1 computes tile max, sum-exp and K local winners while A
+is resident. Stage 2 merges tile summaries with global max/sum-exp and produces
+K ids, normalized probabilities and two FP32 normalization scalars per context.
+Full corrected FP32 logits/q never reach global memory in production Triton
+proposals. Tie-breaking is compact-id ascending; Torch tie order is unspecified.
+Near-tie/rounding differences are allowed within numeric tolerances, not a promise
+of identical seeded stochastic rollouts across backends.
+
+The verifier keeps parents/token ids/head-context ids on GPU. One CTA per
+trajectory follows first matching children, reading only ALREADY sampled target
+tokens and stops at EOS. A node expanded by a draft head carries its head context
+id; unexpanded leaves carry -1. The emitted target bonus at such a leaf is committed
+normally but cannot provide a nonexistent draft q/psi. Counterfactual branches
+are never feedback-eligible. A parent-closure async assertion rejects malformed
+confidence-selected trees rather than silently changing mask semantics.
+
+Visited q is reconstructed from cached NATIVE logits, psi and max/sum-exp, using
+pre-update A. Three launches per round: compact teacher masses; LK alpha/selected
+mass; mean-gradient aggregate and single A write/decay. Both statistics and update
+reuse A tiles across visited slots. There is no per-depth/context update launch.
+Reduction is over each trajectory's own eligible visited count, including valid
+contexts whose greedy token is outside the controllable compact vocabulary (zero
+gradient), excluding unexpanded/unvisited contexts. Default CUDA update has no
+separate diagnostic/path-validation reduction launches; optional `validate=True`
+is a debug API. The normal production path comes from the bounded verifier.
+
+Torch/root keeps its original cached q/psi and in-place rank-one equation for
+ablation. Torch/visited is the explicit dense reference for testing. Triton/root
+uses the same generalized fused feedback with a preallocated root-index view.
+Neither mode adds autograd, an optimizer, persistent parameters or extra RNG draws.
+
+### Memory and dispatch
+
+Reused across rounds: proposal partial max/sum/top-k pools; native-logit, FP32 psi
+and norm feedback pools; feedback mass/statistic partials; root indices; path
+buffers; flat packed-target mask pool. Mask capacity includes verification padding
+and all permitted rounds, not only real-token max_length. Small returned selected
+proposals/norm/alpha tensors still allocate; this is not an allocation-free API.
+
+No full branch q is retained in Triton. Visited Torch computes a dense temporary
+reference, but also caches native logits rather than full tree FP32 q. Root Torch
+keeps its legacy root q for the closest ablation. Full teacher sampling probabilities
+and target logits are released after feedback in ACTIVE, before the next draft.
+Feedback caches need no finished-row compaction: next-round proposals overwrite
+active rows. A itself retains the existing stable double-buffer compaction.
+
+No unmeasured active-index indirection, multi-stream overlap, CUDA graph capture
+or hybrid backend dispatch was enabled. `auto` remains availability-based, NOT
+measured autotuning. Explicit `torch` is the reference; explicit `triton` is the
+new optimized implementation and fails clearly when CUDA/Triton are unavailable.
+Until the actual GPU tests/benchmark pass, use `REFLEX_BACKEND=torch` on the server.
+
+### Correctness evidence
+
+CPU tests cover actual kernel SOURCE equations, padded vocabulary tiles, strided
+BF16/FP16 inputs, D=4/8, C=1/4/7/8, ties and selected probabilities; mean feedback
+with different eligible counts, single decay, greedy compact misses, counterfactual
+and unexpanded-leaf exclusion, AMP FP32 isolation, finished-row reuse and debug
+validation. Tensor masks/path matching are differentially checked against Python
+ancestor/matching traversal, including duplicate child tokens and EOS.
+
+Four full production-control-flow rollouts use tiny deterministic model doubles:
+greedy/sample x repeat 1/2, left padding, EOS/finished-row shrinking and returned
+training features. OFF vs ACTIVE zero-state root/visited match committed tokens,
+target masks, returned features/ids, acceptance counters and target forward count.
+No actual model downloads or CUDA kernels are involved in those CPU tests.
+
+Additionally, a one-time differential execution against the PRE-CHANGE file from
+the revision above checked eight cases: greedy/sample x repeat 1/2 x OFF/ACTIVE
+root, with LR=0.05. All generated tokens, masks, acceptance counters, returned
+features/ids and target forward counts matched exactly. It is not claimed to
+validate GPU compiler behavior, production model quality or B200 speed.
+
+Real CUDA tests span B=1/3/64, C=1/4/7/8, V=16003, D=4/8, BF16/FP16, stochastic
+teacher/greedy, compaction, fused probabilities, path extraction and masks. They
+are SKIPPED locally. Old six root CUDA parity cases also remain in the suite.
+
+Final rerun: `python -m compileall -q .` passed. Full `python -m pytest -q` with
+`BASH_BIN=D:/Git/bin/bash.exe`: **251 passed, 103 skipped, 8 warnings** (55.18s).
+102 skips require real CUDA/Triton; one is the existing unsupported Windows
+Gloo transport. Warnings are existing optional FlashAttention/scheduler notices.
+Targeted source/tensor/full-rollout tests: **81 passed**. Checkout source check,
+shell syntax/dry runs, benchmark CLI/smokes and `git diff --check` passed.
+CUDA skips are NOT counted as passes.
+
+### Benchmark status and how to decide
+
+| Measurement | Before/reference | New candidate | B200 result |
+| --- | --- | --- | --- |
+| Correction | Torch/cuBLAS | A-reused multi-context Triton | Not run |
+| Normalized top-k | dense correction/softmax/top-k | tiled fused top-k | Not run |
+| Feedback/update | Torch root/visited reference | 3-launch reconstruction/mean/write | Not run |
+| Path extraction | tensor Torch reference | one Triton launch | Not run |
+| Reflex cycle | full Torch proposal/extraction/update | full Triton equivalent | Not run |
+| Production rollout | frozen FastGRPO + zero-state control | root/visited Torch/Triton | Not run |
+| Real short training | 20-step FastGRPO isolated run | matched SpecNaacl isolated run | Not run |
+
+Both small CPU pipeline smoke modes ran with B=2,V=17,target V=23,H=7,C=3,D=4,
+K=3,depth=2. Proposal/state parity passed (zero error comparing Torch to Torch).
+These timing values are NOT a before/after GPU comparison and NOT evidence of
+speedup. Benchmark smoke and summarizer tests validate JSON schema/denominators.
+
+`benchmark_reflex_pipeline.py` warms production APIs, validates numerical parity
+BEFORE timings and reports CUDA-event AND host-wall latencies per component and
+whole cycle. Preparation is outside feedback-only timing; the whole cycle includes
+real cache/proposal work. `benchmark_reflex_rollout.py` loads existing production
+weights/mapping/dataset, reuses the EXACT training prompt collator, performs a
+zero-state Torch/OFF check, counts actual backbone forwards and reports generation
+wall time, tokens/s, weighted AAL and memory. `*-zero` controls distinguish tensor
+engineering gain from learned acceptance gain. Optional profiler captures ONE
+additional untimed rollout; it never affects default training.
+
+The optional training script performs 20 requested GRPO steps per method in new
+isolated roots, with active/latest links isolated too. Its summarizer reports
+tokens/generation-time and tokens/job-wall-time separately, GRPO steps/s, and a
+wall-time ratio only when completed step counts match. Startup/reward filtering
+are included, not hidden as optimizer-only timing. None of these GPU/GRPO
+benchmarks was executed on this CPU host. Commands and checkpoint/environment
+setup are in `METHOD_FAST_LK_REFLEX.md`.
+
+No fastest backend has been selected from nonexistent B200 measurements. Choose
+using repeated, matched real rollout/training runs AFTER CUDA parity passes;
+compare reward/quality as well as AAL and wall time. A microkernel win alone is
+not a SpecNaacl/FastGRPO end-to-end win. Zero overhead is not promised.
+
+### Remaining bottlenecks / limits
+
+- Target/draft model forwards, full target-vocabulary lm_head/temperature/top-p
+  sampling, and packed target probabilities are intrinsic existing costs; no
+  alternate sampler or additional target forward was introduced.
+- Existing CPU KV/padding/finish bookkeeping and target/draft cache gathers/copies
+  remain. One small path D2H per round remains. Default OFF retains legacy host
+  tree costs, by request; do not attribute every future gain to AAL alone.
+- Feature projection, native feedback caching/reconstruction, state traffic,
+  three-stage feedback and kernel dispatch still cost time. Tiny root shapes
+  could favor Torch/cuBLAS; no universal Triton advantage is claimed.
+- First-use JIT and shape-specific compilation, persistent training/autograd,
+  logging/checkpoint/data/reward work and existing GRPO allocator behavior are
+  separate end-to-end costs. They were not changed to manufacture baseline gains.
+- CUDA compiler/numerical/runtime behavior, race checks on real hardware and
+  production quality/throughput remain deployment validation requirements.

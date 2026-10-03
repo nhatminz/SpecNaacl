@@ -277,7 +277,8 @@ parser.add_argument('--reflex_feature_dim', type=int, default=8)
 parser.add_argument('--reflex_lr', type=float, default=0.05)
 parser.add_argument('--reflex_weight_decay', type=float, default=0.0)
 parser.add_argument('--reflex_seed', type=int, default=42)
-parser.add_argument('--reflex_update_scope', type=str, default='root', choices=['root'])
+parser.add_argument('--reflex_feedback_scope', '--reflex_update_scope', dest='reflex_feedback_scope',
+                    type=str, default='root', choices=['root', 'visited_path'])
 parser.add_argument('--reflex_profile', default='0')
 parser.add_argument('--reflex_diagnostics', default='0')
 parser.add_argument('--reflex_backend', default='auto', choices=['auto', 'torch', 'triton'])
@@ -525,6 +526,7 @@ reflex_kwargs = {
     "reflex_profile": _as_bool(args.reflex_profile),
     "reflex_diagnostics": _as_bool(args.reflex_diagnostics),
     "reflex_backend": args.reflex_backend,
+    "reflex_feedback_scope": args.reflex_feedback_scope,
 }
 effective_reflex_backend = 'off'
 reset_rng_on_resume = _as_bool(args.reset_rng_on_resume)
@@ -615,7 +617,7 @@ print(f"B200/spec: dtype={args.dtype}, attn_impl={attn_impl or 'default'}, "
       f"max_draft_len={max_draft_token_length}, max_draft_k={max_draft_k}, "
       f"statistical_time={statistical_time}")
 print(f"Draft: train={is_train_draft}")
-print(f"Method: {method} | Reflex: mode={args.reflex_mode}, scope=root, "
+print(f"Method: {method} | Reflex: mode={args.reflex_mode}, scope={args.reflex_feedback_scope}, "
       f"dim={args.reflex_feature_dim}, lr={args.reflex_lr}, "
       f"wd={args.reflex_weight_decay}, profile={_as_bool(args.reflex_profile)}, "
       f"diagnostics={_as_bool(args.reflex_diagnostics)}, backend={args.reflex_backend}")
@@ -1374,6 +1376,7 @@ run_config_log = {
     "reflex_profile": _as_bool(args.reflex_profile),
     "reflex_diagnostics": _as_bool(args.reflex_diagnostics),
     "reflex_backend_requested": args.reflex_backend,
+    "reflex_feedback_scope": args.reflex_feedback_scope,
     "resume_checkpoint": str(resume_checkpoint),
     "append_log": bool(append_log),
     "source_grpo_step": int(trace_start_step),
@@ -2470,6 +2473,7 @@ summary = {
     "reflex_weight_decay": float(args.reflex_weight_decay),
     "reflex_diagnostics": _as_bool(args.reflex_diagnostics),
     "reflex_backend_requested": args.reflex_backend,
+    "reflex_feedback_scope": args.reflex_feedback_scope,
     "reflex_updates": int(final_metrics['reflex_updates']),
     "reflex_backend_effective": effective_reflex_backend,
     "train_dataset_full_size": int(full_train_samples),

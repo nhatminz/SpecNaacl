@@ -25,7 +25,8 @@ def test_all_launch_shells_have_valid_syntax_and_dry_run():
     ]
     scripts += [ROOT / "scripts" / "plot_training_time.sh"]
     for script in scripts + [ROOT / "pretrain_eagle3_sharegpt_b200.sh",
-                             ROOT / "scripts/benchmark_pretrain.sh"]:
+                             ROOT / "scripts/benchmark_pretrain.sh",
+                             ROOT / "scripts/benchmark_reflex_training.sh"]:
         subprocess.run([BASH, "-n", str(script)], check=True)
     for script in scripts[:-1]:
         result = subprocess.run(
@@ -80,6 +81,31 @@ def test_reflex_backend_override_is_forwarded_to_training_launcher():
     command = shlex.split(next(line[len("Command  :"):] for line in result.stdout.splitlines()
                               if line.startswith("Command  :")))
     assert command[command.index("--reflex_backend") + 1] == "torch"
+
+
+def test_visited_feedback_override_is_forwarded_without_changing_method_binding():
+    env = dict(os.environ, DRY_RUN='true', PYTHON_BIN=PYTHON, METHOD='specnaacl', REFLEX_MODE='off',
+               REFLEX_FEEDBACK_SCOPE='visited_path')
+    result = subprocess.run([BASH, str(ROOT / 'train_qwen25_3b.sh')], env=env,
+                            cwd=ROOT, capture_output=True, text=True, check=True)
+    command = shlex.split(next(line[len('Command  :'):] for line in result.stdout.splitlines()
+                              if line.startswith('Command  :')))
+    assert command[command.index('--reflex_feedback_scope') + 1] == 'visited_path'
+    assert command[command.index('--reflex_mode') + 1] == 'active'
+
+
+def test_real_training_benchmark_dry_run_is_isolated_and_bounded(tmp_path):
+    run_root = tmp_path / 'new_benchmark'
+    env = dict(os.environ, DRY_RUN='true', PYTHON_BIN=PYTHON, MODEL_KEY='qwen25_3b',
+               BENCHMARK_ROOT=run_root.as_posix(), BENCHMARK_STEPS='20', REFLEX_BACKEND='torch',
+               REFLEX_FEEDBACK_SCOPE='visited_path')
+    result = subprocess.run([BASH, str(ROOT / 'scripts/benchmark_reflex_training.sh')], env=env,
+                            cwd=ROOT, capture_output=True, text=True, check=True)
+    assert result.stdout.count('--max_grpo_steps 20') == 2
+    assert '--method fastgrpo' in result.stdout and '--method specnaacl' in result.stdout
+    assert f'{run_root.as_posix()}/fastgrpo' in result.stdout
+    assert f'{run_root.as_posix()}/specnaacl' in result.stdout
+    assert not run_root.exists()  # no links/checkpoints/training in dry run
 
 
 def test_pretrain_wrapper_reports_explicit_backend_topology_and_batch():
