@@ -8,7 +8,10 @@ parameters, never enter an optimizer, and never survive a rollout.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import nullcontext
 from typing import Optional
+import importlib
+import importlib.util
 import time
 
 import torch
@@ -16,6 +19,19 @@ import torch.nn.functional as F
 
 
 _PROJECTION_CACHE: dict[tuple[str, int, int, int], torch.Tensor] = {}
+
+
+def resolve_reflex_backend(requested, device, feature_dim):
+    """Resolve once per rollout; do not import Triton on the CPU/torch path."""
+    if requested not in {"auto", "torch", "triton"}:
+        raise ValueError("Reflex backend must be auto, torch or triton")
+    if requested == "torch":
+        return "torch"
+    supported = torch.device(device).type == "cuda" and int(feature_dim) <= 64
+    available = supported and importlib.util.find_spec("triton") is not None
+    if requested == "triton" and not available:
+        raise RuntimeError("Reflex triton backend requires CUDA, Triton and feature_dim <= 64; choose torch")
+    return "triton" if requested != "torch" and available else "torch"
 
 
 def lk_alpha_and_logit_gradient_without_loss(
@@ -80,6 +96,7 @@ class FastLKReflex:
         eps: float = 1.0e-8,
         profile: bool = False,
         diagnostics: bool = False,
+        backend: str = "auto",
     ) -> None:
         if feature_dim <= 0:
             raise ValueError("feature_dim must be positive")
@@ -92,8 +109,14 @@ class FastLKReflex:
         self.eps = float(eps)
         self.profile = bool(profile)
         self.diagnostics = bool(diagnostics)
+        if backend not in {"auto", "torch", "triton"}:
+            raise ValueError("Reflex backend must be auto, torch or triton")
+        self.requested_backend = backend
+        self.backend = "torch"
+        self._kernels = None
         self.projection: Optional[torch.Tensor] = None
         self.state: Optional[torch.Tensor] = None
+        self._state_workspace: Optional[torch.Tensor] = None
         self._root_q: Optional[torch.Tensor] = None
         self._root_psi: Optional[torch.Tensor] = None
         self._alpha_sum: Optional[torch.Tensor] = None
@@ -126,6 +149,13 @@ class FastLKReflex:
         if num_trajectories <= 0 or compact_vocab_size <= 0 or hidden_size <= 0:
             raise ValueError("trajectory, vocabulary, and hidden sizes must be positive")
         device = torch.device(device)
+        if device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        self.backend = resolve_reflex_backend(self.requested_backend, device, self.feature_dim)
+        self._kernels = (
+            importlib.import_module("helper.fast_lk_reflex_kernels")
+            if self.backend == "triton" else None
+        )
         # Initialization is outside the per-round hot path. A device-local
         # generator makes R reproducible without copying it from CPU.
         cache_key = (str(device), hidden_size, self.feature_dim, self.seed)
@@ -149,6 +179,9 @@ class FastLKReflex:
             dtype=torch.float32,
             requires_grad=False,
         )
+        # Double-buffer only the small fast adapter, not the model or KV cache.
+        # Finished-row compaction can reuse storage without a fresh A allocation.
+        self._state_workspace = torch.empty_like(self.state)
         self._root_q = None
         self._root_psi = None
         self._alpha_sum = (
@@ -160,10 +193,13 @@ class FastLKReflex:
             if self.diagnostics else None
         )
         self._updates = 0
+        self._profile_time_s = 0.0
 
     def _feature(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.projection is None:
             raise RuntimeError("FastLKReflex.start() must be called before correction")
+        if self._kernels is not None:
+            return self._kernels.feature(hidden_states, self.projection)
         return F.normalize(hidden_states.float().matmul(self.projection), dim=-1, eps=1.0e-6)
 
     @torch.no_grad()
@@ -180,13 +216,26 @@ class FastLKReflex:
             raise RuntimeError("FastLKReflex.start() must be called before correction")
         if compact_logits.shape[0] != self.state.shape[0]:
             raise ValueError("Reflex state is not aligned with the active batch")
-        psi = self._feature(native_hidden)
-        corrected = torch.baddbmm(
-            compact_logits.float(), psi, self.state.transpose(1, 2)
-        )
-        probabilities = corrected.softmax(dim=-1)
+        # A/R/psi and the analytic update are FP32, irrespective of model AMP.
+        # Otherwise autocast copies the entire A to BF16 at every tree depth
+        # and cached BF16 psi cannot be used by the FP32 in-place update.
+        # Pure Triton already performs explicit FP32 arithmetic; avoid entering
+        # an extra AMP context on its hot path. Torch needs the guard only when
+        # the caller actually enabled model autocast.
+        guard = (torch.autocast(device_type=compact_logits.device.type, enabled=False)
+                 if self._kernels is None and torch.is_autocast_enabled(compact_logits.device.type)
+                 else nullcontext())
+        with guard:
+            psi = self._feature(native_hidden)
+            if self._kernels is not None:
+                probabilities = self._kernels.correct(compact_logits, psi, self.state)
+            else:
+                corrected = torch.baddbmm(
+                    compact_logits.float(), psi, self.state.transpose(1, 2)
+                )
+                probabilities = corrected.softmax(dim=-1)
         if cache_root:
-            if corrected.shape[1] != 1:
+            if probabilities.shape[1] != 1:
                 raise ValueError("root correction expects exactly one proposal context")
             self._root_q = probabilities.squeeze(1)
             self._root_psi = psi.squeeze(1)
@@ -203,6 +252,8 @@ class FastLKReflex:
         if self.state is None or self._root_q is None or self._root_psi is None:
             raise RuntimeError("root q/psi were not cached before the Reflex update")
         mapping = compact_to_target.to(device=target_root_probs.device, dtype=torch.long)
+        if self._kernels is not None:
+            return self._update_fused(target_root_probs, mapping, greedy=False)
         # Conditional compact-vocabulary LK: condition the exact target sampling
         # distribution on tokens controllable by the EAGLE compact head.
         p = target_root_probs.float().index_select(-1, mapping)
@@ -221,6 +272,8 @@ class FastLKReflex:
         mapping = compact_to_target.to(
             device=target_root_tokens.device, dtype=torch.long
         )
+        if self._kernels is not None:
+            return self._update_fused(target_root_tokens.to(torch.long), mapping, greedy=True)
         p = target_root_tokens.to(torch.long).unsqueeze(-1).eq(mapping.unsqueeze(0))
         p = p.to(torch.float32)
         p = p / (p.sum(dim=-1, keepdim=True) + self.eps)
@@ -242,18 +295,33 @@ class FastLKReflex:
         # materializing a [batch, vocabulary, feature] outer-product temporary.
         self.state.baddbmm_(
             gradient.unsqueeze(-1),
-            self._root_psi.unsqueeze(1),
+            self._root_psi.float().unsqueeze(1),
             beta=decay,
             alpha=-self.learning_rate,
         )
+        self._record_update(alpha, loss)
+        self._profile_end(started)
+        return alpha, loss
+
+    def _update_fused(self, target, mapping, *, greedy):
+        started = self._profile_start()
+        alpha = self._kernels.update(
+            self.state, self._root_q, self._root_psi, target, mapping,
+            greedy=greedy, eps=self.eps, learning_rate=self.learning_rate,
+            decay=1.0 - self.learning_rate * self.weight_decay,
+        )
+        loss = lk_diagnostic_loss(alpha, self.eps) if self.diagnostics else None
+        self._record_update(alpha, loss)
+        self._profile_end(started)
+        return alpha, loss
+
+    def _record_update(self, alpha, loss):
         if self.diagnostics:
             self._alpha_sum.add_(alpha.sum())
             self._loss_sum.add_(loss.sum())
         self._updates += int(alpha.shape[0])
         self._root_q = None
         self._root_psi = None
-        self._profile_end(started)
-        return alpha, loss
 
     @torch.no_grad()
     def remove_finished(self, finished_indices) -> None:
@@ -269,7 +337,11 @@ class FastLKReflex:
             index for index in range(self.state.shape[0]) if index not in finished_set
         ]
         keep = torch.tensor(keep_indices, device=self.state.device, dtype=torch.long)
-        self.state = self.state.index_select(0, keep)
+        previous = self.state
+        compacted = self._state_workspace[:len(keep_indices)]
+        torch.index_select(previous, 0, keep, out=compacted)
+        self.state = compacted
+        self._state_workspace = previous
         # A root cache belongs to the just-verified batch and has already been
         # consumed. Clearing defensively prevents accidental cross-round reuse.
         self._root_q = None
@@ -297,6 +369,8 @@ class FastLKReflex:
     def clear(self) -> None:
         self.projection = None
         self.state = None
+        self._state_workspace = None
+        self._kernels = None
         self._root_q = None
         self._root_psi = None
         self._alpha_sum = None

@@ -537,3 +537,94 @@ benchmark was run, and no speedup is claimed. Loss/objective, TTT length, featur
 capture, sampling, Reflex, optimizer, vocab, dataset and checkpoint/resume remain
 unchanged. Deploy both modified production files together and rerun the original
 training command; pretrained checkpoints do not need to be regenerated.
+
+## Reflex engineering throughput implementation (2026-10-03)
+
+Scope: optimize trajectory-local Reflex only. Keep feature dimension/seed, random
+projection values, all tree-context corrections, every root update, conditional
+teacher probabilities, strict `q < p` subgradient, epsilon, LR/weight decay,
+sampling/verification, EAGLE parameters/objective/TTT and checkpoint contents.
+No model forward, target softmax, RNG draw, optimizer or backward is added.
+
+Inspection found an AMP precision/overhead issue: the model autocast context
+encloses Reflex, so float inputs to matmul/baddbmm can become BF16. This can
+cast the entire FP32 `A` on each proposal depth, return BF16 proposals instead
+of the OFF path's FP32 probabilities, and cache a BF16 `psi` incompatible with
+FP32 in-place baddbmm update. Reflex now explicitly operates in FP32 independent
+of model AMP, matching its stated equations and restoring zero-state/OFF parity.
+This is intentionally different from the old accidental AMP rounding, not a
+claim of bitwise identity to that path. Model and EAGLE training AMP are unchanged.
+
+Optimizations and files:
+
+- `helper/fast_lk_reflex.py`: one-time `auto|torch|triton` backend resolution,
+  lazy Triton import, AMP isolation, canonical CUDA projection-cache keys, and
+  stable finished-row compaction into two reusable state buffers. Only fast-state
+  storage doubles; model/KV storage does not. Reset both buffers/root caches and
+  timing at rollout lifecycle boundaries. Ordinary Torch remains the reference.
+- `helper/fast_lk_reflex_kernels.py` (new): fused hidden conversion, seeded
+  projection and normalization; tiled FP32 low-rank logit correction with the
+  existing softmax; three-launch tiled conditional teacher/LK/rank-one update.
+  Avoid dense compact p/mask/gradient and outer-product temporaries on this path.
+  Support greedy missing-token zero-mass cases, non-contiguous root views,
+  arbitrary non-power-of-two vocab sizes including full ~152k Qwen vocabularies,
+  runtime strides and 64-bit batch offsets (large verification strides can exceed
+  2**31). Large projection matrices use guarded FP32 cuBLAS; dimensions >64 use
+  Torch in auto mode or fail clearly for explicit Triton. No runtime compilation
+  failure is silently swallowed. No hot-path CUDA synchronization is introduced.
+- `helper/specualtive_generate.py`: backend plumbing and effective backend in
+  rollout results. Correction/update scopes, target supervision and tree
+  selection/sampling logic are unchanged.
+- `grpo_speculative.py`: CLI/backend forwarding, run config and final summary
+  requested/effective backend metadata. Persistent training math is unchanged.
+- `configs/_shared/b200_common.env`, `scripts/launch/train_model.sh`: expose
+  `REFLEX_BACKEND` with auto default and record it in run metadata; fair OFF/ACTIVE
+  launchers still differ only by method/reflex mode.
+- `scripts/check_training_sources.py`: require the new kernel source too, so
+  incomplete server deployments fail before expensive GPU model loading.
+- `scripts/benchmark_reflex.py` (new): standalone synthetic OFF/Torch/candidate
+  component-cycle benchmark with repeated-state numerical verification before
+  timing. Report GPU/name/backend, warmed ms/cycle, added ms vs OFF, first-JIT
+  verification time, probability/state error and root top-k agreement. Setup,
+  target probability creation and JIT compilation are outside timed cycles. CPU
+  mode is explicitly smoke-only. No default training profiler was added.
+- `tests/test_fast_lk_reflex.py`: AMP/FP32 regression, exact zero-state/OFF parity,
+  backend requirements/fallbacks, double-buffer lifecycle, 20-round exact Torch
+  equation/gradient-state parity with greedy/sampling, decay and compaction.
+  Six real CUDA/Triton tests cover BF16 model autocast, root/branch correction,
+  repeated updates, strides/compaction and small/32k/full-vocab shapes.
+- `tests/test_reflex_kernel_equations.py` (new): 12 source-isolated CPU tests
+  execute the actual tiled kernel definitions via a small Torch-backed tl memory
+  simulator; validate feature/correction/update equations, padding, strides,
+  normalization, missing greedy tokens, LR=0 and decay. This is NOT validation
+  of the actual Triton compiler, CUDA numerical behavior or GPU performance.
+- `tests/test_reflex_benchmark.py` (new), `tests/test_shell_scripts.py`: CPU
+  benchmark JSON/parity smoke and launcher backend override/fairness tests.
+- `README.md`, `RUNNING.md`, `METHOD_FAST_LK_REFLEX.md`: runtime/backend/benchmark
+  instructions and caveats. This report records the implementation and limits.
+
+Numerical caveats: fused FP32 reductions need not be bit-identical to cuBLAS;
+near-tie candidates may change, and no task-quality preservation or B200 speedup
+has been measured here. Checkpoint loading/state/RNG restoration is unchanged,
+but keep backend fixed for strictly comparable resumed runs. Zero overhead is
+not promised: projection, correction, state update, dispatch, extra fast-state
+storage and first-use JIT compilation still cost resources. Run CUDA parity and
+the benchmark on the actual B200 before a long fused run, then compare matched
+real AAL/reward/end-to-end throughput. Use `REFLEX_BACKEND=torch` if CUDA checks
+fail or fused kernels are not faster on that setup.
+
+Final validation: `python -m compileall -q .` passes. Full `pytest -q` with
+`BASH_BIN=D:/Git/bin/bash.exe`: **164 passed, 7 skipped, 8 warnings**. Six skips
+are the unavailable CUDA/Triton execution tests; the seventh is the pre-existing
+unsupported Windows Gloo transport. Warnings are the existing optional
+FlashAttention availability and scheduler notices. Targeted kernel-source tests
+report **12 passed**. The small CPU benchmark smoke passes with zero probability
+and state error and root top-k agreement 1; its CPU timing is not a performance
+claim. Checkout-integrity check and `git diff --check` pass.
+
+No real CUDA/B200 kernel execution, GRPO run, full pretrain or GPU benchmark was
+performed. No speedup, zero-overhead behavior, full GPU numerical equivalence or
+task-quality preservation is claimed. For numerical intent the kernels use
+[`tl.div_rn`](https://triton-lang.org/main/python-api/generated/triton.language.div_rn.html)
+for precise division rather than approximate reciprocal normalization. This
+documentation check is not a substitute for the skipped CUDA/compiler tests.

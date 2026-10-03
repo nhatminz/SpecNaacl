@@ -40,8 +40,13 @@ The matching `train_<model>.sh` wrappers expose `MODEL`, `DATASET`,
 `DRAFT_CHECKPOINT`, `TARGET_LR`, `DRAFT_LR`, `BATCH_SIZE`,
 `ACCUMULATION_STEPS`, `GEN_MAX_LENGTH`, `MAX_PROMPT_LENGTH`, `NUM_EPOCHS`,
 `NPROC_PER_NODE`, `METHOD`, `REFLEX_FEATURE_DIM`, `REFLEX_LR`, and
-`REFLEX_WEIGHT_DECAY`. `METHOD=fastgrpo` disables Reflex and
+`REFLEX_WEIGHT_DECAY`, and `REFLEX_BACKEND=auto|torch|triton`. `METHOD=fastgrpo` disables Reflex and
 `METHOD=specnaacl` enables it; `DATASET` accepts `gsm8k`, `simplelr`, or `dapo`.
+
+See [METHOD_FAST_LK_REFLEX.md](METHOD_FAST_LK_REFLEX.md) for backend requirements,
+numerical caveats and `scripts/benchmark_reflex.py`. Backend changes do not alter
+checkpoint contents, but fused reduction rounding can change near-tie proposals;
+keep the same backend for strict like-for-like resumed comparisons.
 
 If `DRAFT_CHECKPOINT`, `DRAFT_CONFIG`, and `VOCAB_MAPPING` are omitted, the
 launcher uses the matching model's `outputs/pretrain/<model>/latest_*` links.

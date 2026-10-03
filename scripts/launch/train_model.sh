@@ -125,6 +125,7 @@ cmd=(
   --reflex_update_scope root
   --reflex_profile "$REFLEX_PROFILE"
   --reflex_diagnostics "$REFLEX_DIAGNOSTICS"
+  --reflex_backend "$REFLEX_BACKEND"
   --log_interval "$LOG_INTERVAL"
   --log_file "$LOG_DIR/metrics.jsonl"
   --timing_file "$LOG_DIR/timing.csv"
@@ -178,7 +179,8 @@ ln -sfn "$RUN_DIR" "$TRAIN_MODEL_ROOT/active_run"
   --item "resume_checkpoint=$RESUME_CHECKPOINT" --item "method=$METHOD" \
   --item "reflex_mode=$REFLEX_MODE" --item "reflex_diagnostics=$REFLEX_DIAGNOSTICS" \
   --item "reflex_feature_dim=$REFLEX_FEATURE_DIM" --item "reflex_lr=$REFLEX_LR" \
-  --item "reflex_weight_decay=$REFLEX_WEIGHT_DECAY" --item "nproc_per_node=$NPROC_PER_NODE"
+  --item "reflex_weight_decay=$REFLEX_WEIGHT_DECAY" --item "reflex_backend=$REFLEX_BACKEND" \
+  --item "nproc_per_node=$NPROC_PER_NODE"
 
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"

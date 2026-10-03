@@ -174,6 +174,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
                         reflex_lr=0.05, reflex_weight_decay=0.0,
                         reflex_seed=42, reflex_profile=False,
                         reflex_diagnostics=False,
+                        reflex_backend="auto",
                         ):
 
     reflex_mode = str(reflex_mode).strip().lower()
@@ -655,6 +656,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
             seed=reflex_seed,
             profile=reflex_profile,
             diagnostics=reflex_diagnostics,
+            backend=reflex_backend,
         )
         reflex.start(
             bsz,
@@ -1255,6 +1257,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
         'response_verification_rounds':response_verification_rounds,
         'response_generated_tokens':[len(item) for item in filtered_generated_token_ids],
         'reflex_updates': 0 if reflex_stats is None else reflex_stats.updates,
+        'reflex_backend': 'off' if reflex is None else reflex.backend,
     }
     if reflex_stats is not None and reflex_stats.alpha_sum is not None:
         result['reflex_alpha_sum'] = reflex_stats.alpha_sum

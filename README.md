@@ -16,6 +16,10 @@ not the wall-clock baseline for this comparison.
 - No Reflex backward, optimizer, persistent model update, or extra target forward.
 - `REFLEX_PROFILE=0` and `REFLEX_DIAGNOSTICS=0` are the defaults; diagnostic LK
   loss is not evaluated in that default path.
+- `REFLEX_BACKEND=auto|torch|triton` selects FP32 Reflex engineering kernels.
+  Auto uses fused Triton on supported CUDA setups; Torch is the reference path.
+  Run the CUDA parity tests and [Reflex benchmark](scripts/benchmark_reflex.py)
+  before trusting GPU speed/quality; local CPU tests are not a B200 benchmark.
 - SpecForge `0.2.0` source is vendored at commit
   `3cb0510f0bd0e8c195ac6e9c5c62f6b50580ff83`.
 - The inherited FastGRPO source provenance is

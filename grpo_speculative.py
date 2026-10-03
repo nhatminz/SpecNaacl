@@ -280,6 +280,7 @@ parser.add_argument('--reflex_seed', type=int, default=42)
 parser.add_argument('--reflex_update_scope', type=str, default='root', choices=['root'])
 parser.add_argument('--reflex_profile', default='0')
 parser.add_argument('--reflex_diagnostics', default='0')
+parser.add_argument('--reflex_backend', default='auto', choices=['auto', 'torch', 'triton'])
 parser.add_argument('--dtype', type=str, default='auto', choices=['auto', 'bf16', 'fp16', 'fp32'])
 parser.add_argument('--attn_implementation', type=str, default='')
 parser.add_argument('--temperature',type=float,default=1.0)
@@ -523,7 +524,9 @@ reflex_kwargs = {
     "reflex_seed": int(args.reflex_seed),
     "reflex_profile": _as_bool(args.reflex_profile),
     "reflex_diagnostics": _as_bool(args.reflex_diagnostics),
+    "reflex_backend": args.reflex_backend,
 }
+effective_reflex_backend = 'off'
 reset_rng_on_resume = _as_bool(args.reset_rng_on_resume)
 _seed_everything(trace_seed)
 max_grpo_steps = max(0, int(args.max_grpo_steps))
@@ -615,7 +618,7 @@ print(f"Draft: train={is_train_draft}")
 print(f"Method: {method} | Reflex: mode={args.reflex_mode}, scope=root, "
       f"dim={args.reflex_feature_dim}, lr={args.reflex_lr}, "
       f"wd={args.reflex_weight_decay}, profile={_as_bool(args.reflex_profile)}, "
-      f"diagnostics={_as_bool(args.reflex_diagnostics)}")
+      f"diagnostics={_as_bool(args.reflex_diagnostics)}, backend={args.reflex_backend}")
 print(f"Trace: max_new_grpo_steps={max_grpo_steps}, drift_topk={drift_topk}, "
       f"drift_temperature={drift_temperature}, drift_row_chunk={drift_row_chunk_size}")
 print(f"FastGRPO ablation: enabled={fastgrpo_ablation}, draft_lr_multiplier={draft_lr_multiplier}")
@@ -1370,6 +1373,7 @@ run_config_log = {
     "reflex_mode": args.reflex_mode,
     "reflex_profile": _as_bool(args.reflex_profile),
     "reflex_diagnostics": _as_bool(args.reflex_diagnostics),
+    "reflex_backend_requested": args.reflex_backend,
     "resume_checkpoint": str(resume_checkpoint),
     "append_log": bool(append_log),
     "source_grpo_step": int(trace_start_step),
@@ -1660,6 +1664,7 @@ for epoch in epoch_bar:
             draft_token_length_c=draft_token_length_c,
             return_all_draft_input=True,statistical_time=statistical_time,
             **reflex_kwargs)
+        effective_reflex_backend = outputs.get('reflex_backend', 'off')
             
         
         prompt_length=input_ids.shape[-1]
@@ -2464,7 +2469,9 @@ summary = {
     "reflex_lr": float(args.reflex_lr),
     "reflex_weight_decay": float(args.reflex_weight_decay),
     "reflex_diagnostics": _as_bool(args.reflex_diagnostics),
+    "reflex_backend_requested": args.reflex_backend,
     "reflex_updates": int(final_metrics['reflex_updates']),
+    "reflex_backend_effective": effective_reflex_backend,
     "train_dataset_full_size": int(full_train_samples),
     "train_dataset_selected_size": int(selected_train_samples),
     "dataset_path": str(args.dataset_path),

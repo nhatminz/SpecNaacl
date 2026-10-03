@@ -72,6 +72,16 @@ def test_fair_launchers_differ_only_by_method_and_reflex_toggle(tmp_path):
     assert without_method_flags(baseline) == without_method_flags(treatment)
 
 
+def test_reflex_backend_override_is_forwarded_to_training_launcher():
+    env = dict(os.environ, DRY_RUN="true", PYTHON_BIN=PYTHON, METHOD="specnaacl",
+               REFLEX_BACKEND="torch")
+    result = subprocess.run([BASH, str(ROOT / "train_qwen25_3b.sh")], env=env,
+                            cwd=ROOT, capture_output=True, text=True, check=True)
+    command = shlex.split(next(line[len("Command  :"):] for line in result.stdout.splitlines()
+                              if line.startswith("Command  :")))
+    assert command[command.index("--reflex_backend") + 1] == "torch"
+
+
 def test_pretrain_wrapper_reports_explicit_backend_topology_and_batch():
     env = dict(os.environ, DRY_RUN="true", PYTHON_BIN=PYTHON,
                PRETRAIN_ATTENTION_BACKEND="sdpa", PRETRAIN_DISTRIBUTED_MODE="auto",
