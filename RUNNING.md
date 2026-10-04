@@ -34,7 +34,60 @@ parquet rows are deterministically converted into the conversation format that
 SpecForge consumes. `RESUME=auto` reuses the active incomplete run; an explicit
 run directory can be passed through `RESUME=/path/to/run`.
 
-## Train FastGRPO
+## Paired Qwen training (FastGRPO vs SpecNaacl)
+
+The six paired launchers use local DAPO-Math-17k by default, target/draft LR
+`1e-5`, batch size `8`, accumulation `4`, and 8 responses per prompt. They
+require a pretrained EAGLE-3 draft in `outputs/pretrain/<model>/latest_*` (or
+explicit `DRAFT_CHECKPOINT`, `DRAFT_CONFIG`, `VOCAB_MAPPING`).
+
+```bash
+cd /workspace/storage-shared/nlp/minhpn19/SpecNaacl
+CUDA_VISIBLE_DEVICES=0 bash train_qwen3_4b.sh
+CUDA_VISIBLE_DEVICES=0 bash train_qwen3_4b_fastgrpo.sh
+CUDA_VISIBLE_DEVICES=0 bash train_qwen25_3b.sh
+CUDA_VISIBLE_DEVICES=0 bash train_qwen25_3b_fastgrpo.sh
+CUDA_VISIBLE_DEVICES=0 bash train_qwen3_1p7b.sh
+CUDA_VISIBLE_DEVICES=0 bash train_qwen3_1p7b_fastgrpo.sh
+```
+
+Append `--max_grpo_steps 2` for a short run or set `DRY_RUN=true` to inspect
+the command without touching checkpoints. Override `MODEL`, `DATASET_PATH`,
+`TARGET_ADAPTER`, `DRAFT_CHECKPOINT`, `TARGET_LR`, `DRAFT_LR`, `BATCH_SIZE`,
+`ACCUMULATION_STEPS`, `DRAFT_ACCUMULATION_STEPS`, `RESPONSES_PER_PROMPT`,
+`GEN_MAX_LENGTH`, `CUDA_VISIBLE_DEVICES`, `NPROC_PER_NODE`, or `RESUME` through
+the environment.
+
+SpecNaacl defaults to `REFLEX_BACKEND=triton`, `REFLEX_FEEDBACK_SCOPE=root`,
+`REFLEX_UPDATE_STREAM=1`, matching `triton-root-stream`. FastGRPO creates no
+Reflex update stream. Both use batched SpecForge EAGLE-3 training. Control VRAM
+with `DRAFT_TRAIN_MAX_BATCH_SIZE=8`, `DRAFT_TRAIN_MAX_TOKENS=4096`, and
+`DRAFT_TRAIN_MAX_PADDING_RATIO=1.25`; `DRAFT_TRAIN_MODE=per_response` is the
+measured fallback. `DRAFT_TRAIN_PROFILE=1` logs optional timings.
+`REFLEX_PROFILE=1` reports feature projection, proposal/correction, feedback
+update and estimated stream overlap; turn it off for throughput runs.
+
+For B200 selection, run the opt-in short real-training benchmarks:
+
+```bash
+MODEL_KEY=qwen25_3b DATASET=dapo BENCHMARK_STEPS=3 bash scripts/benchmark_online_draft_training.sh
+MODEL_KEY=qwen25_3b DATASET=dapo BENCHMARK_STEPS=3 bash scripts/benchmark_reflex_training.sh
+python3 scripts/benchmark_reflex_rollout.py \
+  --target-model /workspace/storage-shared/models/Qwen2.5-3B-Instruct \
+  --draft-config outputs/pretrain/qwen25_3b/latest_draft_config.json \
+  --draft-checkpoint outputs/pretrain/qwen25_3b/latest_checkpoint \
+  --vocab-mapping outputs/pretrain/qwen25_3b/latest_vocab_mapping.pt \
+  --dataset-path /workspace/storage-shared/nlp/minhpn19/data/DAPO-Math-17k-Processed/en/train-00000-of-00001.parquet \
+  --modes fastgrpo,triton-root,triton-root-stream
+```
+
+If batched training is slower or uses too much memory, set
+`DRAFT_TRAIN_MODE=per_response`; if stream overlap loses throughput, set
+`REFLEX_UPDATE_STREAM=0`. B200 speedup remains unmeasured here.
+Each short training benchmark writes both run summaries and
+`benchmark_report.json` under its printed `outputs/benchmarks/...` directory.
+
+## Generic training wrappers
 
 The matching `train_<model>.sh` wrappers expose `MODEL`, `DATASET`,
 `DRAFT_CHECKPOINT`, `TARGET_LR`, `DRAFT_LR`, `BATCH_SIZE`,
@@ -44,7 +97,7 @@ The matching `train_<model>.sh` wrappers expose `MODEL`, `DATASET`,
 `METHOD=specnaacl` enables it; `DATASET` accepts `gsm8k`, `simplelr`, or `dapo`.
 
 `REFLEX_FEEDBACK_SCOPE=root|visited_path` defaults to root. Example:
-`METHOD=specnaacl REFLEX_BACKEND=torch REFLEX_FEEDBACK_SCOPE=visited_path bash train_qwen25_3b.sh`.
+`REFLEX_BACKEND=torch REFLEX_FEEDBACK_SCOPE=visited_path bash train_qwen25_3b.sh`.
 Visited feedback uses only entered draft-head contexts and averages their gradients
 before one update per round. Qualify Triton with CUDA tests and the component/real
 rollout benchmarks in [METHOD_FAST_LK_REFLEX.md](METHOD_FAST_LK_REFLEX.md) before
@@ -95,5 +148,6 @@ bash scripts/plot_training_time.sh /absolute/run1 /absolute/run2
 
 For the opt-in Reflex parallel kernels, GPU path bookkeeping, side-stream
 overlap, and B200 benchmark/selection commands, see
-[REFLEX_B200_OPTIMIZATION.md](REFLEX_B200_OPTIMIZATION.md). Production defaults
-keep unmeasured kernel/stream candidates disabled.
+[REFLEX_B200_OPTIMIZATION.md](REFLEX_B200_OPTIMIZATION.md). Production now
+requests the streamed-root Triton path; measure on the actual B200 before
+attributing a throughput change to it.

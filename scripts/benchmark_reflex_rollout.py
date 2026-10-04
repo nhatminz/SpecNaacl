@@ -45,15 +45,16 @@ def parse_args(argv=None):
     parser.add_argument('--reflex-correction-strategy', choices=['serial', 'parallel', 'tiled'], default='serial')
     parser.add_argument('--reflex-feedback-strategy', choices=['serial', 'parallel'], default='serial')
     parser.add_argument('--reflex-feature-strategy', choices=['auto', 'triton', 'torch'], default='auto')
-    parser.add_argument('--reflex-update-stream', action='store_true')
     parser.add_argument('--kv-gather-strategy', choices=['stacked', 'per_layer'], default='stacked')
     parser.add_argument('--attn-implementation', default='eager')
     parser.add_argument('--greedy', action='store_true')
-    parser.add_argument('--modes', default='fastgrpo,torch-zero,torch-root,triton-root,torch-visited_path,triton-visited_path')
+    parser.add_argument('--modes', default='fastgrpo,triton-root,triton-root-stream')
     parser.add_argument('--skip-zero-state-check', action='store_true')
     parser.add_argument('--profile-trace', default='', help='Optional Chrome/Perfetto trace of ONE extra rollout (not timed)')
     parser.add_argument('--component-timing', action='store_true',
                         help='Diagnostic target/draft phase timing; synchronizes and is not a throughput run')
+    parser.add_argument('--reflex-profile', action='store_true',
+                        help='Opt-in Reflex feature/proposal/update/stream timing; not a throughput run')
     args = parser.parse_args(argv)
     for name in ('batch_size', 'responses', 'warmup', 'iterations', 'max_length', 'max_prompt_length',
                  'verification_capacity', 'max_verification_num', 'max_draft_k', 'max_draft_length', 'feature_dim'):
@@ -116,7 +117,7 @@ def benchmark(args):
         max_draft_k=args.max_draft_k, max_draft_token_length=args.max_draft_length,
         max_length=args.max_length, statistical_time=args.component_timing, reflex_feature_dim=args.feature_dim,
         reflex_weight_decay=args.reflex_weight_decay, reflex_seed=args.seed,
-        reflex_profile=False, reflex_diagnostics=False,
+        reflex_profile=args.reflex_profile, reflex_diagnostics=False,
         reflex_proposal_strategy=args.reflex_proposal_strategy,
         reflex_correction_strategy=args.reflex_correction_strategy,
         reflex_feedback_strategy=args.reflex_feedback_strategy,
@@ -139,7 +140,7 @@ def benchmark(args):
         output = speculative_generate(model, batch['input_ids'], batch['attention_mask'], tokenizer,
             reflex_mode='off' if mode == 'fastgrpo' else 'active', reflex_backend=backend,
             reflex_feedback_scope=scope, reflex_lr=args.reflex_lr if lr is None else lr,
-            reflex_update_stream=stream_mode or args.reflex_update_stream, **base)
+            reflex_update_stream=stream_mode, **base)
         return output, forwards[0] - before
 
     try:
@@ -169,6 +170,8 @@ def benchmark(args):
                     target_phase_s=output['target_time_cost'] if args.component_timing else None,
                     draft_phase_s=output['draft_time_cost'] if args.component_timing else None,
                     committed_draft_forward_s=output['check_time_cost'] if args.component_timing else None,
+                    reflex_profile_sections_ms=output.get('reflex_profile_sections_ms'),
+                    reflex_estimated_overlap_ms=output.get('reflex_estimated_overlap_ms'),
                     peak_allocated_bytes=torch.cuda.max_memory_allocated(),
                     peak_reserved_bytes=torch.cuda.max_memory_reserved()))
             total_wall = sum(row['generation_wall_s'] for row in rows_out)

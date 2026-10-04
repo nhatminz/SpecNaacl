@@ -60,6 +60,7 @@ def _tiled_logsumexp_argmax(
     *,
     chunk_size: int = DEFAULT_VOCAB_CHUNK_SIZE,
     selected_token_ids: Optional[torch.Tensor] = None,
+    selected_ids_host: Optional[list[int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     if chunk_size <= 0:
         raise ValueError(f"chunk_size must be positive, got {chunk_size}.")
@@ -81,7 +82,8 @@ def _tiled_logsumexp_argmax(
     selected_start = 0
     if selected_token_ids is not None:
         # Copy once so chunk boundaries do not synchronize the device inside the loop.
-        selected_ids_host = selected_token_ids.tolist()
+        if selected_ids_host is None:
+            selected_ids_host = selected_token_ids.tolist()
         selected_logits = torch.empty(
             (*lead_shape, len(selected_ids_host)), dtype=torch.float32, device=device
         )
@@ -145,6 +147,8 @@ def compute_target_from_hidden(
     loss_mask: torch.Tensor,
     *,
     chunk_size: int = DEFAULT_VOCAB_CHUNK_SIZE,
+    selected_token_ids: Optional[torch.Tensor] = None,
+    selected_ids_host: Optional[list[int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compact-teacher equivalent of ``_compute_target_p``, computed from hidden states.
 
@@ -164,12 +168,14 @@ def compute_target_from_hidden(
             f"{lm_head_weight.shape[1]}."
         )
 
-    selected_token_ids = torch.nonzero(t2d, as_tuple=False).flatten()
+    if selected_token_ids is None:
+        selected_token_ids = torch.nonzero(t2d, as_tuple=False).flatten()
     log_z, target_token_ids, draft_logits = _tiled_logsumexp_argmax(
         hidden,
         lm_head_weight,
         chunk_size=chunk_size,
         selected_token_ids=selected_token_ids,
+        selected_ids_host=selected_ids_host,
     )
     assert draft_logits is not None
     target_p = torch.softmax(draft_logits, dim=-1)
@@ -195,6 +201,8 @@ def compute_target_p_padded_from_hidden(
     length: int,
     *,
     chunk_size: int = DEFAULT_VOCAB_CHUNK_SIZE,
+    selected_token_ids: Optional[torch.Tensor] = None,
+    selected_ids_host: Optional[list[int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compact-teacher equivalent of ``_compute_target_p_padded`` (same pad constants)."""
     (
@@ -203,7 +211,8 @@ def compute_target_p_padded_from_hidden(
         target_token_ids,
         position_mask,
     ) = compute_target_from_hidden(
-        hidden, lm_head_weight, t2d, loss_mask, chunk_size=chunk_size
+        hidden, lm_head_weight, t2d, loss_mask, chunk_size=chunk_size,
+        selected_token_ids=selected_token_ids, selected_ids_host=selected_ids_host,
     )
 
     assert target_p.dim() == 3

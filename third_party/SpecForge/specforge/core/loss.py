@@ -122,6 +122,8 @@ def log_softmax_backward_kernel(
     m_ptr,
     d_ptr,
     n_cols,
+    ROWS_PER_SAMPLE: tl.constexpr,
+    PER_SAMPLE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     program_id = tl.program_id(0).to(tl.int64)
@@ -141,7 +143,10 @@ def log_softmax_backward_kernel(
     d_ptr += program_id
     m = tl.load(m_ptr).to(tl.float32)
     d = tl.load(d_ptr).to(tl.float32)
-    grad_output = tl.load(grad_output_ptr).to(tl.float32)
+    if PER_SAMPLE:
+        grad_output = tl.load(grad_output_ptr + program_id // ROWS_PER_SAMPLE).to(tl.float32)
+    else:
+        grad_output = tl.load(grad_output_ptr).to(tl.float32)
     grad_output = grad_output * scaling_factor
 
     # First pass: compute sum of (target * grad_output)
@@ -172,7 +177,7 @@ def log_softmax_backward_kernel(
 
 class LogSoftmaxLoss(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, logits, target, position_mask):
+    def forward(ctx, logits, target, position_mask, per_sample=False):
         B, T, V = logits.shape
         loss = torch.zeros((B * T, 1), device=logits.device)
         logits_flat = logits.contiguous().view(B * T, V)
@@ -198,13 +203,18 @@ class LogSoftmaxLoss(torch.autograd.Function):
             num_warps=num_warps,
         )
         ctx.save_for_backward(logits.detach(), target, position_mask, m, d)
-        return loss.squeeze(1).mean()
+        ctx.per_sample = per_sample
+        return loss.view(B, T).mean(dim=1) if per_sample else loss.squeeze(1).mean()
 
     @staticmethod
     def backward(ctx, grad_output):
         logits, target, position_mask, m, d = ctx.saved_tensors
         B, T, V = logits.shape
-        scaling_factor = 1.0 / (B * T)
+        if ctx.per_sample:
+            # sum/stack upstream can pass an expanded, stride-zero vector.
+            # The Triton kernel indexes one gradient per response.
+            grad_output = grad_output.contiguous()
+        scaling_factor = 1.0 / (T if ctx.per_sample else B * T)
         logits = logits.contiguous().view(B * T, V)
         target = target.contiguous().view(B * T, V)
         position_mask = position_mask.contiguous().view(B * T, 1).bool()
@@ -221,8 +231,10 @@ class LogSoftmaxLoss(torch.autograd.Function):
             m,
             d,
             V,
+            ROWS_PER_SAMPLE=T,
+            PER_SAMPLE=ctx.per_sample,
             BLOCK_SIZE=BLOCK_SIZE,
             num_warps=num_warps,
         )
         logits = logits.view(B, T, V)
-        return logits, None, None
+        return (logits, None, None, None) if len(ctx.needs_input_grad) == 4 else (logits, None, None)

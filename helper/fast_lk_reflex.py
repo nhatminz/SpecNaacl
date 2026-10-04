@@ -78,6 +78,7 @@ class ReflexStats:
     loss_sum: Optional[float]
     updates: int
     profile_time_ms: float = 0.0
+    profile_sections_ms: Optional[dict] = None
 
 
 class FastLKReflex:
@@ -148,6 +149,27 @@ class FastLKReflex:
         self._loss_sum: Optional[torch.Tensor] = None
         self._updates = 0
         self._profile_time_s = 0.0
+        self._profile_events = []
+
+    def _gpu_profile_start(self):
+        if not self.profile or self.state is None or not self.state.is_cuda:
+            return None
+        event = torch.cuda.Event(enable_timing=True)
+        event.record()
+        return event
+
+    def _gpu_profile_end(self, label, started):
+        if started is not None:
+            ended = torch.cuda.Event(enable_timing=True)
+            ended.record()
+            self._profile_events.append((label, started, ended))
+
+    def _profile_sections(self):
+        totals = {}
+        for label, started, ended in self._profile_events:
+            ended.synchronize()  # opt-in profiling, only after the rollout
+            totals[label] = totals.get(label, 0.0) + started.elapsed_time(ended)
+        return totals
 
     def _profile_start(self):
         if not self.profile:
@@ -220,6 +242,7 @@ class FastLKReflex:
         )
         self._updates = 0
         self._profile_time_s = 0.0
+        self._profile_events = []
         self._batch_capacity = num_trajectories
         self._context_capacity = int(max_contexts) if self.feedback_scope == "visited_path" else 1
         self._path_capacity = int(max_path_length)
@@ -293,7 +316,11 @@ class FastLKReflex:
                  if needs_fp32_guard and torch.is_autocast_enabled(compact_logits.device.type)
                  else nullcontext())
         with guard:
+            feature_event = self._gpu_profile_start() if self.profile else None
             psi = self._feature(native_hidden)
+            if self.profile:
+                self._gpu_profile_end("feature_projection_ms", feature_event)
+            proposal_event = self._gpu_profile_start() if self.profile else None
             if self._kernels is not None and self.proposal_strategy in {"fused", "sort"}:
                 values, ids, norm = self._kernels.propose(compact_logits, psi, self.state, k,
                                                         self._proposal_workspace,
@@ -316,6 +343,8 @@ class FastLKReflex:
                 if root and self.feedback_scope == "root":
                     # Keep the exact existing Torch/root ablation, no reconstruction.
                     self._root_q, self._root_psi = q.squeeze(1), psi.squeeze(1)
+            if self.profile:
+                self._gpu_profile_end("proposal_ms", proposal_event)
         if self.feedback_scope == "visited_path" or (root and self._kernels is not None):
             self._cache_contexts(compact_logits, psi, norm)
         self._profile_end(started)
@@ -325,6 +354,7 @@ class FastLKReflex:
     def update_visited(self, target, mapping, path, *, greedy=False, validate=False):
         """One state write per round; mean over eligible visited proposal heads."""
         started = self._profile_start()
+        update_event = self._gpu_profile_start() if self.profile else None
         if self._feedback_raw is None or self._round_contexts == 0:
             raise RuntimeError("proposal feedback was not cached")
         batch = self.active_trajectories
@@ -379,6 +409,8 @@ class FastLKReflex:
             self._record_update(alpha[:, 0], None)  # shape only; no diagnostic reductions
         self._round_contexts = 0
         self._profile_end(started)
+        if self.profile:
+            self._gpu_profile_end("feedback_update_ms", update_event)
         return alpha, loss
 
     def _update_cached_root(self, target, mapping, *, greedy):
@@ -420,7 +452,11 @@ class FastLKReflex:
                  and torch.is_autocast_enabled(compact_logits.device.type)
                  else nullcontext())
         with guard:
+            feature_event = self._gpu_profile_start() if self.profile else None
             psi = self._feature(native_hidden)
+            if self.profile:
+                self._gpu_profile_end("feature_projection_ms", feature_event)
+            correction_event = self._gpu_profile_start() if self.profile else None
             if self._kernels is not None:
                 probabilities = self._kernels.correct(compact_logits, psi, self.state)
             else:
@@ -428,6 +464,8 @@ class FastLKReflex:
                     compact_logits.float(), psi, self.state.transpose(1, 2)
                 )
                 probabilities = corrected.softmax(dim=-1)
+            if self.profile:
+                self._gpu_profile_end("correction_ms", correction_event)
         if cache_root:
             if probabilities.shape[1] != 1:
                 raise ValueError("root correction expects exactly one proposal context")
@@ -483,6 +521,7 @@ class FastLKReflex:
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Shared in-place update after compact target supervision is formed."""
         started = self._profile_start()
+        update_event = self._gpu_profile_start() if self.profile else None
         p = compact_target_probs
         alpha, gradient = lk_alpha_and_logit_gradient_without_loss(
             self._root_q, p, self.eps
@@ -499,10 +538,13 @@ class FastLKReflex:
         )
         self._record_update(alpha, loss)
         self._profile_end(started)
+        if self.profile:
+            self._gpu_profile_end("feedback_update_ms", update_event)
         return alpha, loss
 
     def _update_fused(self, target, mapping, *, greedy):
         started = self._profile_start()
+        update_event = self._gpu_profile_start() if self.profile else None
         alpha = self._kernels.update(
             self.state, self._root_q, self._root_psi, target, mapping,
             greedy=greedy, eps=self.eps, learning_rate=self.learning_rate,
@@ -511,6 +553,8 @@ class FastLKReflex:
         loss = lk_diagnostic_loss(alpha, self.eps) if self.diagnostics else None
         self._record_update(alpha, loss)
         self._profile_end(started)
+        if self.profile:
+            self._gpu_profile_end("feedback_update_ms", update_event)
         return alpha, loss
 
     def _record_update(self, alpha, loss):
@@ -551,17 +595,20 @@ class FastLKReflex:
             return ReflexStats(
                 alpha_sum=None, loss_sum=None, updates=int(self._updates),
                 profile_time_ms=self._profile_time_s * 1000.0,
+                profile_sections_ms=self._profile_sections() if self.profile else None,
             )
         if self._updates == 0 or self._alpha_sum is None or self._loss_sum is None:
             return ReflexStats(
                 alpha_sum=0.0, loss_sum=0.0, updates=0,
                 profile_time_ms=self._profile_time_s * 1000.0,
+                profile_sections_ms=self._profile_sections() if self.profile else None,
             )
         return ReflexStats(
             alpha_sum=float(self._alpha_sum.item()),
             loss_sum=float(self._loss_sum.item()),
             updates=int(self._updates),
             profile_time_ms=self._profile_time_s * 1000.0,
+            profile_sections_ms=self._profile_sections() if self.profile else None,
         )
 
     def clear(self) -> None:
@@ -580,6 +627,7 @@ class FastLKReflex:
         self._loss_sum = None
         self._updates = 0
         self._profile_time_s = 0.0
+        self._profile_events = []
 
 
 def reflex_or_baseline_probabilities(

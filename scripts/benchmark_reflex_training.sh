@@ -10,6 +10,9 @@ BENCHMARK_ROOT="${BENCHMARK_ROOT:-$REPO_DIR/outputs/benchmarks/reflex_training_$
 # Independent train roots isolate active_run/latest_run/checkpoint links too.
 [[ ! -e "$BENCHMARK_ROOT" ]] || { echo "Use a NEW BENCHMARK_ROOT" >&2; exit 2; }
 export NPROC_PER_NODE="${NPROC_PER_NODE:-1}" RESUME="" STATISTICAL_TIME=False
+export TARGET_LR="${TARGET_LR:-1e-5}" DRAFT_LR="${DRAFT_LR:-1e-5}"
+export BATCH_SIZE="${BATCH_SIZE:-8}" ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-4}"
+export RESPONSES_PER_PROMPT="${RESPONSES_PER_PROMPT:-8}" DATASET="${DATASET:-dapo}"
 export REFLEX_PROFILE=0 REFLEX_DIAGNOSTICS=0
 export PYTHON_BIN MODEL_KEY
 for method in fastgrpo specnaacl; do
@@ -18,4 +21,5 @@ for method in fastgrpo specnaacl; do
     bash "$REPO_DIR/scripts/launch/train_model.sh" --max_grpo_steps "$BENCHMARK_STEPS" "$@"
 done
 if [[ "${DRY_RUN:-false}" == "true" ]]; then exit 0; fi
-"$PYTHON_BIN" "$REPO_DIR/scripts/summarize_reflex_training.py" "$BENCHMARK_ROOT"
+"$PYTHON_BIN" "$REPO_DIR/scripts/summarize_reflex_training.py" "$BENCHMARK_ROOT" \
+  | tee "$BENCHMARK_ROOT/benchmark_report.json"

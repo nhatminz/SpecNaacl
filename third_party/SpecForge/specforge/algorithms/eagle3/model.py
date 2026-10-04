@@ -57,6 +57,8 @@ def _compute_loss_and_acceptance_rate(
         Callable[..., Tuple[torch.Tensor, torch.Tensor]]
     ] = None,
     reduce_loss_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    per_sample_loss: bool = False,
+    original_lengths: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute step loss and acceptance rate for KL/LK objectives.
 
@@ -71,8 +73,14 @@ def _compute_loss_and_acceptance_rate(
         reduce_metrics_fn: Optional distributed reducer for metric numer/denom.
         reduce_loss_fn: Optional distributed reducer for KL loss.
     """
-    kl_loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
-    if reduce_loss_fn is not None:
+    if per_sample_loss:
+        # The unbatched objective divides each response by its own sequence
+        # length at this TTT step, not by the padded microbatch width.
+        kl_loss = LogSoftmaxLoss.apply(logits, target_p, position_mask, True)
+        kl_loss = kl_loss * (logits.shape[1] / original_lengths.clamp_min(1))
+    else:
+        kl_loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
+    if reduce_loss_fn is not None and not per_sample_loss:
         kl_loss = reduce_loss_fn(kl_loss)
 
     with torch.set_grad_enabled(lk_loss_type is not None):
@@ -80,7 +88,8 @@ def _compute_loss_and_acceptance_rate(
             logits=logits,
             target_probs=target_p_on_draft,
             position_mask=position_mask,
-            reduce_fn=reduce_metrics_fn,
+            reduce_fn=None if per_sample_loss else reduce_metrics_fn,
+            per_sample=per_sample_loss,
         )
 
     if lk_loss_type is None:
@@ -133,6 +142,16 @@ class OnlineEagle3Model(Eagle3Model):
         self.lk_loss_type = lk_loss_type
         self.kl_scale = kl_scale
         self.kl_decay = kl_decay
+        self._compact_selected_ids = None
+        self._compact_selected_ids_host = None
+
+    def prepare_compact_teacher_selection(self):
+        """Cache the immutable d2t mapping once, outside the microbatch hot path."""
+        selected = self.draft_model.d2t.long() + torch.arange(
+            self.draft_model.d2t.numel(), device=self.draft_model.d2t.device
+        )
+        self._compact_selected_ids = selected
+        self._compact_selected_ids_host = selected.tolist()
 
     def _make_adapter(self) -> BackendAdapter:
         if self.attention_backend == "usp":
@@ -151,6 +170,8 @@ class OnlineEagle3Model(Eagle3Model):
         adapter: BackendAdapter,
         loss_scale: float = 1.0,
         full_positions: Optional[int] = None,
+        per_sample_loss: bool = False,
+        original_lengths: Optional[torch.Tensor] = None,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -184,6 +205,8 @@ class OnlineEagle3Model(Eagle3Model):
             kl_decay=self.kl_decay,
             reduce_metrics_fn=adapter.reduce_metrics,
             reduce_loss_fn=adapter.reduce_loss,
+            per_sample_loss=per_sample_loss,
+            original_lengths=original_lengths,
         )
         if loss_scale != 1.0:
             # The trimmed loss kernel averages over n_sup supervised positions, but
@@ -262,6 +285,8 @@ class OnlineEagle3Model(Eagle3Model):
         target_head_weight: Optional[torch.Tensor] = None,
         compact_teacher_chunk_size: int = DEFAULT_VOCAB_CHUNK_SIZE,
         trim_loss_positions: bool = False,
+        per_sample_loss: bool = False,
+        original_lengths: Optional[torch.Tensor] = None,
     ) -> Tuple[
         List[torch.Tensor],
         List[torch.Tensor],
@@ -286,9 +311,17 @@ class OnlineEagle3Model(Eagle3Model):
             trim_loss_positions: compute the teacher, draft logits and loss only at
                 supervised positions when the batch/objective supports it.
         """
+        if per_sample_loss and (original_lengths is None or self.attention_backend == "usp"):
+            raise ValueError("per-sample online loss requires original_lengths and a non-USP backend")
+        profile_events = getattr(self, "_profile_events", None)
+        if profile_events is not None and hidden_states.is_cuda:
+            teacher_start = torch.cuda.Event(enable_timing=True)
+            teacher_start.record()
         adapter = self._make_adapter()
         # Step 1: handle vocab size
         if target_hidden_for_compact is not None:
+            if self._compact_selected_ids is None:
+                self.prepare_compact_teacher_selection()
             (
                 target_p_padded,
                 target_p_on_draft_padded,
@@ -301,6 +334,8 @@ class OnlineEagle3Model(Eagle3Model):
                 loss_mask=loss_mask,
                 length=self.length,
                 chunk_size=compact_teacher_chunk_size,
+                selected_token_ids=self._compact_selected_ids,
+                selected_ids_host=self._compact_selected_ids_host,
             )
             del target_hidden_for_compact
             trim_pack = None
@@ -357,6 +392,12 @@ class OnlineEagle3Model(Eagle3Model):
                     length=self.length,
                 )
             del target
+        if profile_events is not None and hidden_states.is_cuda:
+            teacher_end = torch.cuda.Event(enable_timing=True)
+            teacher_end.record()
+            profile_events.append(("compact_teacher_ms", teacher_start, teacher_end))
+            forward_start = torch.cuda.Event(enable_timing=True)
+            forward_start.record()
         # Reuse CUDA allocator blocks across micro-batches. Flushing here
         # synchronizes the device and repeats large teacher allocations.
 
@@ -471,6 +512,9 @@ class OnlineEagle3Model(Eagle3Model):
             hidden_states = hidden_states_out
 
             # Step 5.4 + 5.5 + 5.6: logits, metric and loss
+            if profile_events is not None and hidden_states.is_cuda:
+                loss_start = torch.cuda.Event(enable_timing=True)
+                loss_start.record()
             if trim_pack is not None:
                 # A-level: only the rows that can carry loss at this step go through
                 # norm + lm_head. Rows shift down by one per step (rows = sup - idx)
@@ -528,7 +572,13 @@ class OnlineEagle3Model(Eagle3Model):
                     position_mask=state.position_mask,
                     loss_mask=state.loss_mask,
                     adapter=adapter,
+                    per_sample_loss=per_sample_loss,
+                    original_lengths=original_lengths if per_sample_loss else None,
                 )
+            if profile_events is not None and hidden_states.is_cuda:
+                loss_end = torch.cuda.Event(enable_timing=True)
+                loss_end.record()
+                profile_events.append(("logits_loss_ms", loss_start, loss_end))
             acces.append(acc)
             acceptance_rates.append(acceptance_rate)
             plosses.append(loss)
@@ -543,6 +593,10 @@ class OnlineEagle3Model(Eagle3Model):
                 position_mask = padding(position_mask, left=False)
                 loss_mask = padding(loss_mask, left=False)
                 # Flex attention mask shirnking is handled inside attention module
+        if profile_events is not None and hidden_states.is_cuda:
+            forward_end = torch.cuda.Event(enable_timing=True)
+            forward_end.record()
+            profile_events.append(("eagle_forward_including_loss_ms", forward_start, forward_end))
         return (
             plosses,
             acceptance_rates,

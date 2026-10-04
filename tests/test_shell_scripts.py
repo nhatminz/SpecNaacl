@@ -18,6 +18,8 @@ MODEL_KEYS = (
 def test_all_launch_shells_have_valid_syntax_and_dry_run():
     env = dict(os.environ, DRY_RUN="true", PYTHON_BIN=PYTHON)
     scripts = [ROOT / f"train_{key}.sh" for key in MODEL_KEYS]
+    scripts += [ROOT / f"train_{key}_fastgrpo.sh" for key in
+                ("qwen3_4b", "qwen25_3b", "qwen3_1p7b")]
     scripts += [ROOT / f"pretrain_{key}.sh" for key in MODEL_KEYS]
     scripts += [
         ROOT / "scripts" / "run_fastgrpo_fair.sh",
@@ -26,7 +28,8 @@ def test_all_launch_shells_have_valid_syntax_and_dry_run():
     scripts += [ROOT / "scripts" / "plot_training_time.sh"]
     for script in scripts + [ROOT / "pretrain_eagle3_sharegpt_b200.sh",
                              ROOT / "scripts/benchmark_pretrain.sh",
-                             ROOT / "scripts/benchmark_reflex_training.sh"]:
+                             ROOT / "scripts/benchmark_reflex_training.sh",
+                             ROOT / "scripts/benchmark_online_draft_training.sh"]:
         subprocess.run([BASH, "-n", str(script)], check=True)
     for script in scripts[:-1]:
         result = subprocess.run(
@@ -71,6 +74,35 @@ def test_fair_launchers_differ_only_by_method_and_reflex_toggle(tmp_path):
     assert treatment[treatment.index("--method") + 1] == "specnaacl"
     assert treatment[treatment.index("--reflex_mode") + 1] == "active"
     assert without_method_flags(baseline) == without_method_flags(treatment)
+
+
+def test_paired_qwen_launchers_share_training_and_use_streamed_triton(tmp_path):
+    for key in ("qwen3_4b", "qwen25_3b", "qwen3_1p7b"):
+        commands = {}
+        for method, suffix in (("specnaacl", ""), ("fastgrpo", "_fastgrpo")):
+            env = dict(os.environ, DRY_RUN="true", PYTHON_BIN=PYTHON,
+                       RUN_NAME="paired", RUN_DIR=str(tmp_path / key))
+            result = subprocess.run([BASH, str(ROOT / f"train_{key}{suffix}.sh")],
+                                    env=env, cwd=ROOT, capture_output=True, text=True, check=True)
+            line = next(line[len("Command  :"):] for line in result.stdout.splitlines()
+                        if line.startswith("Command  :"))
+            command = shlex.split(line)
+            flags = {command[i]: command[i + 1] for i in range(len(command) - 1)
+                     if command[i].startswith("--")}
+            assert flags["--method"] == method
+            assert flags["--reflex_mode"] == ("active" if method == "specnaacl" else "off")
+            for flag, value in (("--target_lr", "1e-5"), ("--draft_lr", "1e-5"),
+                                ("--batch_size", "8"), ("--accumulation_steps", "4"),
+                                ("--reflex_backend", "triton"),
+                                ("--reflex_feedback_scope", "root"),
+                                ("--reflex_update_stream", "1"),
+                                ("--draft_train_mode", "batched")):
+                assert flags[flag] == value
+            commands[method] = command
+        for command in commands.values():
+            del command[command.index("--method"):command.index("--method") + 2]
+            del command[command.index("--reflex_mode"):command.index("--reflex_mode") + 2]
+        assert commands["specnaacl"] == commands["fastgrpo"]
 
 
 def test_reflex_backend_override_is_forwarded_to_training_launcher():

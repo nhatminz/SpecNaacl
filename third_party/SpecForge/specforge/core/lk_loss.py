@@ -22,6 +22,7 @@ def _masked_mean(
     position_mask: torch.Tensor,
     eps: float,
     reduce_fn: Optional[Callable[..., Tuple[torch.Tensor, torch.Tensor]]],
+    per_sample: bool = False,
 ) -> torch.Tensor:
     """Compute a masked mean, with optional distributed reduction."""
     mask = position_mask.squeeze(-1)
@@ -30,8 +31,11 @@ def _masked_mean(
     else:
         mask = mask.to(dtype=values_per_token.dtype)
 
-    numerator = (values_per_token * mask).sum()
-    denominator = mask.sum().clamp_min(eps)
+    dimension = 1 if per_sample else None
+    numerator = (values_per_token * mask).sum(dim=dimension)
+    denominator = mask.sum(dim=dimension).clamp_min(eps)
+    if per_sample and reduce_fn is not None:
+        raise ValueError("per-sample LK metrics do not support distributed reduction")
     if reduce_fn is not None:
         numerator, denominator = reduce_fn(
             local_correct=numerator, local_denom=denominator
@@ -56,6 +60,7 @@ def compute_acceptance_rate(
     position_mask: torch.Tensor,
     eps: float = 1e-8,
     reduce_fn: Optional[Callable[..., Tuple[torch.Tensor, torch.Tensor]]] = None,
+    per_sample: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Return masked means of acceptance and log-acceptance over valid positions."""
     acceptance_rate_per_token = _acceptance_rate_per_token_from_logits(
@@ -67,6 +72,7 @@ def compute_acceptance_rate(
         position_mask=position_mask,
         eps=eps,
         reduce_fn=reduce_fn,
+        per_sample=per_sample,
     )
     log_acceptance_rate_per_token = torch.where(
         acceptance_rate_per_token > 0, torch.log(acceptance_rate_per_token), 0
@@ -76,6 +82,7 @@ def compute_acceptance_rate(
         position_mask=position_mask,
         eps=eps,
         reduce_fn=reduce_fn,
+        per_sample=per_sample,
     )
     return acceptance_rate, log_acceptance_rate
 

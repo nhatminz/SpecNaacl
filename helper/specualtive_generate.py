@@ -175,13 +175,13 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
                         reflex_lr=0.05, reflex_weight_decay=0.0,
                         reflex_seed=42, reflex_profile=False,
                         reflex_diagnostics=False,
-                        reflex_backend="auto",
+                        reflex_backend="triton",
                         reflex_feedback_scope="root",
                         reflex_proposal_strategy="fused",
                         reflex_correction_strategy="serial",
                         reflex_feedback_strategy="serial",
                         reflex_feature_strategy="auto",
-                        reflex_update_stream=False,
+                        reflex_update_stream=True,
                         kv_gather_strategy="stacked",
                         ):
 
@@ -525,6 +525,14 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
     executor = ThreadPoolExecutor(max_workers=64) if reflex_mode == "off" else None
     update_stream = (torch.cuda.Stream(device) if reflex_mode == "active" and reflex_update_stream
                      and torch.device(device).type == "cuda" else None)
+    profile_overlap_events = [] if reflex_profile and update_stream is not None else None
+
+    def wait_for_reflex_update():
+        if profile_overlap_events is not None:
+            main_ready = torch.cuda.Event(enable_timing=True)
+            main_ready.record(torch.cuda.current_stream(device))
+            profile_overlap_events.append((source_ready, update_done, main_ready))
+        torch.cuda.current_stream(device).wait_event(update_done)
 
     prefill_time_start=time.time()
     target_time_start=time.time()
@@ -1046,13 +1054,13 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
         
         if 0 not in end_sig:
             if update_stream is not None:
-                torch.cuda.current_stream(device).wait_event(update_done)
+                wait_for_reflex_update()
             break
         real_sequences_length=max([len(item1)+input_ids.shape[-1]-len(item2) for item1,item2 in zip(generated_sequences, padding_positions)])
         
         if real_sequences_length>=max_length:
             if update_stream is not None:
-                torch.cuda.current_stream(device).wait_event(update_done)
+                wait_for_reflex_update()
             break
         
         if finished_indices:
@@ -1220,7 +1228,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
             # forward are independent of the new A. The event is needed only
             # before batch-compacting A or issuing the next proposal.
             if update_stream is not None:
-                torch.cuda.current_stream(device).wait_event(update_done)
+                wait_for_reflex_update()
                 if finished_indices:
                     reflex.remove_finished(finished_indices)
 
@@ -1358,4 +1366,17 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
         result['reflex_loss_sum'] = reflex_stats.loss_sum
     if reflex_stats is not None and reflex_profile:
         result['reflex_profile_time_ms'] = reflex_stats.profile_time_ms
+        result['reflex_profile_sections_ms'] = reflex_stats.profile_sections_ms
+        if profile_overlap_events:
+            overlap_ms = 0.0
+            update_ms = 0.0
+            for source_ready, update_done, main_ready in profile_overlap_events:
+                update_done.synchronize()  # opt-in post-rollout profiling only
+                main_ready.synchronize()
+                elapsed_update = source_ready.elapsed_time(update_done)
+                elapsed_main = source_ready.elapsed_time(main_ready)
+                update_ms += elapsed_update
+                overlap_ms += min(elapsed_update, elapsed_main)
+            result['reflex_update_stream_ms'] = update_ms
+            result['reflex_estimated_overlap_ms'] = overlap_ms
     return result

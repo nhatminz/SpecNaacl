@@ -2,7 +2,7 @@
 set -euo pipefail
 # Paired launcher: all defaults are identical except METHOD / Reflex.
 MODEL_KEY="qwen25_3b"
-METHOD="specnaacl"
+METHOD="fastgrpo"
 MODEL="${MODEL:-/workspace/storage-shared/models/Qwen2.5-3B-Instruct}"
 DATASET="${DATASET:-dapo}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"

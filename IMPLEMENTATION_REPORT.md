@@ -941,3 +941,41 @@ passed. A broader local pytest run had 321 passes, but full collection is
 blocked by missing local `pydantic`/`transformers`; three pre-existing dirty
 `tests/test_requirements.py` cases reference absent offline-wheel files. No
 full model rollout/training or B200 benchmark was run on this machine.
+
+## 2026-10-04: streamed-root default and batched online draft training
+
+- SpecNaacl production default is now Triton/root/update-stream, equivalent to
+  `triton-root-stream`. FastGRPO keeps Reflex OFF and allocates no Reflex stream.
+  Rollout's serial/parallel and Torch/custom kernel strategies remain selectable
+  so B200 measurements can pick the end-to-end winner; no unmeasured winner is
+  asserted here.
+- Both methods use the same deterministic length-bucketed dynamic microbatch
+  adapter for the real vendored SpecForge EAGLE-3 forward/TTT. Added a per-row
+  output to SpecForge's Triton KL kernel and LK masked means so padding does not
+  change each response's original loss denominator or nonlinear LK term.
+  Prompt masks, first-token budget allocation, response weighting and optimizer
+  cadence are unchanged. The original per-response path is available with
+  `DRAFT_TRAIN_MODE=per_response` for measured fallback.
+- Cached the immutable compact-token selection before the microbatch inner loop.
+  Training metrics transfer GPU-to-CPU once per rollout phase. Optional
+  `DRAFT_TRAIN_PROFILE=1` records packing, compact teacher, forward/loss,
+  backward and optimizer timing; default is OFF.
+- Six paired Qwen launchers default to DAPO, both LRs `1e-5`, batch `8`, target
+  accumulation `4`; model/checkpoint/data paths remain the existing local ones.
+  Run names and outputs use the existing collision-safe launcher.
+- CPU ragged-response parity checks cover KL/alpha/TV/lambda objectives, token
+  budget, loss, acceptance metric and gradients. CUDA Triton per-row loss/grad
+  was checked on local RTX 3090; this is not a B200 throughput benchmark.
+- `scripts/benchmark_online_draft_training.sh`, existing real rollout and
+  full-method benchmark scripts provide opt-in B200 comparisons. No real B200
+  speedup or end-to-end result is claimed until those scripts are run there.
+- Validation here: `compileall` and six-launcher shell syntax passed;
+  272 Python tests passed (134 skipped for CUDA) when excluding the unrelated
+  offline-wheel requirements test; local RTX 3090 Reflex CUDA suite passed
+  156 tests; new Triton per-row loss/gradient CUDA parity passed. The full
+  `pytest -q` run has three pre-existing failures in `tests/test_requirements.py`
+  because `requirements-bootstrap.txt`, `requirements-external.txt`, and
+  `scripts/build_offline_wheelhouse.sh` are absent from this checkout.
+  `pip check` passed in the local CPU test venv, but that venv lacks `pandas`
+  and its installed CUDA build is incompatible with this machine's driver,
+  so production CLI/full-model runs and B200 timing were not possible here.

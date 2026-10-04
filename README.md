@@ -19,9 +19,9 @@ not the wall-clock baseline for this comparison.
 - No Reflex backward, optimizer, persistent model update, or extra target forward.
 - `REFLEX_PROFILE=0` and `REFLEX_DIAGNOSTICS=0` are the defaults; diagnostic LK
   loss is not evaluated in that default path.
-- `REFLEX_BACKEND=auto|torch|triton` selects FP32 Reflex engineering kernels.
-  Auto uses fused Triton on supported CUDA setups; Torch is the reference path.
-  Auto means availability, not the fastest measured backend. Run CUDA parity,
+- `REFLEX_BACKEND=triton` and `REFLEX_UPDATE_STREAM=1` are the SpecNaacl
+  production defaults; `REFLEX_FEEDBACK_SCOPE=root` remains default. Each is
+  overrideable. FastGRPO mode creates no Reflex update stream. Run CUDA parity,
   [component benchmark](scripts/benchmark_reflex_pipeline.py) and
   [real rollout benchmark](scripts/benchmark_reflex_rollout.py)
   before trusting GPU speed/quality; local CPU tests are not a B200 benchmark.

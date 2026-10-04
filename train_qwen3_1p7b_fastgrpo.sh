@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 # Paired launcher: all defaults are identical except METHOD / Reflex.
-MODEL_KEY="qwen25_3b"
-METHOD="specnaacl"
-MODEL="${MODEL:-/workspace/storage-shared/models/Qwen2.5-3B-Instruct}"
+MODEL_KEY="qwen3_1p7b"
+METHOD="fastgrpo"
+MODEL="${MODEL:-/workspace/storage-shared/models/Qwen3-1.7B}"
 DATASET="${DATASET:-dapo}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-1}"

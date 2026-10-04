@@ -90,6 +90,21 @@ def test_reflex_mode_off_is_exact_baseline_behavior():
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for opt-in GPU profile")
+def test_opt_in_reflex_profile_reports_components():
+    reflex = FastLKReflex(feature_dim=3, backend="triton", profile=True)
+    reflex.start(2, 16, 8, "cuda")
+    logits = torch.randn(2, 1, 16, device="cuda")
+    hidden = torch.randn(2, 1, 8, device="cuda")
+    mapping = torch.arange(16, device="cuda")
+    reflex.propose(logits, hidden, 4, mapping, root=True)
+    reflex.update_from_target_tokens(torch.tensor([1, 2], device="cuda"), mapping)
+    sections = reflex.finish().profile_sections_ms
+    assert sections["feature_projection_ms"] >= 0
+    assert sections["proposal_ms"] >= 0
+    assert sections["feedback_update_ms"] >= 0
+
+
 def test_fused_nonzero_correction_matches_reference_einsum():
     torch.manual_seed(17)
     reflex = FastLKReflex(feature_dim=3, seed=4)

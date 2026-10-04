@@ -66,7 +66,12 @@ def cpu_training_model(monkeypatch):
     reference.decorator_list = []
     scope = {"torch": torch, "nn": torch.nn}
     exec(compile(ast.Module(body=[reference], type_ignores=[]), "loss.py", "exec"), scope)
-    scope["LogSoftmaxLoss"] = SimpleNamespace(apply=scope["_compute_loss"])
+    def reference_loss(logits, target_p, position_mask, per_sample=False):
+        if not per_sample:
+            return scope["_compute_loss"](logits, target_p, position_mask)
+        logp = torch.log_softmax(logits.float(), dim=-1)
+        return -(target_p * logp * position_mask).sum(dim=-1).mean(dim=1)
+    scope["LogSoftmaxLoss"] = SimpleNamespace(apply=reference_loss)
     model_tree = ast.parse((SPEC / "algorithms/eagle3/model.py").read_text(encoding="utf-8"))
     model_tree.body = [node for node in model_tree.body
                        if not (isinstance(node, ast.ImportFrom)
@@ -173,3 +178,49 @@ def test_zero_budget_skips_training(cpu_training_model):
         }
     assert training_entrypoint()(model, outputs, torch.ones(1, 4), 0) == (0, 0, 0, 0, 0)
     assert all(param.grad is None for param in model.draft_model.parameters())
+
+
+@pytest.mark.parametrize("lk_loss_type", [None, "alpha", "tv", "lambda"])
+@pytest.mark.parametrize("token_budget", [None, 14])
+def test_batched_matches_per_response_for_ragged_rows(cpu_training_model, lk_loss_type, token_budget):
+    model = cpu_training_model
+    model.dtype = torch.float32
+    model.specforge_training_model.lk_loss_type = lk_loss_type
+    lengths = [13, 17, 15, 12]
+    outputs = {
+        "all_draft_input_states": [torch.randn(n, 48) for n in lengths],
+        "all_target_hidden_states": [torch.randn(n, 16) for n in lengths],
+        "all_draft_input_ids": [torch.randint(0, 32, (n,)) for n in lengths],
+    }
+    for row in outputs["all_target_hidden_states"]:
+        row[:, 0] = 1
+    prompt_mask = torch.tensor([[1, 1, 1, 0, 0, 0], [1, 1, 1, 1, 1, 0]])
+    train = training_entrypoint()
+    old = train(model, outputs, prompt_mask, token_budget, mode="per_response")
+    old_grads = {name: p.grad.detach().clone() for name, p in model.draft_model.named_parameters()
+                 if p.grad is not None}
+    model.draft_model.zero_grad(set_to_none=True)
+    new = train(model, outputs, prompt_mask, token_budget, mode="batched",
+                max_batch_size=4, max_tokens=100, max_padding_ratio=1.5)
+    assert old[-1] == new[-1]
+    assert old[0] == pytest.approx(new[0], rel=2e-4, abs=2e-5)
+    assert old[1] == pytest.approx(new[1], rel=2e-4, abs=2e-5)
+    for name, p in model.draft_model.named_parameters():
+        if name in old_grads:
+            torch.testing.assert_close(p.grad, old_grads[name], rtol=4e-3, atol=3e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="SpecForge Triton loss requires CUDA")
+def test_triton_per_sample_loss_matches_reference_gradients():
+    from specforge.core.loss import LogSoftmaxLoss
+    logits = torch.randn(3, 5, 16, device="cuda", requires_grad=True)
+    reference_logits = logits.detach().clone().requires_grad_()
+    teacher = torch.softmax(torch.randn_like(logits), dim=-1)
+    mask = torch.randint(0, 2, (3, 5, 1), device="cuda")
+    actual = LogSoftmaxLoss.apply(logits, teacher, mask, True)
+    reference = -(teacher * torch.log_softmax(reference_logits.float(), dim=-1)
+                  * mask).sum(dim=-1).mean(dim=-1)
+    torch.testing.assert_close(actual, reference, rtol=1e-5, atol=1e-5)
+    actual.sum().backward()
+    reference.sum().backward()
+    torch.testing.assert_close(logits.grad, reference_logits.grad, rtol=1e-5, atol=1e-5)

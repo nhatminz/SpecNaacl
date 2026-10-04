@@ -281,12 +281,17 @@ parser.add_argument('--reflex_feedback_scope', '--reflex_update_scope', dest='re
                     type=str, default='root', choices=['root', 'visited_path'])
 parser.add_argument('--reflex_profile', default='0')
 parser.add_argument('--reflex_diagnostics', default='0')
-parser.add_argument('--reflex_backend', default='auto', choices=['auto', 'torch', 'triton'])
+parser.add_argument('--reflex_backend', default='triton', choices=['auto', 'torch', 'triton'])
 parser.add_argument('--reflex_proposal_strategy', default='fused', choices=['fused', 'sort', 'hybrid', 'torch'])
 parser.add_argument('--reflex_correction_strategy', default='serial', choices=['serial', 'parallel', 'tiled'])
 parser.add_argument('--reflex_feedback_strategy', default='serial', choices=['serial', 'parallel'])
 parser.add_argument('--reflex_feature_strategy', default='auto', choices=['auto', 'triton', 'torch'])
-parser.add_argument('--reflex_update_stream', default='0', choices=['0', '1'])
+parser.add_argument('--reflex_update_stream', default='1', choices=['0', '1'])
+parser.add_argument('--draft_train_mode', default='batched', choices=['batched', 'per_response'])
+parser.add_argument('--draft_train_max_batch_size', type=int, default=8)
+parser.add_argument('--draft_train_max_tokens', type=int, default=4096)
+parser.add_argument('--draft_train_max_padding_ratio', type=float, default=1.25)
+parser.add_argument('--draft_train_profile', default='0', choices=['0', '1'])
 parser.add_argument('--kv_gather_strategy', default='stacked', choices=['stacked', 'per_layer'])
 parser.add_argument('--dtype', type=str, default='auto', choices=['auto', 'bf16', 'fp16', 'fp32'])
 parser.add_argument('--attn_implementation', type=str, default='')
@@ -588,6 +593,9 @@ if drift_temperature <= 0.0:
     raise ValueError('--drift_temperature must be positive')
 if draft_lr_multiplier <= 0.0:
     raise ValueError('--draft_lr_multiplier must be positive')
+if (args.draft_train_max_batch_size < 1 or args.draft_train_max_tokens < 1 or
+        args.draft_train_max_padding_ratio < 1.0):
+    raise ValueError('draft microbatch size/tokens must be positive and padding ratio >= 1')
 if args.reflex_mode == 'active' and args.draft_backend != 'eagle3':
     raise ValueError('--reflex_mode=active requires --draft_backend=eagle3')
 if args.reflex_feature_dim <= 0 or args.reflex_lr < 0 or args.reflex_weight_decay < 0:
@@ -948,7 +956,14 @@ def compute_target_loss_and_backward(
 
 def training_draft_model(model,outputs,prompt_mask,token_budget=None):
     if getattr(model, 'is_eagle3_specforge', False):
-        return training_eagle3_specforge(model, outputs, prompt_mask, token_budget=token_budget)
+        return training_eagle3_specforge(
+            model, outputs, prompt_mask, token_budget=token_budget,
+            mode=args.draft_train_mode,
+            max_batch_size=args.draft_train_max_batch_size,
+            max_tokens=args.draft_train_max_tokens,
+            max_padding_ratio=args.draft_train_max_padding_ratio,
+            profile=_as_bool(args.draft_train_profile),
+        )
     
 
     all_draft_input_states = outputs['all_draft_input_states']
@@ -1197,7 +1212,9 @@ def training_draft_model(model,outputs,prompt_mask,token_budget=None):
     return total_loss1,total_loss2,mean_drift_tv,mean_drift_kl,drift_count
 
 
-def training_eagle3_specforge(model, outputs, prompt_mask, token_budget=None):
+def training_eagle3_specforge(model, outputs, prompt_mask, token_budget=None,
+                              mode='batched', max_batch_size=8, max_tokens=4096,
+                              max_padding_ratio=1.25, profile=False):
     """Use SpecForge's EAGLE-3 architecture, KL/LK loss and TTT unrolling.
 
     This adapter only packs FastGRPO rollout tensors.  Objective computation and
@@ -1210,53 +1227,124 @@ def training_eagle3_specforge(model, outputs, prompt_mask, token_budget=None):
         raise RuntimeError('EAGLE-3 rollout is missing final target hidden states')
     if not (len(feature_rows) == len(target_rows) == len(token_rows)):
         raise RuntimeError('misaligned EAGLE-3 rollout feature tensors')
-    total_loss = 0.0
-    total_acceptance = 0.0
-    valid_tokens = 0
-    remaining_budget = None if token_budget is None else int(token_budget)
+    if mode not in ('batched', 'per_response'):
+        raise ValueError('draft train mode must be batched or per_response')
+    if max_batch_size < 1 or max_tokens < 1 or max_padding_ratio < 1:
+        raise ValueError('draft microbatch limits must be positive and padding ratio >= 1')
+    nrows = len(feature_rows)
+    if nrows == 0:
+        return 0, 0, 0, 0, 0
+    profile_start = time.perf_counter() if profile else None
+    if prompt_mask.shape[0] * repeated_generate_nums < nrows:
+        raise ValueError('prompt mask has fewer rows than the rollout')
+    # A single device-to-host transfer before packing; no per-response sync.
+    prompt_lengths = prompt_mask.sum(dim=1).repeat_interleave(repeated_generate_nums)[:nrows].tolist()
+    lengths = [int(row.shape[-1]) for row in token_rows]
+    allowed = []
+    remaining = None if token_budget is None else max(0, int(token_budget))
+    for seq_len, prompt_len in zip(lengths, prompt_lengths):
+        count = max(0, seq_len - min(int(prompt_len), seq_len) - 1)
+        if remaining is not None:
+            count = min(count, remaining)
+            remaining -= count
+        allowed.append(count)
+    valid_tokens = sum(allowed)
+    if not valid_tokens:
+        return 0, 0, 0, 0, 0
+    # Shortest-first bucketing is deterministic and reduces both padding and
+    # compact-teacher temporary memory. A singleton is always legal.
+    ordered = [i for i in range(nrows) if allowed[i] > 0]
+    if mode == 'batched':
+        ordered.sort(key=lambda i: (lengths[i], i))
+    packs = []
+    pack = []
+    pack_sum = 0
+    for i in ordered:
+        prospective_max = lengths[i]
+        prospective_count = len(pack) + 1
+        prospective_sum = pack_sum + lengths[i]
+        if pack and (prospective_count > (1 if mode == 'per_response' else max_batch_size)
+                     or prospective_max * prospective_count > max_tokens
+                     or prospective_max * prospective_count > max_padding_ratio * prospective_sum):
+            packs.append(pack)
+            pack, pack_sum = [], 0
+        pack.append(i)
+        pack_sum += lengths[i]
+    if pack:
+        packs.append(pack)
     training_model = model.specforge_training_model
     target_head = _get_base_causal_lm(model.target_model).lm_head.weight
-    for index, (features, target_hidden, input_ids_row) in enumerate(
-        zip(feature_rows, target_rows, token_rows)
-    ):
-        prompt_len = int(prompt_mask[index // repeated_generate_nums].sum().item())
-        seq_len = int(input_ids_row.shape[-1])
-        loss_mask = torch.zeros((1, seq_len, 1), device=model.device, dtype=torch.float32)
-        loss_mask[:, min(prompt_len, seq_len):, :] = 1.0
-        if seq_len:
-            loss_mask[:, -1, :] = 0.0
-        if remaining_budget is not None:
-            valid_positions = torch.nonzero(loss_mask.reshape(-1) > 0, as_tuple=False).flatten()
-            if valid_positions.numel() > remaining_budget:
-                loss_mask.zero_()
-                loss_mask.reshape(-1)[valid_positions[:remaining_budget]] = 1.0
-        cur_valid = int(loss_mask.sum().item())
-        if cur_valid == 0:
-            continue
-        # Rollout uses inference_mode for speed. Its tensors must become ordinary
-        # tensors before autograd saves inputs for draft parameter gradients.
-        # Convert per response, after dtype casting, without copying the whole
-        # rollout or changing teacher values / loss masks / TTT semantics.
+    if (hasattr(training_model, 'prepare_compact_teacher_selection') and
+            getattr(training_model, '_compact_selected_ids', None) is None):
+        training_model.prepare_compact_teacher_selection()
+    loss_total = torch.zeros((), device=model.device, dtype=torch.float32)
+    acceptance_total = torch.zeros_like(loss_total)
+    timing = ({'packs': len(packs), 'responses': len(ordered),
+               'bucketing_cpu_ms': (time.perf_counter() - profile_start) * 1000,
+               'packing_cpu_ms': 0.0} if profile else None)
+    cuda_events = []
+    if profile:
+        training_model._profile_events = []
+    for pack in packs:
+        packing_start = time.perf_counter() if profile else None
+        seq_len = max(lengths[i] for i in pack)
+        row_lengths = torch.tensor([lengths[i] for i in pack], device=model.device)
+        row_prompts = torch.tensor([min(int(prompt_lengths[i]), lengths[i]) for i in pack], device=model.device)
+        row_allowed = torch.tensor([allowed[i] for i in pack], device=model.device)
+        positions = torch.arange(seq_len, device=model.device).unsqueeze(0)
+        attention_mask = (positions < row_lengths[:, None]).long()
+        loss_mask = ((positions >= row_prompts[:, None]) &
+                     (positions < row_prompts[:, None] + row_allowed[:, None]) &
+                     (positions < row_lengths[:, None] - 1)).unsqueeze(-1).float()
+        # inference_mode tensors cannot be saved by autograd. Convert each row
+        # before padding; this changes neither values nor teacher supervision.
+        ids = torch.nn.utils.rnn.pad_sequence(
+            [rollout_tensor_for_training(token_rows[i]) for i in pack],
+            batch_first=True, padding_value=0)
+        features = torch.nn.utils.rnn.pad_sequence(
+            [rollout_tensor_for_training(feature_rows[i].to(model.dtype)) for i in pack],
+            batch_first=True, padding_value=0)
+        target_hidden = torch.nn.utils.rnn.pad_sequence(
+            [rollout_tensor_for_training(target_rows[i].to(model.dtype)) for i in pack],
+            batch_first=True, padding_value=0)
+        if profile:
+            timing['packing_cpu_ms'] += (time.perf_counter() - packing_start) * 1000
+        if profile and torch.cuda.is_available() and model.device.type == 'cuda':
+            forward_start = torch.cuda.Event(enable_timing=True)
+            forward_start.record()
         result = training_model(
-            input_ids=rollout_tensor_for_training(input_ids_row.unsqueeze(0)),
-            attention_mask=torch.ones((1, seq_len), device=model.device, dtype=torch.long),
+            input_ids=ids,
+            attention_mask=attention_mask,
             target=None,
             loss_mask=loss_mask,
-            hidden_states=rollout_tensor_for_training(features.unsqueeze(0).to(model.dtype)),
-            target_hidden_for_compact=rollout_tensor_for_training(target_hidden.unsqueeze(0).to(model.dtype)),
+            hidden_states=features,
+            target_hidden_for_compact=target_hidden,
             target_head_weight=target_head,
+            **({'per_sample_loss': True, 'original_lengths': row_lengths}
+               if mode == 'batched' else {}),
         )
         plosses, acceptance_rates = result[0], result[1]
         loss = torch.stack([item.float() for item in plosses]).sum()
-        (loss / max(len(feature_rows), 1)).backward()
-        total_loss += float(loss.detach().cpu())
-        total_acceptance += sum(float(item.detach().cpu()) for item in acceptance_rates)
-        valid_tokens += cur_valid
-        if remaining_budget is not None:
-            remaining_budget -= cur_valid
-            if remaining_budget <= 0:
-                break
-    denom = max(len(feature_rows), 1)
+        if profile and torch.cuda.is_available() and model.device.type == 'cuda':
+            forward_end = torch.cuda.Event(enable_timing=True)
+            forward_end.record()
+            cuda_events.append(('total_forward_ms', forward_start, forward_end))
+            backward_start = torch.cuda.Event(enable_timing=True)
+            backward_start.record()
+        (loss / nrows).backward()
+        if profile and torch.cuda.is_available() and model.device.type == 'cuda':
+            backward_end = torch.cuda.Event(enable_timing=True)
+            backward_end.record()
+            cuda_events.append(('backward_ms', backward_start, backward_end))
+        loss_total += loss.detach()
+        acceptance_total += torch.stack([item.float() for item in acceptance_rates]).sum().detach()
+    total_loss, total_acceptance = torch.stack((loss_total, acceptance_total)).cpu().tolist()
+    if profile:
+        for label, start, end in cuda_events + training_model._profile_events:
+            timing[label] = timing.get(label, 0.0) + start.elapsed_time(end)
+        training_model._profile_events = None
+        model.last_draft_train_profile = timing
+    denom = nrows
     # Keep the legacy return arity. The second field is the SpecForge simulated
     # acceptance objective; sparse legacy drift metrics are deliberately absent.
     return total_loss / denom, total_acceptance / denom, 0.0, 0.0, valid_tokens
@@ -1407,6 +1495,10 @@ run_config_log = {
     "drift_temperature": float(drift_temperature),
     "drift_normalization": "mean_over_valid_response_token_rows",
     "draft_lr_multiplier": float(draft_lr_multiplier),
+    "draft_train_mode": args.draft_train_mode,
+    "draft_train_max_batch_size": int(args.draft_train_max_batch_size),
+    "draft_train_max_tokens": int(args.draft_train_max_tokens),
+    "draft_train_max_padding_ratio": float(args.draft_train_max_padding_ratio),
     "effective_draft_lrs": effective_draft_lrs,
     "fastgrpo_ablation": bool(fastgrpo_ablation),
 }
@@ -1680,6 +1772,14 @@ for epoch in epoch_bar:
             return_all_draft_input=True,statistical_time=statistical_time,
             **reflex_kwargs)
         effective_reflex_backend = outputs.get('reflex_backend', 'off')
+        if _as_bool(args.reflex_profile) and is_main_process:
+            with open(log_file, 'a', encoding='utf-8') as profile_stream:
+                profile_stream.write(json.dumps({
+                    'phase': 'reflex_profile', 'step': int(step),
+                    'sections_ms': outputs.get('reflex_profile_sections_ms'),
+                    'estimated_overlap_ms': outputs.get('reflex_estimated_overlap_ms'),
+                    'update_stream_ms': outputs.get('reflex_update_stream_ms'),
+                }) + '\n')
             
         
         prompt_length=input_ids.shape[-1]
@@ -1704,6 +1804,12 @@ for epoch in epoch_bar:
                 torch.cuda.synchronize()
             draft_train_time_start=time.time()
             draft_loss1,draft_loss2,draft_sparse_tv,draft_sparse_kl,draft_sparse_count=training_draft_model(model,outputs,attention_mask)
+            if _as_bool(args.draft_train_profile) and is_main_process:
+                with open(log_file, 'a', encoding='utf-8') as profile_stream:
+                    profile_stream.write(json.dumps({
+                        'phase': 'draft_profile', 'step': int(step),
+                        **getattr(model, 'last_draft_train_profile', {}),
+                    }) + '\n')
             if statistical_time:
                 torch.cuda.synchronize()
             batch_data['draft_train_time_cost']+=time.time()-draft_train_time_start
@@ -1719,7 +1825,20 @@ for epoch in epoch_bar:
             draft_accumulated_step += 1
             if is_train_draft and draft_accumulated_step % draft_accumulation_steps == 0:
                 _sync_gradients(model.draft_model)
+                if _as_bool(args.draft_train_profile):
+                    optimizer_profile_start = torch.cuda.Event(enable_timing=True)
+                    optimizer_profile_end = torch.cuda.Event(enable_timing=True)
+                    optimizer_profile_start.record()
                 optimizer_draft.step() 
+                if _as_bool(args.draft_train_profile):
+                    optimizer_profile_end.record()
+                    optimizer_profile_end.synchronize()
+                    if is_main_process:
+                        with open(log_file, 'a', encoding='utf-8') as profile_stream:
+                            profile_stream.write(json.dumps({
+                                'phase': 'draft_optimizer_profile', 'step': int(step),
+                                'optimizer_ms': optimizer_profile_start.elapsed_time(optimizer_profile_end),
+                            }) + '\n')
                 optimizer_draft.zero_grad(set_to_none=True)
                 draft_step += 1
                 draft_update_committed = True
@@ -2476,6 +2595,10 @@ summary = {
     "draft_sparse_kl": float(final_metrics['draft_sparse_kl']),
     "draft_sparse_count": int(final_metrics['draft_sparse_count']),
     "draft_lr_multiplier": float(draft_lr_multiplier),
+    "draft_train_mode": args.draft_train_mode,
+    "draft_train_max_batch_size": int(args.draft_train_max_batch_size),
+    "draft_train_max_tokens": int(args.draft_train_max_tokens),
+    "draft_train_max_padding_ratio": float(args.draft_train_max_padding_ratio),
     "effective_draft_lrs": effective_draft_lrs,
     "fastgrpo_ablation": bool(fastgrpo_ablation),
     "method": method,
@@ -2501,6 +2624,8 @@ summary = {
     "total_draft_train_time_s": float(final_metrics['draft_train_time_cost']) if is_train_draft else 0.0,
     "total_wall_time_s": float(total_wall_time),
     "total_rollout_tokens": int(final_metrics['total_rollout_tokens']),
+    "peak_allocated_bytes": int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else 0,
+    "peak_reserved_bytes": int(torch.cuda.max_memory_reserved()) if torch.cuda.is_available() else 0,
     "generation_tokens_per_s": float(final_metrics['tokens_per_s']),
     "tokens_per_s": float(final_metrics['tokens_per_s']),
     "average_accept_length": float(final_average_accept_length),

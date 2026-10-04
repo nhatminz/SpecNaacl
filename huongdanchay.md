@@ -10,6 +10,33 @@ cd /workspace/storage-shared/nlp/minhpn19/SpecNaacl
 export PYTHON_BIN="$(command -v python)"
 ```
 
+Sáu launcher ghép cặp mới (mặc định DAPO, target/draft LR `1e-5`, batch `8`,
+accumulation `4`, SpecNaacl = Triton/root/stream):
+
+```bash
+CUDA_VISIBLE_DEVICES=0 bash train_qwen3_4b.sh
+CUDA_VISIBLE_DEVICES=0 bash train_qwen3_4b_fastgrpo.sh
+CUDA_VISIBLE_DEVICES=0 bash train_qwen25_3b.sh
+CUDA_VISIBLE_DEVICES=0 bash train_qwen25_3b_fastgrpo.sh
+CUDA_VISIBLE_DEVICES=0 bash train_qwen3_1p7b.sh
+CUDA_VISIBLE_DEVICES=0 bash train_qwen3_1p7b_fastgrpo.sh
+```
+
+Các launcher cần draft EAGLE-3 đã pretrain đúng model. Có thể chạy ngắn với
+`--max_grpo_steps 2`, hoặc `DRY_RUN=true` để kiểm tra lệnh. Giới hạn VRAM:
+`DRAFT_TRAIN_MAX_BATCH_SIZE=8 DRAFT_TRAIN_MAX_TOKENS=4096
+DRAFT_TRAIN_MAX_PADDING_RATIO=1.25`. Nếu B200 benchmark cho thấy batched
+chậm hơn, đổi `DRAFT_TRAIN_MODE=per_response`; nếu stream chậm hơn, đặt
+`REFLEX_UPDATE_STREAM=0`.
+
+Đo trên B200 trước khi train dài (kết quả nằm trong
+`outputs/benchmarks/<run>/benchmark_report.json`):
+
+```bash
+MODEL_KEY=qwen25_3b BENCHMARK_STEPS=3 bash scripts/benchmark_online_draft_training.sh
+MODEL_KEY=qwen25_3b BENCHMARK_STEPS=3 bash scripts/benchmark_reflex_training.sh
+```
+
 ## 1. Pretrain draft Qwen2.5-3B trong 1 epoch
 
 ```bash
@@ -47,8 +74,8 @@ DATASET_PATH=/workspace/storage-shared/nlp/minhpn19/data/DAPO-Math-17k-Processed
 REFLEX_FEATURE_DIM=8 \
 REFLEX_LR=0.05 \
 REFLEX_WEIGHT_DECAY=0.0 \
-TARGET_LR=1e-6 \
-DRAFT_LR=1e-6 \
+TARGET_LR=1e-5 \
+DRAFT_LR=1e-5 \
 BATCH_SIZE=8 \
 ACCUMULATION_STEPS=4 \
 GEN_MAX_LENGTH=2048 \
@@ -71,8 +98,8 @@ DATASET_PATH=/workspace/storage-shared/nlp/minhpn19/data/DAPO-Math-17k-Processed
 REFLEX_FEATURE_DIM=8 \
 REFLEX_LR=0.05 \
 REFLEX_WEIGHT_DECAY=0.0 \
-TARGET_LR=1e-6 \
-DRAFT_LR=1e-6 \
+TARGET_LR=1e-5 \
+DRAFT_LR=1e-5 \
 BATCH_SIZE=8 \
 ACCUMULATION_STEPS=4 \
 GEN_MAX_LENGTH=2048 \
@@ -89,7 +116,7 @@ Muốn chỉ rõ draft thay vì dùng link mới nhất:
 DRAFT_CHECKPOINT=/absolute/pretrain/run/checkpoints/<run>-latest \
 DRAFT_CONFIG=/absolute/pretrain/run/config/eagle3.json \
 VOCAB_MAPPING=/absolute/pretrain/run/features/vocab_mapping/vocab_mapping.pt \
-METHOD=specnaacl bash train_qwen25_3b.sh
+bash train_qwen25_3b.sh
 ```
 
 Resume run train cũ:

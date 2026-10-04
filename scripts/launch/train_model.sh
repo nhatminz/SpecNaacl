@@ -96,6 +96,11 @@ cmd=(
   --draft_accumulation_steps "$DRAFT_ACCUMULATION_STEPS"
   --target_lr "$TARGET_LR"
   --draft_lr "$DRAFT_LR"
+  --draft_train_mode "$DRAFT_TRAIN_MODE"
+  --draft_train_max_batch_size "$DRAFT_TRAIN_MAX_BATCH_SIZE"
+  --draft_train_max_tokens "$DRAFT_TRAIN_MAX_TOKENS"
+  --draft_train_max_padding_ratio "$DRAFT_TRAIN_MAX_PADDING_RATIO"
+  --draft_train_profile "$DRAFT_TRAIN_PROFILE"
   --is_train_draft "$IS_TRAIN_DRAFT"
   --temperature "$TEMPERATURE"
   --top_p "$TOP_P"
@@ -130,7 +135,7 @@ cmd=(
   --reflex_correction_strategy "${REFLEX_CORRECTION_STRATEGY:-serial}"
   --reflex_feedback_strategy "${REFLEX_FEEDBACK_STRATEGY:-serial}"
   --reflex_feature_strategy "${REFLEX_FEATURE_STRATEGY:-auto}"
-  --reflex_update_stream "${REFLEX_UPDATE_STREAM:-0}"
+  --reflex_update_stream "$REFLEX_UPDATE_STREAM"
   --kv_gather_strategy "${KV_GATHER_STRATEGY:-stacked}"
   --log_interval "$LOG_INTERVAL"
   --log_file "$LOG_DIR/metrics.jsonl"
@@ -191,7 +196,7 @@ ln -sfn "$RUN_DIR" "$TRAIN_MODEL_ROOT/active_run"
   --item "reflex_correction_strategy=${REFLEX_CORRECTION_STRATEGY:-serial}" \
   --item "reflex_feedback_strategy=${REFLEX_FEEDBACK_STRATEGY:-serial}" \
   --item "reflex_feature_strategy=${REFLEX_FEATURE_STRATEGY:-auto}" \
-  --item "reflex_update_stream=${REFLEX_UPDATE_STREAM:-0}" \
+  --item "reflex_update_stream=$REFLEX_UPDATE_STREAM" \
   --item "kv_gather_strategy=${KV_GATHER_STRATEGY:-stacked}" \
   --item "nproc_per_node=$NPROC_PER_NODE"
 
