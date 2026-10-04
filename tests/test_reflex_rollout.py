@@ -19,6 +19,7 @@ import torch
 from helper.fast_lk_reflex import FastLKReflex, reflex_or_baseline_probabilities, topk_compact_candidates
 from helper.sampling import build_sampling_probs, sample_from_probs, sample_target_from_logits
 from helper.tree_verification import pack_tree, trace_verified_path
+from helper.rollout_history import RolloutHistory
 
 
 class Cache:
@@ -39,7 +40,7 @@ class Cache:
             layer.values = layer.values.repeat_interleave(repeats, 0)
 
 
-def load_rollout(source=None, device="cpu"):
+def load_rollout(source=None, device="cpu", history_type=RolloutHistory):
     path = Path(__file__).resolve().parents[1] / "helper/specualtive_generate.py"
     tree = ast.parse(path.read_text(encoding="utf-8") if source is None else source)
     functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
@@ -52,7 +53,7 @@ def load_rollout(source=None, device="cpu"):
         reflex_or_baseline_probabilities=reflex_or_baseline_probabilities,
         topk_compact_candidates=topk_compact_candidates, sample_target_from_logits=sample_target_from_logits,
         build_sampling_probs=build_sampling_probs, sample_from_probs=sample_from_probs,
-        pack_tree=pack_tree, trace_verified_path=trace_verified_path)
+        pack_tree=pack_tree, trace_verified_path=trace_verified_path, RolloutHistory=history_type)
     exec(compile(ast.fix_missing_locations(ast.Module(body=functions, type_ignores=[])), str(path), "exec"), scope)
     return scope["speculative_generate"]
 

@@ -10,10 +10,19 @@ cd /workspace/storage-shared/nlp/minhpn19/SpecNaacl
 export PYTHON_BIN="$(command -v python)"
 ```
 
-Sáu launcher ghép cặp mới (mặc định DAPO, target/draft LR `1e-5`, batch `8`,
+Đủ 14 launcher cho 7 model (mặc định DAPO, target/draft LR `1e-5`, batch `8`,
 accumulation `4`, SpecNaacl = Triton/root/stream):
 
 ```bash
+# Chọn cặp model cần chạy; không cần chạy toàn bộ danh sách.
+CUDA_VISIBLE_DEVICES=0 bash train_qwen25_1p5b.sh
+CUDA_VISIBLE_DEVICES=0 bash train_qwen25_1p5b_fastgrpo.sh
+CUDA_VISIBLE_DEVICES=0 bash train_qwen25_7b.sh
+CUDA_VISIBLE_DEVICES=0 bash train_qwen25_7b_fastgrpo.sh
+CUDA_VISIBLE_DEVICES=0 bash train_qwen25_14b.sh
+CUDA_VISIBLE_DEVICES=0 bash train_qwen25_14b_fastgrpo.sh
+CUDA_VISIBLE_DEVICES=0 bash train_llama31_8b.sh
+CUDA_VISIBLE_DEVICES=0 bash train_llama31_8b_fastgrpo.sh
 CUDA_VISIBLE_DEVICES=0 bash train_qwen3_4b.sh
 CUDA_VISIBLE_DEVICES=0 bash train_qwen3_4b_fastgrpo.sh
 CUDA_VISIBLE_DEVICES=0 bash train_qwen25_3b.sh
@@ -22,12 +31,35 @@ CUDA_VISIBLE_DEVICES=0 bash train_qwen3_1p7b.sh
 CUDA_VISIBLE_DEVICES=0 bash train_qwen3_1p7b_fastgrpo.sh
 ```
 
+File thường luôn chạy SpecNaacl; file `_fastgrpo.sh` luôn chạy FastGRPO (Reflex
+OFF). Cùng model thì hai file dùng cùng config, chỉ khác method. Nếu 14B cần
+giảm batch để tiết kiệm VRAM, áp dụng giống nhau cho cả hai:
+
+```bash
+BATCH_SIZE=4 ACCUMULATION_STEPS=8 CUDA_VISIBLE_DEVICES=0 bash train_qwen25_14b.sh
+BATCH_SIZE=4 ACCUMULATION_STEPS=8 CUDA_VISIBLE_DEVICES=0 bash train_qwen25_14b_fastgrpo.sh
+```
+
+Outputs: `outputs/train/<model_key>/<run_name>/`; run name tự tạo gồm model,
+dataset, method, seed, timestamp và UUID. Draft mặc định vẫn lấy từ
+`outputs/pretrain/<model_key>/latest_*`; không dùng draft của model khác.
+
 Các launcher cần draft EAGLE-3 đã pretrain đúng model. Có thể chạy ngắn với
 `--max_grpo_steps 2`, hoặc `DRY_RUN=true` để kiểm tra lệnh. Giới hạn VRAM:
-`DRAFT_TRAIN_MAX_BATCH_SIZE=8 DRAFT_TRAIN_MAX_TOKENS=4096
+`DRAFT_TRAIN_MAX_BATCH_SIZE=8 DRAFT_TRAIN_MAX_TOKENS=2048
 DRAFT_TRAIN_MAX_PADDING_RATIO=1.25`. Nếu B200 benchmark cho thấy batched
 chậm hơn, đổi `DRAFT_TRAIN_MODE=per_response`; nếu stream chậm hơn, đặt
 `REFLEX_UPDATE_STREAM=0`.
+
+Cả hai method mặc định 8 responses/prompt (`RESPONSES_PER_PROMPT`, hoặc alias
+`REPEATED_GENERATE_NUMS`) và `LOG_INTERVAL=1`. Log `logs/metrics.jsonl`
+(`phase=target_train`) và `logs/timing.csv` có cùng schema: thời gian, token,
+AAL, acceptance rate riêng từng step và cumulative, cùng allocated/reserved/
+peak/free GPU memory. `step_aal = step_accepted_tokens / step_verification_rounds`,
+giữ root/bonus token theo FastGRPO. Các optimizer update có cùng nhãn `step`
+được gộp đúng counters; row được ghi khi nhãn đổi hoặc run kết thúc.
+`LOG_INTERVAL` chỉ điều khiển progress display, không bỏ row dữ liệu.
+Xem [RUNNING.md](RUNNING.md) để biết cách đo time, memory và xử lý resume.
 
 Đo trên B200 trước khi train dài (kết quả nằm trong
 `outputs/benchmarks/<run>/benchmark_report.json`):

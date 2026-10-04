@@ -19,6 +19,7 @@ from helper.specualtive_generate import speculative_generate
 from helper.eagle3_specforge import Eagle3FastGRPOAdapter, rollout_tensor_for_training
 from helper.checkpointing import capture_rng_state, restore_rng_state
 from helper.method_config import resolve_method
+from helper.step_metrics import PhaseTimings, StepMetricsWriter, completed_step_snapshot
 from policy_lag_analysis import (
     BranchSummary,
     bootstrap_delta_by_prompt,
@@ -289,7 +290,7 @@ parser.add_argument('--reflex_feature_strategy', default='auto', choices=['auto'
 parser.add_argument('--reflex_update_stream', default='1', choices=['0', '1'])
 parser.add_argument('--draft_train_mode', default='batched', choices=['batched', 'per_response'])
 parser.add_argument('--draft_train_max_batch_size', type=int, default=8)
-parser.add_argument('--draft_train_max_tokens', type=int, default=4096)
+parser.add_argument('--draft_train_max_tokens', type=int, default=2048)
 parser.add_argument('--draft_train_max_padding_ratio', type=float, default=1.25)
 parser.add_argument('--draft_train_profile', default='0', choices=['0', '1'])
 parser.add_argument('--kv_gather_strategy', default='stacked', choices=['stacked', 'per_layer'])
@@ -353,7 +354,7 @@ parser.add_argument('--saved_statistics_dir', type=str, required=True,
                     help="Directory to save statistics of generated sequence lengths.")
 parser.add_argument('--checkpoint_dir', type=str, default='')
 parser.add_argument('--timing_file', type=str, default='')
-parser.add_argument('--log_interval', type=int, default=100)
+parser.add_argument('--log_interval', type=int, default=1)
 parser.add_argument('--save_checkpoint_steps', type=int, default=0)
 parser.add_argument('--keep_last_checkpoints', type=int, default=3)
 parser.add_argument('--resume_checkpoint', type=str, default='')
@@ -1213,7 +1214,7 @@ def training_draft_model(model,outputs,prompt_mask,token_budget=None):
 
 
 def training_eagle3_specforge(model, outputs, prompt_mask, token_budget=None,
-                              mode='batched', max_batch_size=8, max_tokens=4096,
+                              mode='batched', max_batch_size=8, max_tokens=2048,
                               max_padding_ratio=1.25, profile=False):
     """Use SpecForge's EAGLE-3 architecture, KL/LK loss and TTT unrolling.
 
@@ -1412,12 +1413,12 @@ batch_data={
 
 optimizer_target.zero_grad(set_to_none=True)
 optimizer_draft.zero_grad(set_to_none=True)
-session_start_time=time.time()
+session_start_time=time.perf_counter()
 cumulative_elapsed_before_resume=0.0
 
 
 def _cumulative_wall_time():
-    return cumulative_elapsed_before_resume + time.time() - session_start_time
+    return cumulative_elapsed_before_resume + time.perf_counter() - session_start_time
 
 
 batch=[]
@@ -1501,17 +1502,28 @@ run_config_log = {
     "draft_train_max_padding_ratio": float(args.draft_train_max_padding_ratio),
     "effective_draft_lrs": effective_draft_lrs,
     "fastgrpo_ablation": bool(fastgrpo_ablation),
+    "step_metric_definition": "distinct inherited GRPO labels; all updates with the same label are accumulated",
+    "log_interval": log_interval,
+    "log_interval_applies_to": "progress display; authoritative step telemetry is always recorded",
 }
 with open(log_file, 'a', encoding='utf-8') as f:
     f.write(json.dumps(run_config_log) + '\n')
-if is_main_process and (not append_log or not os.path.exists(timing_file)):
-    with open(timing_file, 'w', newline='', encoding='utf-8') as stream:
-        csv.writer(stream).writerow([
-            'step', 'cumulative_wall_time_s', 'cumulative_generation_time_s',
-            'cumulative_target_train_time_s', 'cumulative_draft_train_time_s',
-            'rollout_tokens', 'tokens_per_s', 'aal', 'acceptance_rate',
-        ])
-last_metrics_step = -1
+phase_timings = PhaseTimings(
+    model.target_model.device,
+    target_s=batch_data.get('_phase_target_time_s', batch_data['train_time_cost']),
+    draft_s=batch_data.get('_phase_draft_time_s', batch_data['draft_train_time_cost']),
+)
+step_metrics_state = batch_data.get('_step_metrics_state') if append_log else None
+step_metrics_baseline = {}
+if resume_checkpoint and step_metrics_state is None:
+    baseline_metrics = _aggregate_job_metrics(
+        batch_data, model.target_model.device, cumulative_elapsed_before_resume)
+    step_metrics_baseline = completed_step_snapshot(
+        baseline_metrics, batch_data, phase_timings, model.target_model.device,
+        cumulative_elapsed_before_resume)
+step_metrics = StepMetricsWriter(
+    log_file, timing_file, enabled=is_main_process, append=append_log,
+    baseline=step_metrics_baseline, state=step_metrics_state)
 
 class TrainDataCollator:
     def __init__(self, tokenizer, max_prompt_length):
@@ -1803,6 +1815,7 @@ for epoch in epoch_bar:
             if statistical_time:
                 torch.cuda.synchronize()
             draft_train_time_start=time.time()
+            draft_phase_ticket = phase_timings.begin('draft')
             draft_loss1,draft_loss2,draft_sparse_tv,draft_sparse_kl,draft_sparse_count=training_draft_model(model,outputs,attention_mask)
             if _as_bool(args.draft_train_profile) and is_main_process:
                 with open(log_file, 'a', encoding='utf-8') as profile_stream:
@@ -1842,6 +1855,7 @@ for epoch in epoch_bar:
                 optimizer_draft.zero_grad(set_to_none=True)
                 draft_step += 1
                 draft_update_committed = True
+            phase_timings.end(draft_phase_ticket)
     
         if draft_step % 1024 == 0 and step > 0 and is_train_draft:
             with open(f"{saved_statistics_dir}/{step}.pkl","wb") as f:
@@ -2000,6 +2014,7 @@ for epoch in epoch_bar:
             dist.all_reduce(used_tensor, op=dist.ReduceOp.MIN)
             synchronized_used_items = int(used_tensor.item())
         step = synchronized_used_items // (batch_size * accumulation_steps)
+        step_metrics.advance(step)
         batch_old_logps=[]
         batch_ref_logps=[]
         batch_data['reward_sum'] += float(sum(batch_data['rewards']))
@@ -2009,6 +2024,7 @@ for epoch in epoch_bar:
             if statistical_time and torch.cuda.is_available():
                 torch.cuda.synchronize()
             train_time_start=time.time()
+            target_phase_ticket = phase_timings.begin('target')
             
             cur_max_length=0
             device=model.target_model.device
@@ -2128,6 +2144,7 @@ for epoch in epoch_bar:
             _sync_gradients(model.target_model)
             optimizer_target.step()
             optimizer_target.zero_grad(set_to_none=True)
+            phase_timings.end(target_phase_ticket)
 
             if (
                 analysis_enabled
@@ -2404,17 +2421,17 @@ for epoch in epoch_bar:
                 f"last_{sample_num}_draft_loss2":round(sum(batch_data['last_draft_loss2'][-real_sample_num:])/len(batch_data['last_draft_loss2'][-real_sample_num:]),4) if is_train_draft and draft_step > 0 else 0 
             }
 
-            should_log_metrics = step != last_metrics_step and (
-                step == 0 or step % log_interval == 0
-            )
-            if should_log_metrics:
+            if grpo_iteration == grpo_iteration_num - 1:
                 wall_elapsed = _cumulative_wall_time()
                 global_metrics = _aggregate_job_metrics(
                     batch_data, model.target_model.device, wall_elapsed,
                     include_reflex_diagnostics=_as_bool(args.reflex_diagnostics),
                     include_reflex_profile=_as_bool(args.reflex_profile),
                 )
-                wall_elapsed = global_metrics['cumulative_elapsed_time_s']
+                step_snapshot = completed_step_snapshot(
+                    global_metrics, batch_data, phase_timings, model.target_model.device,
+                    _cumulative_wall_time())
+                wall_elapsed = step_snapshot['cumulative_wall_time_s']
                 avg_logs.update({
                     "used_time": round(wall_elapsed / 60.0, 3),
                     "generate_time_cost": round(global_metrics['generate_time_cost'] / 60.0, 3),
@@ -2454,19 +2471,8 @@ for epoch in epoch_bar:
                     avg_logs["reflex_profile_time_ms"] = float(
                         global_metrics['reflex_profile_time_ms']
                     )
-                if is_main_process:
-                    with open(log_file, 'a', encoding='utf-8') as f:
-                        f.write(json.dumps(avg_logs) + '\n')
-                    with open(timing_file, 'a', newline='', encoding='utf-8') as stream:
-                        csv.writer(stream).writerow([
-                            int(step), float(wall_elapsed), float(global_metrics['generate_time_cost']),
-                            float(global_metrics['train_time_cost']), float(global_metrics['draft_train_time_cost']),
-                            int(global_metrics['total_rollout_tokens']),
-                            float(global_metrics['tokens_per_s']),
-                            float(global_metrics['average_accept_length']),
-                            float(global_metrics['draft_acceptance_rate']),
-                        ])
-                last_metrics_step = int(step)
+                step_metrics.submit(step, step_snapshot, avg_logs)
+                batch_data['_step_metrics_state'] = step_metrics.state_dict()
 
             postfix = {
                 "step": step,
@@ -2477,8 +2483,9 @@ for epoch in epoch_bar:
                 "reward": avg_logs["mean_reward"],
                 "phase": "GRPO",
             }
-            batch_bar.set_postfix(postfix, refresh=False)
-            epoch_bar.set_postfix(postfix, refresh=False)
+            if step % log_interval == 0:
+                batch_bar.set_postfix(postfix, refresh=False)
+                epoch_bar.set_postfix(postfix, refresh=False)
                 
             torch.cuda.empty_cache()
             
@@ -2550,6 +2557,23 @@ for epoch in epoch_bar:
         break
             
 
+# Drain timers and account for trailing rollouts (including reward-filtered
+# responses) before finalizing the last inherited GRPO label. The ordinary
+# metric transfer completes the main stream; no new CUDA synchronize is used.
+batch_data['used_items'] = int(used_items)
+training_end_metrics = _aggregate_job_metrics(
+    batch_data, model.target_model.device, _cumulative_wall_time(),
+    include_reflex_diagnostics=_as_bool(args.reflex_diagnostics),
+    include_reflex_profile=_as_bool(args.reflex_profile),
+)
+training_end_snapshot = completed_step_snapshot(
+    training_end_metrics, batch_data, phase_timings, model.target_model.device,
+    _cumulative_wall_time())
+if step_metrics.pending is not None:
+    step_metrics.submit(step_metrics.pending['step'], training_end_snapshot,
+                        step_metrics.pending['extras'])
+step_metrics.flush()
+batch_data['_step_metrics_state'] = step_metrics.state_dict()
 if is_main_process:
     model.save_model(f"{saved_draft_model_dir}/step{step}.pth")
     model.target_model.save_pretrained(f'{saved_model_dir}/step{step}')
@@ -2577,7 +2601,10 @@ final_metrics = _aggregate_job_metrics(
     include_reflex_diagnostics=_as_bool(args.reflex_diagnostics),
     include_reflex_profile=_as_bool(args.reflex_profile),
 )
-total_wall_time = final_metrics['cumulative_elapsed_time_s']
+final_snapshot = completed_step_snapshot(
+    final_metrics, batch_data, phase_timings, model.target_model.device,
+    _cumulative_wall_time())
+total_wall_time = final_snapshot['cumulative_wall_time_s']
 final_average_accept_length = final_metrics['average_accept_length']
 final_medusa_acceptance_rate = final_metrics['draft_acceptance_rate']
 final_accepted_tokens_per_medusa_step = final_metrics['accepted_tokens_per_medusa_step']
@@ -2652,6 +2679,14 @@ summary = {
     "saved_draft_model_dir": f"{saved_draft_model_dir}/step{step}.pth",
     "saved_statistics_dir": str(saved_statistics_dir),
     "checkpoint_dir": str(checkpoint_dir),
+    **final_snapshot,
+    "cumulative_generation_tokens_per_s": (
+        final_metrics['total_rollout_tokens'] / final_metrics['generate_time_cost']
+        if final_metrics['generate_time_cost'] > 0 else 0.0
+    ),
+    "cumulative_aal": float(final_average_accept_length),
+    "cumulative_acceptance_rate": float(final_medusa_acceptance_rate),
+    "timing_csv": str(timing_file),
 }
 if _as_bool(args.reflex_diagnostics):
     summary.update({

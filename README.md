@@ -44,3 +44,9 @@ blocked, use the much smaller Hugging Face transfer described in
 
 All new outputs are written under `SpecNaacl/outputs/{pretrain,train}/...`.
 No launcher clones repositories or downloads models/datasets.
+
+Both methods default to 8 responses/prompt, `DRAFT_TRAIN_MAX_TOKENS=2048`,
+and `LOG_INTERVAL=1`. Rollout history uses owned append buffers and clones only
+finished rows; exact per-step/cumulative AAL, timings, throughput and GPU memory
+are exported with the same schema. See [RUNNING.md](RUNNING.md#outputs) for the
+step-label grouping, timing basis and resume behavior.

@@ -28,6 +28,7 @@ import math
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from helper.tree_verification import pack_tree, trace_verified_path
+from helper.rollout_history import RolloutHistory
 
 from helper.fast_lk_reflex import (
     FastLKReflex,
@@ -511,7 +512,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
 
     if statistical_time:
         torch.cuda.synchronize()
-    start_time=time.time()
+    start_time=time.perf_counter()
     target_past_key_values=DynamicCache()
     avg_acc_length=[0,0]
     total_accepted_draft_tokens=0
@@ -598,15 +599,18 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
     if reflex_mode == "active":
         del _, target_logits
     
-    generated_sequences=target_next_token
     
     draft_input_ids=torch.concat([input_ids[:,1:],target_next_token],dim=-1)
     draft_attention_mask=attention_mask.to(model.dtype)
         
+    initial_history = {'generated_ids': target_next_token}
     if return_all_draft_input:
-        all_draft_input_states=feature_states
-        all_target_hidden_states=target_hidden_states
-        all_draft_input_ids=draft_input_ids
+        initial_history.update(features=feature_states, target_hidden=target_hidden_states,
+                               input_ids=draft_input_ids)
+    history = RolloutHistory(
+        initial_history, repeats=max(1, repeated_generate_nums or 1),
+        max_length=max_length + max_draft_token_length + 1)
+    del initial_history
 
     if statistical_time:
         torch.cuda.synchronize()
@@ -641,7 +645,6 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
         draft_hidden_states=draft_hidden_states.repeat_interleave(repeated_generate_nums,dim=0)
         next_feature_states=next_feature_states.repeat_interleave(repeated_generate_nums,dim=0)
 
-        generated_sequences=generated_sequences.repeat_interleave(repeated_generate_nums,dim=0)
         bsz*=repeated_generate_nums
         end_sig=[0]*bsz
         
@@ -657,10 +660,6 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
                 new_padding_positions.append(deepcopy(cur_padding_positions))
         padding_positions=new_padding_positions
         
-        if return_all_draft_input:
-            all_draft_input_states=all_draft_input_states.repeat_interleave(repeated_generate_nums,dim=0)
-            all_target_hidden_states=all_target_hidden_states.repeat_interleave(repeated_generate_nums,dim=0)
-            all_draft_input_ids=all_draft_input_ids.repeat_interleave(repeated_generate_nums,dim=0)
             
     draft_token_length, draft_k, draft_total_token = get_adaptive_hyperparameters(bsz, verification_capacity,
                                 max_draft_token_length, max_draft_k, max_verification_num,
@@ -1039,12 +1038,12 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
             dim=1, index=target_hidden_index
         )
         
+        history_chunk = {'generated_ids': next_token}
         if return_all_draft_input:
-            all_draft_input_states=torch.concat([all_draft_input_states, feature_states], dim=1)
-            all_target_hidden_states=torch.concat([all_target_hidden_states, target_hidden_states], dim=1)
-            all_draft_input_ids=torch.concat([all_draft_input_ids, next_token], dim=-1)
-            
-        generated_sequences=torch.concat([generated_sequences,next_token],dim=-1)
+            history_chunk.update(features=feature_states, target_hidden=target_hidden_states,
+                                 input_ids=next_token)
+        history.append(residual_index, history_chunk)
+        del history_chunk
 
         finished_indices = [index for index, finished in enumerate(end_sig) if finished]
         if reflex is not None and finished_indices and update_stream is None:
@@ -1056,7 +1055,8 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
             if update_stream is not None:
                 wait_for_reflex_update()
             break
-        real_sequences_length=max([len(item1)+input_ids.shape[-1]-len(item2) for item1,item2 in zip(generated_sequences, padding_positions)])
+        real_sequences_length=max(history.lengths['generated_ids'] + input_ids.shape[-1] - len(pad)
+                                  for pad in padding_positions)
         
         if real_sequences_length>=max_length:
             if update_stream is not None:
@@ -1068,12 +1068,14 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
             keep = torch.tensor(keep_rows, device=device, dtype=torch.long)
             for row in finished_indices:
                 original = residual_index[row]
+                finished_history = history.finish(original)
                 padding_positions_dict[str(original)] = padding_positions[row]
-                generated_sequences_dict[str(original)] = generated_sequences[row]
+                generated_sequences_dict[str(original)] = finished_history['generated_ids']
                 if return_all_draft_input:
-                    draft_input_states_dict[str(original)] = all_draft_input_states[row]
-                    target_hidden_states_dict[str(original)] = all_target_hidden_states[row]
-                    draft_input_ids_dict[str(original)] = all_draft_input_ids[row]
+                    draft_input_states_dict[str(original)] = finished_history['features']
+                    target_hidden_states_dict[str(original)] = finished_history['target_hidden']
+                    draft_input_ids_dict[str(original)] = finished_history['input_ids']
+                del finished_history
             end_sig = [end_sig[row] for row in keep_rows]
             padding_positions = [padding_positions[row] for row in keep_rows]
             past_position_ids = [past_position_ids[row] for row in keep_rows]
@@ -1091,11 +1093,6 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
             feature_states = feature_states.index_select(0, keep)
             target_hidden_states = target_hidden_states.index_select(0, keep)
             last_valid_index = last_valid_index.index_select(0, keep)
-            generated_sequences = generated_sequences.index_select(0, keep)
-            if return_all_draft_input:
-                all_draft_input_states = all_draft_input_states.index_select(0, keep)
-                all_target_hidden_states = all_target_hidden_states.index_select(0, keep)
-                all_draft_input_ids = all_draft_input_ids.index_select(0, keep)
             bsz = len(keep_rows)
             draft_token_length, draft_k, draft_total_token = get_adaptive_hyperparameters(
                 bsz, verification_capacity, max_draft_token_length, max_draft_k,
@@ -1254,12 +1251,15 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
         ori_idx=residual_index[idx_batch] 
         
         padding_positions_dict[str(ori_idx)]=padding_positions[delete_idx]
-        generated_sequences_dict[str(ori_idx)]=generated_sequences[delete_idx]
+        finished_history = history.finish(ori_idx)
+        generated_sequences_dict[str(ori_idx)]=finished_history['generated_ids']
         
         if return_all_draft_input:
-            draft_input_states_dict[str(ori_idx)]=all_draft_input_states[delete_idx]
-            target_hidden_states_dict[str(ori_idx)]=all_target_hidden_states[delete_idx]
-            draft_input_ids_dict[str(ori_idx)]=all_draft_input_ids[delete_idx]
+            draft_input_states_dict[str(ori_idx)]=finished_history['features']
+            target_hidden_states_dict[str(ori_idx)]=finished_history['target_hidden']
+            draft_input_ids_dict[str(ori_idx)]=finished_history['input_ids']
+        del finished_history
+    del history
         
     bsz=len(generated_sequences_dict)
 
@@ -1271,17 +1271,22 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
         
         for idx_batch in range(bsz):
             chosen_index=[]
-            cur_draft_input_states=draft_input_states_dict[str(idx_batch)]
-            cur_target_hidden_states=target_hidden_states_dict[str(idx_batch)]
-            cur_draft_input_ids=draft_input_ids_dict[str(idx_batch)]
+            cur_draft_input_states=draft_input_states_dict.pop(str(idx_batch))
+            cur_target_hidden_states=target_hidden_states_dict.pop(str(idx_batch))
+            cur_draft_input_ids=draft_input_ids_dict.pop(str(idx_batch))
             
             for index in range(cur_draft_input_ids.shape[-1]):
                 if index not in padding_positions_dict[str(idx_batch)]:
                     chosen_index.append(index)
                     
-            all_draft_input_states_without_padding.append(cur_draft_input_states[chosen_index,:])
-            all_target_hidden_states_without_padding.append(cur_target_hidden_states[chosen_index,:])
-            all_draft_input_ids_without_padding.append(cur_draft_input_ids[chosen_index])
+            if len(chosen_index) == cur_draft_input_ids.shape[-1]:
+                all_draft_input_states_without_padding.append(cur_draft_input_states)
+                all_target_hidden_states_without_padding.append(cur_target_hidden_states)
+                all_draft_input_ids_without_padding.append(cur_draft_input_ids)
+            else:
+                all_draft_input_states_without_padding.append(cur_draft_input_states[chosen_index,:])
+                all_target_hidden_states_without_padding.append(cur_target_hidden_states[chosen_index,:])
+                all_draft_input_ids_without_padding.append(cur_draft_input_ids[chosen_index])
             
         all_draft_input_states=all_draft_input_states_without_padding
         all_target_hidden_states=all_target_hidden_states_without_padding
@@ -1300,7 +1305,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
     max_sequence_length=0
 
     for idx_batch in range(bsz):
-        generated_sequence=generated_sequences_dict[str(idx_batch)].tolist()
+        generated_sequence=generated_sequences_dict.pop(str(idx_batch)).tolist()
         cur_position_ids=new_padding_positions[idx_batch]
         
         sequence_without_padding=[]
@@ -1340,7 +1345,9 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
         'total_proposed_medusa_tokens':total_proposed_draft_tokens,
         'draft_acceptance_rate':draft_acceptance_rate,
         'medusa_acceptance_rate':draft_acceptance_rate,
-        'total_time_cost':time.time()-start_time,
+        # Output IDs have already crossed to CPU above, completing the main
+        # stream as required by the caller. No timing-only synchronization.
+        'total_time_cost':time.perf_counter()-start_time,
         'target_time_cost':total_target_time,
         'draft_time_cost':total_draft_time,
         'check_time_cost':total_check_time,

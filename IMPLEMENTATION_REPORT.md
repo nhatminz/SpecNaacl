@@ -979,3 +979,139 @@ full model rollout/training or B200 benchmark was run on this machine.
   `pip check` passed in the local CPU test venv, but that venv lacks `pandas`
   and its installed CUDA build is incompatible with this machine's driver,
   so production CLI/full-model runs and B200 timing were not possible here.
+
+## 2026-10-04: rollout history ownership and exact step telemetry
+
+### Changes and semantics
+
+- Added `helper/rollout_history.py`. Initial prompt/root data is copied into
+  owned per-response buffers (not batch views), initially reserving at most
+  256 extra token slots. Ordinary verification rounds batch-copy only the new
+  chunk. Capacity grows geometrically only on exhaustion; padded history may
+  exceed the real-token max length, so it is never truncated. There is no
+  repeated whole-history concatenation or active-history compaction copy.
+- `helper/specualtive_generate.py` uses these buffers for generated IDs, draft
+  features, final target hidden states and training IDs. Finishing a response
+  clones only its used rows into the four output dictionaries, then releases
+  its buffers. Final unpadding pops dictionary entries as it consumes them;
+  an already unpadded owned clone is reused. Active KV/Reflex compaction,
+  sampler, tree verification, padding order and stop conditions are unchanged.
+- No added production CUDA synchronize, target forward, target distribution,
+  or Reflex operation. The source/update events and waits at A dependencies
+  are untouched. Triton/root/update-stream remains the default, diagnostics
+  and profiling remain OFF. Buffer copies do not perform floating-point
+  transformations; exact output/feature/history parity is tested below.
+- Added `helper/step_metrics.py` and common integration in `grpo_speculative.py`.
+  Each distinct inherited `step` has one JSONL `phase=target_train` row and one
+  CSV row. Multiple optimizer updates sharing a FastGRPO step label are all
+  accumulated before the label is closed, rather than logging only its first
+  update. The final row is flushed at exit. Filtered trailing rollouts and
+  their draft training are included in the last open interval. No fictitious
+  rows are made for labels skipped by the inherited schedule.
+- Both files contain exact cumulative and step-difference wall/generation/
+  target/draft seconds, rollout tokens, accepted-length and sequence-round
+  counters, accepted/proposed draft counters, AAL, acceptance rate, generation
+  throughput and allocated/reserved/peak/free GPU memory in GiB. Step AAL is
+  `step_accepted_tokens / step_verification_rounds`, with zero for no rounds.
+  Accepted length includes the mandatory root/bonus token exactly as before;
+  draft acceptance rate excludes it. No moving/batch-average AAL is used.
+- Generation/wall clocks are monotonic. Output-ID materialization already
+  completes the main stream for generation. Training phases use CUDA event
+  intervals from phase entry through optimizer completion; events are read
+  after the existing aggregate metric transfer, not after a new global sync.
+  CPU fallback is monotonic. CUDA intervals include enqueue gaps and exclude
+  policy-lag side-branch analysis from target-training duration. The inherited
+  minute-valued legacy timing fields remain available. Across ranks, summed
+  counters and max cumulative durations define the job; per-step differences
+  use the same definition. Memory stats do not synchronize, empty the cache
+  or reset the process peak. Existing cache management is not changed.
+- Metric state is checkpointed with per-rank batch_data. On resume, telemetry
+  after that checkpoint is backed up and rewound, allowing a repeated step
+  label to continue without duplicates. Old CSV headers are migrated with a
+  backup and unavailable historical fields remain blank. Final summary also
+  contains the new cumulative fields and memory snapshot.
+- Shared defaults and all six paired Qwen launchers retain 8 responses/prompt,
+  accept the `REPEATED_GENERATE_NUMS` alias, reduce the padded draft microbatch
+  cap from 4096 to 2048 and default `LOG_INTERVAL=1`. Authoritative telemetry
+  is never subsampled; LOG_INTERVAL now controls progress display. Env
+  overrides still work. Both short benchmark launchers accept the same alias.
+- The 2048 cap changes packing, not the supervised-token selection, loss,
+  optimizer schedule or trainable modules; oversized singletons remain legal.
+  Different microbatch shapes can change ordinary floating-point reduction
+  rounding in full training, so no bitwise full-training claim is made.
+
+### Modified/new files
+
+- Runtime: `helper/rollout_history.py`, `helper/specualtive_generate.py`,
+  `helper/step_metrics.py`, `grpo_speculative.py`.
+- Configuration/launch: `configs/_shared/b200_common.env`,
+  `train_qwen3_4b.sh`, `train_qwen3_4b_fastgrpo.sh`, `train_qwen25_3b.sh`,
+  `train_qwen25_3b_fastgrpo.sh`, `train_qwen3_1p7b.sh`,
+  `train_qwen3_1p7b_fastgrpo.sh`, `scripts/benchmark_reflex_training.sh`,
+  `scripts/benchmark_online_draft_training.sh`, `scripts/check_training_sources.py`.
+- Tests: `tests/test_rollout_history.py`, `tests/test_step_metrics.py`,
+  `tests/test_reflex_rollout.py`, `tests/test_shell_scripts.py`.
+- Documentation: `README.md`, `RUNNING.md`, `huongdanchay.md`, this report.
+
+### Validation actually run
+
+- Full CPU-capable venv pytest: **292 passed, 137 skipped, 3 failed**. The
+  same three pre-existing `tests/test_requirements.py` failures reference
+  absent `requirements-bootstrap.txt`, `requirements-external.txt`, and
+  `scripts/build_offline_wheelhouse.sh`. They were not hidden or deleted, and
+  offline dependency installation is outside this change. CUDA skips in this
+  venv are due to Torch 2.11/cu130 versus the local driver.
+- Local RTX 3090/Torch 2.5.1/cu124/Triton 3.1 selected regression suite:
+  **226 passed**, covering real CUDA Reflex kernels, streamed root/visited
+  rollouts, history parity/storage lifetime, telemetry and all shell launchers.
+  The streamed-root collected-history test forbids production global CUDA
+  synchronize calls. History allocated bytes stay fixed within reserved
+  capacity, decrease on finishing a row, and return to baseline after six
+  lifecycles. This is allocator correctness, not a B200 speed measurement.
+- New OFF/ACTIVE full-rollout fixtures compare old concatenation and new
+  buffers under greedy/stochastic sampling, left padding, 8 responses/prompt,
+  with/without history; all IDs, counters, masks and feature tensors match
+  exactly. A separate read-only check against the actual pre-change git HEAD
+  rollout (not only the storage reference) passed **16 configurations**
+  including repeats 1 and 8. Target-forward counts are unchanged.
+- Telemetry tests execute the actual training logging/finalization AST with
+  both method names, repeated labels, two GRPO iterations, filtered final
+  rollout and checkpoint/resume. They check one row per distinct step in both
+  files, exact step counters/ratios, memory logging without cache/sync calls,
+  and CUDA event reads after an existing transfer.
+- `python -m compileall -q .`, `git diff --check`, source integrity check,
+  shell syntax/dry-run and local CPU venv `python -m pip check`: passed.
+- No full model training, B200 run, multi-GPU performance or production-stack
+  validation was launched. Local test envs differ from the pinned B200 stack;
+  the main CLI also lacks local pandas/model paths. No throughput speedup or
+  universal peak-memory reduction is claimed without that benchmark.
+
+Run the same paired launchers as before; paths/checkpoints/data are not changed.
+On B200, validate the changed runtime with:
+
+```bash
+python -m pytest -q tests/test_rollout_history.py tests/test_step_metrics.py \
+  tests/test_reflex_rollout.py tests/test_reflex_cuda_pipeline.py tests/test_shell_scripts.py
+```
+
+## 2026-10-04: paired launchers for every supported model
+
+- Updated `train_qwen25_1p5b.sh`, `train_qwen25_7b.sh`,
+  `train_qwen25_14b.sh`, and `train_llama31_8b.sh` to bind SpecNaacl explicitly.
+  Added the matching four `train_<model>_fastgrpo.sh` files binding FastGRPO.
+  Together with the existing pairs, all seven configured models have both
+  methods (14 launchers). Within each pair the generated CLI differs only by
+  `--method` and `--reflex_mode` when supplied the same run identifiers.
+- These four models now share the existing paired defaults: DAPO, both LRs
+  `1e-5`, batch 8, accumulation 4, eight responses, draft microbatch token cap
+  2048, and the common per-step logging/Triton-root-stream settings. Model
+  paths, draft checkpoint/config/vocab links and unique output directories are
+  unchanged. Environment overrides remain supported; 14B can use batch 4 /
+  accumulation 8 in both modes when a smaller batch is needed.
+- Pretraining wrappers and runtime algorithms are unchanged. Extended
+  `tests/test_shell_scripts.py` to cover all 14 launchers, paired CLI equality,
+  correct model-specific draft paths, defaults and hyperparameter/GPU overrides.
+  Updated `RUNNING.md` and `huongdanchay.md` with every command.
+- Targeted shell/model-config/source regression: **23 passed**, including
+  `bash -n` and dry runs for every paired launcher. `git diff --check` passed.
+  No model training was launched by these tests.
