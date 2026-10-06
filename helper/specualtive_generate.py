@@ -4,7 +4,7 @@ import math
 import time
 from copy import deepcopy
 from transformers import DynamicCache
-from helper.tree_verification import pack_tree, trace_verified_path
+from helper.tree_verification import pack_tree, trace_verified_path, select_confidence_nodes
 from helper.rollout_history import RolloutHistory
 from helper.opd_reflex import OPDReflex
 from helper.method_config import resolve_method
@@ -214,8 +214,9 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
         total_position_ids = torch.concat(total_position_ids, dim=1)
         confidences = torch.concat(confidences, dim=-1)
         draft_total_token = min(int(draft_total_token), int(confidences.shape[-1]))
-        chosen_index = torch.topk(confidences, k=draft_total_token, dim=-1)
-        (chosen_index, _) = torch.sort(chosen_index.indices, dim=-1, descending=False)
+        chosen_index = select_confidence_nodes(
+            confidences, draft_total_token, kernels=opd._kernels,
+            workspace=opd.confidence_key_workspace)
         tensor_tree = pack_tree(torch.cat(full_parents, dim=1), full_contexts, chosen_index, total_input_ids, draft_token_length)
         return {'trees': [], 'trees_chosen_index': None, 'tensor_tree': tensor_tree, 'next_token_trees': total_input_ids.gather(1, chosen_index), 'target_position_ids': total_position_ids.gather(1, chosen_index)}
 

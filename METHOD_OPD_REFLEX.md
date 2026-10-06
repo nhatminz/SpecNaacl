@@ -27,6 +27,15 @@ gradient with support fixed for the round. No dense tail backward.
 OPD always fused Top16→prefix draft_k, including cold. Cold corrected logits
 exactly raw, but historical K-dependent ties may select different candidate IDs.
 User explicitly accepted this; NO slow native K fallback is added to OPD.
+OPD tree confidence pruning also resolves exact ties by ascending full node
+index. FP32 path products can equal their parent's score (conditional p=1 or
+underflow to zero); native arbitrary confidence Top-K can otherwise orphan a
+child. Exact integer lexicographic keys preserve every confidence bit, select
+the same nodes for unique scores, and prefer ancestors on ties. A fused GPU
+encoder writes into a reused small tree-key buffer, not a full-vocabulary
+sort. This tie rule is OPD-only; historical pruning is untouched, and the
+parent-closure device assertion remains enabled. No epsilon/probability change,
+additional target forward, RNG draw or host synchronization is introduced.
 Target sampling and verifier rules unchanged. Actual trajectories/round counts
 may differ; no extra forwards means existing prefill/verify/expand/committed work
 per round, not forcing equal totals when AAL changes.

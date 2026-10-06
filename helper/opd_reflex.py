@@ -139,6 +139,9 @@ class OPDReflex:
             self.path_workspace=[alloc((batch,max_path),torch.long) for _ in range(3)]+[alloc(batch,torch.long)]
             self.padded_path_workspace=[alloc((batch,max_path),torch.bool if i==2 else torch.long) for i in range(3)]+[alloc((batch,1),torch.long)]
             self.scheduling_packet=alloc((batch,max_path+3),torch.long)
+            # Small tree-only lexicographic keys, reused even as the batch shrinks.
+            full_nodes=max_proposal_contexts * max_contexts
+            self.confidence_key_workspace=alloc(batch*full_nodes,torch.int64)
             if self.enabled:
                 self.head_cache=alloc((batch,max_contexts,hidden_size),self.head.weight.dtype)
                 self.u_cache=alloc((batch,max_contexts,self.rank))

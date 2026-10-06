@@ -42,6 +42,41 @@ class PackedTree:
         return mask
 
 
+def select_confidence_nodes(confidences, count, *, kernels=None, workspace=None):
+    """Exact confidence Top-K, breaking ties by ascending full node index.
+
+    Path probabilities are nonnegative FP32 and monotonically nonincreasing
+    down every branch. Their IEEE bits therefore sort in probability order.
+    Adding an integer secondary key (NOT an epsilon to the scores) puts every
+    ancestor before its equal-score descendants, including zero-underflow and
+    probability-one ties. The selected subtree is consequently parent-closed.
+    Historical OFF retains its original native floating Top-K untouched.
+    """
+    if confidences.ndim != 2 or confidences.dtype != torch.float32:
+        raise ValueError('tree confidences must be a [batch,nodes] FP32 tensor')
+    batch, nodes = confidences.shape
+    if not 1 <= count <= nodes:
+        raise ValueError('invalid confidence selection count')
+    if count == nodes:
+        return torch.arange(nodes, device=confidences.device).expand(batch, -1)
+    elements = batch * nodes
+    if workspace is None:
+        keys = torch.empty_like(confidences, dtype=torch.int64)
+    else:
+        if workspace.numel() < elements or workspace.dtype != torch.int64 or workspace.device != confidences.device:
+            raise ValueError('incompatible confidence key workspace')
+        keys = workspace[:elements].view(batch, nodes)
+    if kernels is not None:
+        kernels.confidence_keys(confidences, keys)
+    else:
+        bits = confidences.contiguous().view(torch.int32).to(torch.int64)
+        # +0 and -0 represent the same score: do not introduce a sign-bit tie.
+        bits = torch.where(confidences == 0, 0, bits)
+        keys.copy_((bits << 32) | (nodes - torch.arange(nodes, device=confidences.device)))
+    chosen = torch.topk(keys, k=count, dim=-1, sorted=False).indices
+    return chosen.sort(dim=-1).values
+
+
 def pack_tree(full_parents, full_contexts, chosen, all_tokens, max_depth):
     """Keep the original sorted confidence-selected packing and child order."""
     batch, full_count = full_parents.shape
@@ -52,8 +87,8 @@ def pack_tree(full_parents, full_contexts, chosen, all_tokens, max_depth):
     packed_ids = torch.arange(1, packed_count + 1, device=device).expand(batch, -1)
     inverse.scatter_(1, chosen + 1, packed_ids)
     parents = inverse.gather(1, full_parents.gather(1, chosen) + 1)
-    # Parent closure is required by the existing verifier too. An asynchronous
-    # device assertion catches bad/underflowed trees without a host .item().
+    # Keep this safety check: confidence selection must resolve FP32 ties before
+    # packing; silently removing this assertion would allow invalid ancestry.
     torch._assert_async(((parents >= 0) & (parents < packed_ids)).all(),
                         "confidence-selected draft tree is not parent-closed")
     return PackedTree(

@@ -1,5 +1,37 @@
 # Learned OPD / historical baseline optimization — 2026-10-07
 
+## Follow-up: confidence tree parent-closure crash
+
+Server traceback starts at the retained parent-closure device assertion, not
+Triton compilation or a library version mismatch. Reproduced BEFORE the fix on
+a saturated native-sampler/OPD fixture (draft p=1, all other probabilities0):
+`RuntimeError: confidence-selected draft tree is not parent-closed`.
+FP32 products can tie ancestors at p=1 or underflow0; arbitrary native
+confidence Top-K can select a child while excluding its ancestor.
+
+Added OPD-only exact lexicographic tree-confidence selection: original FP32
+IEEE score bits as the primary key, ascending full node index as the secondary
+key. One fused CUDA encoder into reused small int64 tree workspace, then native
+integer Top-K; no epsilon, full-vocabulary sort, probability modification,
+extra target forward or host sync. Full selection avoids the key pass entirely.
+Keep parent-closure assertion. Historical FastGRPO code is unchanged.
+
+Tests include unit probabilities, all ties, signed zero, adjacent FP32 ULPs,
+underflow, multiple rows/noncontiguous score views, parent closure,
+attention/verifier parity and saturated rollout with responses8 and stream0/1.
+Final focused regression suite: 215 passed, 3 skipped (CPU-only stream cases),
+1 pre-existing torch.load warning; real CUDA tests ran on RTX3090,
+Torch2.5.1+cu124/Triton3.1. Unique-confidence selection equals original native
+Top-K, and RNG states remain unchanged. compileall, source-integrity, shell
+syntax, diff checks and local pip check pass.
+Production Qwen weights/data and B200 are still absent locally; native B200
+training is NOT claimed. See huongdanchay.md for server tests/two-step smoke.
+
+Modified: helper/{tree_verification,tree_kernels,opd_reflex,specualtive_generate}.py,
+tests/opd_fixtures.py; added tests/test_tree_confidence_selection.py; this report,
+METHOD_OPD_REFLEX.md and huongdanchay.md. Dependencies/policy/reward/sampling
+configuration not changed by this fix.
+
 This supersedes the fixed-A/shared-baseline implementation at d9766ad.
 FastGRPO now dispatches to frozen historical c3f05ad OFF: exact native softmax,
 torch.topk(draft_k), original tree/Python verifier/RNG/stacked KV. No OPD engine

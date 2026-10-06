@@ -11,7 +11,7 @@ import torch
 from helper.opd_reflex import OPDReflex,OPD_COUNTER_NAMES
 from helper.method_config import resolve_method
 from helper.rollout_history import RolloutHistory
-from helper.tree_verification import pack_tree,trace_verified_path
+from helper.tree_verification import pack_tree,trace_verified_path,select_confidence_nodes
 from helper.sampling import build_sampling_probs,sample_from_probs,sample_target_from_logits
 from helper.opd_scheduling import schedule,compact_suffix_inplace
 
@@ -98,6 +98,7 @@ def load_rollout(device='cpu',history_type=RolloutHistory):
                OPD_COUNTER_NAMES=OPD_COUNTER_NAMES,historical_generate=load_historical(device,history_type),
                schedule=schedule,compact_suffix_inplace=compact_suffix_inplace,
                pack_tree=pack_tree,trace_verified_path=trace_verified_path,
+               select_confidence_nodes=select_confidence_nodes,
                build_sampling_probs=build_sampling_probs,sample_from_probs=sample_from_probs,
                sample_target_from_logits=sample_target_from_logits)
     exec(compile(ast.fix_missing_locations(ast.Module(body=fns,type_ignores=[])),str(path),'exec'),scope)

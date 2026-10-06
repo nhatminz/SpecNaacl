@@ -133,3 +133,30 @@ Không resume optimizer trajectory của method cũ vào OPD; giữ cùng method
 resume. Có thể dùng lại pretrained draft/target adapter như initialization.
 Checkpoint trước learned-A không dùng làm optimizer resume; dùng draft weights
 của nó để bắt đầu run mới. Checkpoint mới lưu pending A gradient riêng từng rank.
+
+## Fix `confidence-selected draft tree is not parent-closed`
+
+Đây là lỗi tie trong pruning tree OPD, không phải thiếu FlashAttention hay PEFT.
+Đồng bộ toàn bộ `helper/` của bản sửa (cần đủ tree_verification.py,
+tree_kernels.py, opd_reflex.py và specualtive_generate.py), cùng
+`tests/opd_fixtures.py` và `tests/test_tree_confidence_selection.py`.
+Không chỉ copy một file; không tắt assertion để vượt lỗi.
+
+Sau khi process bị device assert đã thoát, dùng process Python mới:
+
+```bash
+cd /workspace/storage-shared/nlp/minhpn19/SpecNaacl
+export PYTHON_BIN="$(command -v python)"
+CUDA_VISIBLE_DEVICES=0 "$PYTHON_BIN" -m pytest -q tests/test_tree_confidence_selection.py
+
+# Hai GRPO steps thực trước khi chạy dài, model/data/draft giữ nguyên.
+CUDA_VISIBLE_DEVICES=0 DATASET=gsm8k MAX_TRAIN_SAMPLES=128 \
+  PYTHON_BIN="$PYTHON_BIN" bash train_qwen25_1p5b.sh --max_grpo_steps 2
+
+# Full run chỉ sau khi smoke thành công.
+CUDA_VISIBLE_DEVICES=0 DATASET=gsm8k PYTHON_BIN="$PYTHON_BIN" \
+  bash train_qwen25_1p5b.sh
+```
+
+Pruning mới giữ confidence FP32 nguyên vẹn, dùng node index làm secondary key
+để cha thắng con khi tie. Không đổi target sampling hoặc historical FastGRPO.
