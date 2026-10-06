@@ -73,3 +73,56 @@ def test_optional_uv_preference_does_not_pin_a_patch_release():
 
     preference = Path(__file__).resolve().parents[1] / ".python-version"
     assert preference.read_text(encoding="utf-8").strip() == "3.12"
+
+
+@pytest.mark.parametrize("actual", ["0.21.1", "0.21.2"])
+def test_peft_supported_patch_passes_real_validator_import_gate(monkeypatch, actual):
+    from types import SimpleNamespace
+
+    set_python_version(monkeypatch, (3, 12, 3))
+    monkeypatch.setattr(sys, "argv", ["validate_environment.py"])
+    monkeypatch.setattr(validate_environment, "pinned_requirements",
+                        lambda path: iter([("peft", "0.21.1")]))
+    monkeypatch.setattr(validate_environment, "version", lambda name: actual)
+    imported = []
+    def import_module(name):
+        imported.append(name)
+        if name == "peft":
+            return SimpleNamespace(**{api: object() for api in validate_environment.REQUIRED_APIS["peft"]})
+        if name == "torch":
+            return SimpleNamespace(__version__="2.13.0+cu130", version=SimpleNamespace(cuda="13.0"))
+        return SimpleNamespace(OfflineSGLangCaptureBackend=object())
+    monkeypatch.setattr(validate_environment.importlib, "import_module", import_module)
+    validate_environment.main()
+    assert "peft" in imported
+
+
+@pytest.mark.parametrize("actual", ["0.21.0", "0.21.3", "0.22.0"])
+def test_other_peft_versions_are_not_silently_accepted(actual):
+    assert not validate_environment.version_matches("peft", "0.21.1", actual)
+
+
+def test_patch_exception_does_not_relax_other_pins_or_custom_peft_pin():
+    assert not validate_environment.version_matches("torch", "2.13.0", "2.11.0+cu130")
+    assert not validate_environment.version_matches("peft", "0.22.0", "0.21.1")
+    assert validate_environment.version_matches("torch", "2.13.0", "2.13.0+cu130")
+
+
+def test_supported_peft_patch_with_broken_api_still_fails(monkeypatch):
+    from types import SimpleNamespace
+
+    set_python_version(monkeypatch, (3, 12, 3))
+    monkeypatch.setattr(sys, "argv", ["validate_environment.py"])
+    monkeypatch.setattr(validate_environment, "pinned_requirements",
+                        lambda path: iter([("peft", "0.21.1")]))
+    monkeypatch.setattr(validate_environment, "version", lambda name: "0.21.1")
+    monkeypatch.setattr(validate_environment.importlib, "import_module", lambda name: SimpleNamespace())
+    with pytest.raises(RuntimeError, match="required APIs missing:.*get_peft_model"):
+        validate_environment.main()
+
+
+def test_canonical_peft_pin_is_0211():
+    from pathlib import Path
+
+    requirements = Path(__file__).resolve().parents[1] / "requirements.txt"
+    assert dict(validate_environment.pinned_requirements(requirements))["peft"] == "0.21.1"

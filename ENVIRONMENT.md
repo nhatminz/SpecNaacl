@@ -16,6 +16,26 @@ CUDA extension.
 
 ## Online installation
 
+### Existing PEFT 0.21.1 environment
+
+Keep the installed PEFT 0.21.1; no Internet download or upgrade is required for
+this fix. The canonical installation pin is `peft==0.21.1`. Runtime validation
+also admits the explicit 0.21.2 patch, checks PEFT imports and the LoRA/checkpoint
+APIs used by training/benchmarking, and keeps all other version pins strict.
+This is not certification of every PEFT execution path; validate the actual
+server environment and run a short training smoke before a long job.
+
+```bash
+export PYTHON_BIN="$(command -v python)"
+"$PYTHON_BIN" -m pip check
+"$PYTHON_BIN" scripts/validate_environment.py --require-cuda
+CUDA_VISIBLE_DEVICES=0 bash train_qwen3_1p7b.sh
+```
+
+Do not replace the venv or reinstall the full requirements set to resolve the
+old `peft: expected 0.21.2, found 0.21.1` gate. Transfer the updated
+`requirements.txt` and `scripts/validate_environment.py` to the server first.
+
 For a new environment, install Python 3.12 with `uv`, then create the
 environment from that managed interpreter. An existing Python >=3.12.0
 environment can be kept; use the validation commands below:

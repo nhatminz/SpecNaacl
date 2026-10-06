@@ -25,6 +25,24 @@ IMPORT_NAMES = {
 # a newer interpreter does not guarantee wheels/runtime support for that version.
 MIN_PYTHON_VERSION = (3, 12, 0)
 
+# Narrow patch compatibility exception, not an unbounded dependency range.
+# requirements.txt still specifies exactly one reproducible installation pin.
+COMPATIBLE_PATCH_VERSIONS = {"peft": frozenset({"0.21.1", "0.21.2"})}
+REQUIRED_APIS = {
+    "peft": (
+        "get_peft_config", "get_peft_model", "LoraConfig", "TaskType", "PeftType",
+        "get_peft_model_state_dict", "set_peft_model_state_dict", "PeftModel",
+    ),
+}
+
+
+def version_matches(distribution, expected, actual):
+    actual = actual.split("+", 1)[0]
+    if actual == expected:
+        return True
+    allowed = COMPATIBLE_PATCH_VERSIONS.get(distribution.lower().replace("_", "-"), ())
+    return expected in allowed and actual in allowed
+
 
 def validate_python_version():
     if sys.version_info[:3] >= MIN_PYTHON_VERSION:
@@ -73,17 +91,24 @@ def main():
         except PackageNotFoundError:
             failures.append(f"{distribution}: not installed")
             continue
-        if actual.split("+", 1)[0] != expected:
+        if not version_matches(distribution, expected, actual):
             failures.append(f"{distribution}: expected {expected}, found {actual}")
             continue
         module_name = IMPORT_NAMES.get(distribution, distribution.replace("-", "_"))
         try:
-            importlib.import_module(module_name)
+            module = importlib.import_module(module_name)
+            missing = [name for name in REQUIRED_APIS.get(distribution.lower(), ())
+                       if not hasattr(module, name)]
+            if missing:
+                raise ImportError("required APIs missing: " + ", ".join(missing))
         except Exception as exc:
             failures.append(
                 f"{distribution}: import {module_name} failed: "
                 f"{type(exc).__name__}: {exc}"
             )
+            continue
+        if actual.split("+", 1)[0] != expected:
+            print(f"{distribution}: accepted compatible patch {actual} (install pin {expected})")
     if failures:
         raise RuntimeError("environment validation failed:\n- " + "\n- ".join(failures))
 
