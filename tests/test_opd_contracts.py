@@ -40,15 +40,18 @@ def test_projector_persists_in_real_draft_checkpoint_api_without_touching_rng(tm
     class Model(torch.nn.Module):
         def __init__(self):
             super().__init__();self.draft_model=torch.nn.Linear(8,17)
-            self.register_buffer('opd_projector',initialize_projector(8,8))
+            self.draft_model.register_parameter('opd_projector',torch.nn.Parameter(initialize_projector(8,8,head=self.draft_model.weight)))
+        @property
+        def opd_projector(self):return self.draft_model.opd_projector
         def checkpoint_metadata(self):return {'opd_rank':8}
         def load_opd_projector(self,x):return Eagle3FastGRPOAdapter.load_opd_projector(self,x)
     model=Model();saved=model.opd_projector.clone();path=tmp_path/'draft.pth'
     Eagle3FastGRPOAdapter.save_model(model,path)
     payload=torch.load(path,weights_only=True)
     assert torch.equal(payload['opd_projector'],saved)
-    model.opd_projector.zero_();Eagle3FastGRPOAdapter.load_model(model,path)
-    assert torch.equal(model.opd_projector,saved) and not model.opd_projector.requires_grad
+    with torch.no_grad():model.opd_projector.zero_()
+    Eagle3FastGRPOAdapter.load_model(model,path)
+    assert torch.equal(model.opd_projector,saved) and model.opd_projector.requires_grad
     rng=torch.random.get_rng_state();initialize_projector(8,8)
     assert torch.equal(rng,torch.random.get_rng_state())
 
@@ -97,9 +100,9 @@ def test_no_host_sync_in_production_feedback_and_no_dense_vocab_correction_or_ta
     for forbidden in ('.cpu(','.item(','.tolist(','.numpy(','.synchronize(','.softmax(','.backward(','.step('):
         assert forbidden not in kernels
     tree=ast.parse(kernels)
-    scan=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='_raw_scan')
+    scan=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='_corrected_scan')
     assert not {x.arg for x in scan.args.args}&{'B','U','R','HEAD'}
-    active=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='_active_scan')
+    active=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='_sparse_scores')
     assert 'range(0, count, BS)' in ast.unparse(active)
     assert 'probability_pool' not in (root/'opd_reflex.py').read_text()
     assert 'all_reduce' not in kernels

@@ -126,6 +126,7 @@ cmd=(
   --opd_visited_weight "$OPD_VISITED_WEIGHT" --opd_frontier_weight "$OPD_FRONTIER_WEIGHT"
   --opd_update_stream "$OPD_UPDATE_STREAM" --opd_backend "$OPD_BACKEND"
   --opd_profile "$OPD_PROFILE" --opd_diagnostics "$OPD_DIAGNOSTICS"
+  --opd_train_projector "$OPD_TRAIN_PROJECTOR"
   --kv_gather_strategy "${KV_GATHER_STRATEGY:-stacked}"
   --log_interval "$LOG_INTERVAL"
   --log_file "$LOG_DIR/metrics.jsonl"
@@ -183,6 +184,8 @@ ln -sfn "$RUN_DIR" "$TRAIN_MODEL_ROOT/active_run"
   --item "opd_visited_weight=$OPD_VISITED_WEIGHT" --item "opd_frontier_weight=$OPD_FRONTIER_WEIGHT" \
   --item "opd_profile=$OPD_PROFILE" --item "opd_diagnostics=$OPD_DIAGNOSTICS" \
   --item "opd_backend=$OPD_BACKEND" \
+  --item "opd_train_projector=$OPD_TRAIN_PROJECTOR" --item "opd_proposal_mode=$OPD_PROPOSAL_MODE" \
+  --item "opd_proposal_profile=$OPD_PROPOSAL_PROFILE" \
   --item "kv_gather_strategy=${KV_GATHER_STRATEGY:-stacked}" \
   --item "nproc_per_node=$NPROC_PER_NODE"
 

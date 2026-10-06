@@ -3,14 +3,17 @@ import ast
 from pathlib import Path
 from types import SimpleNamespace
 from copy import deepcopy
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 import math
 import time
 import torch
-from helper.opd_reflex import OPDReflex
+from helper.opd_reflex import OPDReflex,OPD_COUNTER_NAMES
 from helper.method_config import resolve_method
 from helper.rollout_history import RolloutHistory
 from helper.tree_verification import pack_tree,trace_verified_path
 from helper.sampling import build_sampling_probs,sample_from_probs,sample_target_from_logits
+from helper.opd_scheduling import schedule,compact_suffix_inplace
 
 class Cache:
     def __init__(self):
@@ -92,9 +95,31 @@ def load_rollout(device='cpu',history_type=RolloutHistory):
     fns=[n for n in tree.body if isinstance(n,ast.FunctionDef)]
     scope=dict(torch=torch,time=time,math=math,deepcopy=deepcopy,DynamicCache=Cache,
                OPDReflex=OPDReflex,resolve_method=resolve_method,RolloutHistory=history_type,
+               OPD_COUNTER_NAMES=OPD_COUNTER_NAMES,historical_generate=load_historical(device,history_type),
+               schedule=schedule,compact_suffix_inplace=compact_suffix_inplace,
                pack_tree=pack_tree,trace_verified_path=trace_verified_path,
                build_sampling_probs=build_sampling_probs,sample_from_probs=sample_from_probs,
                sample_target_from_logits=sample_target_from_logits)
     exec(compile(ast.fix_missing_locations(ast.Module(body=fns,type_ignores=[])),str(path),'exec'),scope)
     generate=scope['speculative_generate'];generate._test_scope=scope
     return generate
+
+
+def load_historical(device='cpu',history_type=RolloutHistory):
+    path=Path(__file__).resolve().parents[1]/'helper/historical_fastgrpo.py'
+    tree=ast.parse(path.read_text())
+    for n in ast.walk(tree):
+        if isinstance(n,ast.FunctionDef) and n.name=='get_attention_mask':n.args.defaults[1]=ast.Constant(device)
+    fns=[n for n in tree.body if isinstance(n,ast.FunctionDef)]
+    scope=dict(torch=torch,time=time,math=math,deepcopy=deepcopy,DynamicCache=Cache,
+               ThreadPoolExecutor=ThreadPoolExecutor,RolloutHistory=history_type,
+               build_sampling_probs=build_sampling_probs,sample_from_probs=sample_from_probs,
+               sample_target_from_logits=sample_target_from_logits)
+    if device=='cpu':
+        class TorchProxy:
+            cuda=SimpleNamespace(Stream=lambda device:object(),set_device=lambda device:None,
+                                 stream=lambda stream:nullcontext(),synchronize=torch.cuda.synchronize)
+            def __getattr__(self,name):return getattr(torch,name)
+        scope['torch']=TorchProxy()
+    exec(compile(ast.fix_missing_locations(ast.Module(body=fns,type_ignores=[])),str(path),'exec'),scope)
+    return scope['speculative_generate']

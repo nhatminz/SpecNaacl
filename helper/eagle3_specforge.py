@@ -174,6 +174,8 @@ class Eagle3FastGRPOAdapter(nn.Module):
                 )
             else:
                 state, _ = _load_training_state(checkpoint_path)
+                state=dict(state)
+                saved_projector=state.pop('opd_projector',None)
                 missing, unexpected = self.draft_model.load_state_dict(state, strict=False)
                 required_missing = [key for key in missing if "embed" not in key.lower()]
                 if unexpected or required_missing:
@@ -228,13 +230,33 @@ class Eagle3FastGRPOAdapter(nn.Module):
         self.embed_tokens = self.draft_model.embed_tokens
         self.dtype = next(self.draft_model.parameters()).dtype
         from helper.opd_reflex import initialize_projector
-        self.register_buffer('opd_projector',initialize_projector(self.config.hidden_size,int(opd_rank)))
+        self.draft_model.register_parameter('opd_projector',nn.Parameter(
+            initialize_projector(self.config.hidden_size,int(opd_rank),head=self.draft_model.lm_head.weight)))
+        self.draft_model.register_buffer('opd_projector_grad_sum',torch.zeros_like(self.opd_projector),persistent=False)
+        self.draft_model.register_buffer('opd_projector_grad_weight',torch.zeros(1),persistent=False)
+        if draft_checkpoint and not is_exported and saved_projector is not None:
+            self.load_opd_projector(saved_projector)
         if draft_checkpoint and not is_exported:
             _,payload=_load_training_state(Path(draft_checkpoint))
             if payload.get('opd_projector') is not None:self.load_opd_projector(payload['opd_projector'])
         elif draft_checkpoint and is_exported:
             projector_file=Path(draft_checkpoint)/'opd_projector.pt'
             if projector_file.is_file():self.load_opd_projector(torch.load(projector_file,map_location='cpu',weights_only=True))
+
+    @property
+    def opd_projector(self):return self.draft_model.opd_projector
+
+    @property
+    def opd_projector_grad_sum(self):return self.draft_model.opd_projector_grad_sum
+
+    @property
+    def opd_projector_grad_weight(self):return self.draft_model.opd_projector_grad_weight
+
+    def apply_opd_projector_gradient(self):
+        """Only called at the existing draft optimizer boundary, before DDP sync."""
+        gradient=self.opd_projector_grad_sum/self.opd_projector_grad_weight.clamp_min(1.)
+        self.opd_projector.grad=gradient.clone()
+        self.opd_projector_grad_sum.zero_();self.opd_projector_grad_weight.zero_()
 
     @property
     def device(self):
@@ -261,7 +283,7 @@ class Eagle3FastGRPOAdapter(nn.Module):
     def load_opd_projector(self,value):
         if value.shape!=self.opd_projector.shape or not torch.isfinite(value).all():
             raise ValueError('incompatible/nonfinite persistent OPD projector')
-        self.opd_projector.copy_(value.to(device=self.opd_projector.device,dtype=torch.float32))
+        with torch.no_grad():self.opd_projector.copy_(value.to(device=self.opd_projector.device,dtype=torch.float32))
 
     def compact_to_target_ids(self, compact_ids=None, *, device=None):
         """Map compact EAGLE indices to target tokenizer ids on device."""
@@ -281,7 +303,7 @@ class Eagle3FastGRPOAdapter(nn.Module):
             "target_vocab_size": int(self.draft_model.vocab_size),
             "fc_norm": bool(getattr(self.config, 'fc_norm', False)),
             "opd_rank": int(self.opd_projector.shape[1]),
-            "opd_projector_training": "fixed; checkpoint-persistent",
+            "opd_projector_training": "learned at existing draft optimizer boundary; head-input representation",
         }
 
     def save_model(self, path):

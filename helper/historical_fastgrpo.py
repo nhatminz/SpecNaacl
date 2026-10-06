@@ -1,21 +1,21 @@
-"""Optimized OPD EAGLE3 rollout; OFF dispatches to frozen historical FastGRPO."""
+"""Historical FastGRPO OFF from c3f05ad. Frozen baseline, not OPD optimized.
+Native FP32 softmax/topk exactly draft_k, original Python tree/verifier/RNG/KV.
+Only CPU telemetry appended. No legacy LK implementation or runtime imported.
+"""
 import torch
-import math
 import time
+import math
 from copy import deepcopy
+from concurrent.futures import ThreadPoolExecutor
 from transformers import DynamicCache
-from helper.tree_verification import pack_tree, trace_verified_path
 from helper.rollout_history import RolloutHistory
-from helper.opd_reflex import OPDReflex
-from helper.method_config import resolve_method
-from helper.historical_fastgrpo import speculative_generate as historical_generate
-from helper.opd_reflex import OPD_COUNTER_NAMES
-from helper.opd_scheduling import schedule,compact_suffix_inplace
-from helper.sampling import build_sampling_probs, sample_from_probs, sample_target_from_logits
-total_target_time = 0
-total_draft_time = 0
-total_check_time = 0
+from helper.sampling import build_sampling_probs,sample_from_probs,sample_target_from_logits
 
+def reflex_or_baseline_probabilities(raw_logits):return raw_logits.float().softmax(dim=-1)
+def topk_compact_candidates(probabilities,compact_to_target,k):
+    values,compact_ids=torch.topk(probabilities,k=int(k),dim=-1)
+    mapping=compact_to_target.to(probabilities.device,torch.long)
+    return values,compact_ids,mapping[compact_ids]
 def _cache_num_layers(cache):
     if cache is None:
         return 0
@@ -100,27 +100,20 @@ def get_adaptive_hyperparameters(bsz, verification_capacity, max_draft_token_len
     draft_total_token = min(verification_num - 1, tree_node_capacity)
     return (draft_token_length, draft_k, draft_total_token)
 
-@torch.inference_mode()
-def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=False, repeated_generate_nums=None, temperature=0.8, top_p=0.9, top_k=None, verification_capacity=160, max_draft_token_length=5, max_draft_k=8, max_verification_num=160, min_draft_token_length=3, draft_token_length_c=0.75, statistical_time=False, return_all_draft_input=False, max_length=2048, method='fastgrpo', opd_rank=8, opd_topk=16, opd_fast_lr=0.01, opd_visited_weight=1.0, opd_frontier_weight=1.0, opd_update_stream=False, opd_profile=False, opd_diagnostics=False, opd_backend='auto', opd_train_projector=False, kv_gather_strategy='stacked'):
-    (method, _) = resolve_method(method)
-    if method=='fastgrpo':
-        result=historical_generate(model,input_ids,attention_mask,tokenizer,
-            do_sample=do_sample,repeated_generate_nums=repeated_generate_nums,temperature=temperature,
-            top_p=top_p,top_k=top_k,verification_capacity=verification_capacity,
-            max_draft_token_length=max_draft_token_length,max_draft_k=max_draft_k,max_verification_num=max_verification_num,
-            min_draft_token_length=min_draft_token_length,draft_token_length_c=draft_token_length_c,
-            statistical_time=statistical_time,return_all_draft_input=return_all_draft_input,max_length=max_length,
-            kv_gather_strategy=kv_gather_strategy)
-        result.update({name:0. for name in OPD_COUNTER_NAMES})
-        result.update(opd_backend='off',opd_profile_time_ms=0.,opd_profile_sections_ms=None)
-        return result
-    if not getattr(model, 'is_eagle3_specforge', False):
-        raise ValueError('Both fair modes require the real SpecForge EAGLE-3 backend')
+def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=False, repeated_generate_nums=None, temperature=0.8, top_p=0.9, top_k=None, verification_capacity=160, max_draft_token_length=5, max_draft_k=8, max_verification_num=160, min_draft_token_length=3, draft_token_length_c=0.75, statistical_time=False, return_all_draft_input=False, max_length=2048, kv_gather_strategy='stacked'):
+    reflex_mode = str('off').strip().lower()
+    if 'off' not in {'off', 'active'}:
+        raise ValueError("reflex_mode must be 'off' or 'active'")
+    reflex = None
     if kv_gather_strategy not in {'stacked', 'per_layer'}:
-        raise ValueError('invalid KV gather strategy')
-    enabled = method == 'opd_reflex'
-    opd = None
+        raise ValueError('kv_gather_strategy must be stacked or per_layer')
     compact_to_target = None
+
+    class Node:
+
+        def __init__(self, depth, input_id):
+            self.depth = depth
+            self.input_id = input_id
 
     def draft_generate(model, next_feature_states, draft_hidden_states, draft_past_key_values_tree, draft_token_length, past_position_ids_tensor, padding_positions, draft_k=4, draft_total_token=32):
         global total_check_time
@@ -128,24 +121,28 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
         device = model.device
         bsz = draft_hidden_states.shape[0]
         node_nums = draft_k + draft_k * draft_k * (draft_token_length - 1)
-        trees = []
-        full_parents = [torch.full((bsz, draft_k), -1, device=device, dtype=torch.long)]
-        full_contexts = torch.full((bsz, node_nums), -1, device=device, dtype=torch.long)
-        beam_node_ids = torch.arange(draft_k, device=device).expand(bsz, -1)
+        trees = [[0] * node_nums for _ in range(bsz)]
         parents_list = []
         total_input_ids = []
         total_position_ids = []
         confidences = []
         draft_position_ids = past_position_ids_tensor.unsqueeze(-1).repeat(1, draft_k)
         total_position_ids.append(draft_position_ids)
-        if enabled and hasattr(model, 'compute_compact_logits_with_inputs'):
-            (compact_logits, head_inputs) = model.compute_compact_logits_with_inputs(draft_hidden_states)
+        if getattr(model, 'is_eagle3_specforge', False):
+            compact_logits = model.compute_compact_logits(draft_hidden_states)
+            draft_logits = reflex_or_baseline_probabilities(compact_logits)
+            (next_token_values, _, draft_next_token) = topk_compact_candidates(draft_logits, compact_to_target, draft_k)
         else:
-            (compact_logits, head_inputs) = (model.compute_compact_logits(draft_hidden_states), draft_hidden_states)
-        (next_token_values, _, draft_next_token) = opd.propose(compact_logits, draft_hidden_states, draft_k, compact_to_target, root=True, context_offset=0, head_inputs=head_inputs)
+            draft_logits = model.lm_head(draft_hidden_states.to(model.target_model.dtype))
+            draft_logits = draft_logits.softmax(dim=-1)
+            (next_token_values, draft_next_token) = torch.topk(draft_logits, k=draft_k, dim=-1)
         draft_confidences = next_token_values.view(bsz, -1)
         past_kv_len = draft_past_key_values_tree[0][0].shape[-2]
         init_kv_len = draft_past_key_values_tree[0][0].shape[-2]
+        for idx_batch in range(bsz):
+            for idx_k in range(draft_k):
+                node = Node(depth=0, input_id=None)
+                trees[idx_batch][idx_k] = node
         draft_next_token = draft_next_token.view(bsz, -1)
         (bsz, _, hidden_size) = next_feature_states.shape
         next_feature_states = next_feature_states.expand(bsz, draft_k, hidden_size)
@@ -173,9 +170,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
                     padding_positions_indices = torch.tensor(padding_positions_indices, device=model.device)
                 padding_positions_tensor = padding_positions_indices
             if isinstance(padding_positions_tensor, torch.Tensor):
-                if padding_positions_tensor.dtype==torch.bool:
-                    draft_attention_mask.masked_fill_(padding_positions_tensor[:,None,None,:draft_attention_mask.shape[-1]],min_dtype)
-                else:draft_attention_mask[padding_positions_tensor[:,0],0,:,padding_positions_tensor[:,1]]=min_dtype
+                draft_attention_mask[padding_positions_tensor[:, 0], 0, :, padding_positions_tensor[:, 1]] = min_dtype
             if statistical_time:
                 torch.cuda.synchronize()
                 check_time_start = time.time()
@@ -186,18 +181,24 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
             draft_past_key_values_tree = draft_outputs['past_key_values']
             draft_hidden_states = draft_outputs['hidden_states']
             next_feature_states = draft_outputs['next_feature_states']
-            context_ids = 1 + (idx_token - 1) * draft_k + torch.arange(draft_k, device=device)
-            full_contexts.scatter_(1, beam_node_ids, context_ids.expand(bsz, -1))
-            full_parents.append(beam_node_ids.repeat_interleave(draft_k, dim=1))
-            if enabled and hasattr(model, 'compute_compact_logits_with_inputs'):
-                (compact_logits, head_inputs) = model.compute_compact_logits_with_inputs(draft_hidden_states)
+            if getattr(model, 'is_eagle3_specforge', False):
+                compact_logits = model.compute_compact_logits(draft_hidden_states)
+                draft_logits = reflex_or_baseline_probabilities(compact_logits)
+                (next_token_values, _, draft_next_token) = topk_compact_candidates(draft_logits, compact_to_target, draft_k)
             else:
-                (compact_logits, head_inputs) = (model.compute_compact_logits(draft_hidden_states), draft_hidden_states)
-            (next_token_values, _, draft_next_token) = opd.propose(compact_logits, draft_hidden_states, draft_k, compact_to_target, context_offset=1 + (idx_token - 1) * draft_k, head_inputs=head_inputs)
+                draft_logits = model.lm_head(draft_hidden_states.to(model.target_model.dtype))
+                draft_logits = draft_logits.softmax(dim=-1)
+                (next_token_values, draft_next_token) = torch.topk(draft_logits, k=draft_k, dim=-1)
             draft_confidences = draft_confidences.unsqueeze(-1) * next_token_values
             (draft_top_k_token_values, draft_top_k_token_indices) = torch.topk(draft_confidences.view(bsz, -1), k=draft_k, dim=-1)
-            beam_node_ids = draft_k + draft_k * draft_k * (idx_token - 1) + draft_top_k_token_indices
             past_kv_len = draft_past_key_values_tree[0][0].shape[-2]
+            for idx_tree in range(len(trees)):
+                for idx_seq in range(draft_k):
+                    for idx_k in range(draft_k):
+                        index = draft_k + draft_k * draft_k * (idx_token - 1) + idx_seq * draft_k + idx_k
+                        node = Node(depth=idx_token, input_id=None)
+                        assert trees[idx_tree][index] == 0
+                        trees[idx_tree][index] = node
             total_input_ids.append(draft_next_token.view(bsz, -1))
             confidences.append(draft_confidences.view(bsz, -1))
             draft_next_token = draft_next_token.view(bsz, -1).gather(index=draft_top_k_token_indices, dim=-1)
@@ -210,14 +211,37 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
             cur_attention_seen_indices = torch.arange(past_kv_len, past_kv_len + draft_k, device=device).unsqueeze(-1).unsqueeze(0).repeat(bsz, 1, 1)
             attention_seen_indices = torch.concat([attention_seen_indices, cur_attention_seen_indices], dim=-1)
             parents_list.append(draft_top_k_token_indices)
+        if draft_token_length > 1 and True:
+            parents_list = torch.stack(parents_list, dim=1)
+            parents_list = parents_list.to(torch.int16).cpu().tolist()
         total_input_ids = torch.concat(total_input_ids, dim=-1)
         total_position_ids = torch.concat(total_position_ids, dim=1)
         confidences = torch.concat(confidences, dim=-1)
         draft_total_token = min(int(draft_total_token), int(confidences.shape[-1]))
         chosen_index = torch.topk(confidences, k=draft_total_token, dim=-1)
         (chosen_index, _) = torch.sort(chosen_index.indices, dim=-1, descending=False)
-        tensor_tree = pack_tree(torch.cat(full_parents, dim=1), full_contexts, chosen_index, total_input_ids, draft_token_length)
-        return {'trees': [], 'trees_chosen_index': None, 'tensor_tree': tensor_tree, 'next_token_trees': total_input_ids.gather(1, chosen_index), 'target_position_ids': total_position_ids.gather(1, chosen_index)}
+        chosen_index_list = chosen_index.to(torch.int16).cpu().tolist()
+        for (idx_tree, tree) in enumerate(trees):
+            for index in chosen_index_list[idx_tree]:
+                node = tree[index]
+                node.child = []
+                node.input_id = total_input_ids[idx_tree][index]
+                if index < draft_k:
+                    node.parent = []
+                elif index < draft_k + draft_k * draft_k:
+                    parent_index = (index - draft_k) // draft_k
+                    node.parent = [parent_index]
+                    tree[parent_index].child.append(index)
+                else:
+                    parent_index1 = (index - draft_k) // (draft_k * draft_k)
+                    parent_index2 = (index - draft_k - parent_index1 * draft_k * draft_k) // draft_k
+                    parent_index2 = parents_list[idx_tree][parent_index1 - 1][parent_index2]
+                    parent_index = draft_k + (parent_index1 - 1) * draft_k * draft_k + parent_index2
+                    node.parent = tree[parent_index].parent + [parent_index]
+                    tree[parent_index].child.append(index)
+        next_token_trees = total_input_ids.gather(index=chosen_index, dim=-1)
+        target_position_ids = total_position_ids.gather(index=chosen_index, dim=-1)
+        return {'trees': trees, 'trees_chosen_index': chosen_index_list, 'next_token_trees': next_token_trees, 'target_position_ids': target_position_ids}
 
     def model_forward(model, input_ids, attention_mask, past_key_values, position_ids=None):
         if hasattr(model, 'base_model'):
@@ -246,9 +270,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
         attention_mask = attention_mask.unsqueeze(0).unsqueeze(0).repeat(bsz, 1, 1, 1)
         if isinstance(padding_positions, torch.Tensor):
             padding_positions_tensor = padding_positions
-            if padding_positions_tensor.dtype==torch.bool:
-                attention_mask.masked_fill_(padding_positions_tensor[:,None,None,:kv_length],min_dtype)
-            else:attention_mask[padding_positions_tensor[:,0],0,:,padding_positions_tensor[:,1]]=min_dtype
+            attention_mask[padding_positions_tensor[:, 0], 0, :, padding_positions_tensor[:, 1]] = min_dtype
         elif padding_positions:
             batch_indices = []
             pos_indices = []
@@ -270,17 +292,17 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
     bsz = input_ids.shape[0]
     end_sig = [0] * bsz
     device = model.target_model.device
-    update_stream = torch.cuda.Stream(device) if enabled and opd_update_stream and (torch.device(device).type == 'cuda') else None
-    source_ready = update_done = None
-    if update_stream is not None:
-        source_ready = torch.cuda.Event()
-        update_done = torch.cuda.Event()
+    transfer_stream = torch.cuda.Stream(device)
+    executor = ThreadPoolExecutor(max_workers=64)
+    update_stream = None
+    profile_overlap_events = None
 
-    def wait_for_opd_update():
-        ticket = opd.begin('opd_wait_ms')
+    def wait_for_reflex_update():
+        if profile_overlap_events is not None:
+            main_ready = torch.cuda.Event(enable_timing=True)
+            main_ready.record(torch.cuda.current_stream(device))
+            profile_overlap_events.append((source_ready, update_done, main_ready))
         torch.cuda.current_stream(device).wait_event(update_done)
-        opd.end(ticket)
-    verification_batches = active_response_rounds = verified_tree_nodes = 0
     prefill_time_start = time.time()
     target_time_start = time.time()
     global total_target_time, total_draft_time, total_check_time
@@ -288,8 +310,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
     all_draft_input_states = None
     all_target_hidden_states = None
     all_draft_input_ids = None
-    attention_mask = attention_mask.cpu()
-    initial_padding=attention_mask.eq(0).to(device)
+    attention_mask = attention_mask
     position_ids = [torch.sum(item) for item in attention_mask]
     past_position_ids = [item.item() - 1 for item in position_ids]
     position_ids = [torch.concat([torch.zeros(input_ids.shape[-1] - item, dtype=torch.long), torch.arange(0, item, dtype=torch.long)], dim=-1) for item in position_ids]
@@ -314,7 +335,6 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
         torch.cuda.synchronize()
         total_target_time += time.time() - target_time_start
     (target_next_token, _) = sample_target_from_logits(target_logits, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k, eos_token_id=eos_token_id)
-    del _, target_logits
     draft_input_ids = torch.concat([input_ids[:, 1:], target_next_token], dim=-1)
     draft_attention_mask = attention_mask.to(model.dtype)
     initial_history = {'generated_ids': target_next_token}
@@ -374,38 +394,6 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
     response_verification_rounds = [0 for _ in range(bsz)]
     if getattr(model, 'is_eagle3_specforge', False):
         compact_to_target = model.compact_to_target_ids(device=draft_hidden_states.device)
-    cache = getattr(model, '_opd_runtime_cache', None)
-    if cache is None:
-        cache = {}
-        model._opd_runtime_cache = cache
-    key = (enabled, opd_rank, opd_topk, opd_fast_lr, opd_visited_weight, opd_frontier_weight, opd_profile, opd_diagnostics, opd_backend,opd_train_projector)
-    opd = cache.get(key)
-    if opd is None:
-        cache.clear()
-        opd=OPDReflex(opd_rank,opd_topk,opd_fast_lr,opd_visited_weight,opd_frontier_weight,
-                     opd_profile,opd_diagnostics,enabled,opd_backend,opd_train_projector)
-        cache[key]=opd
-    opd.start(model, bsz, compact_to_target, draft_hidden_states.shape[-1], max_contexts=1 + max_draft_k * (max_draft_token_length - 1), max_nodes=max(verification_capacity+bsz,2*bsz), max_path=max_draft_token_length + 1, max_proposal_contexts=max_draft_k)
-    mask_rows_capacity = max(verification_capacity + bsz, 2 * bsz)
-    mask_columns_capacity = input_ids.shape[-1] + max_length * (max_draft_token_length + 1) + max_verification_num
-    workspace = getattr(model, '_opd_tree_mask_workspace', None)
-    elements = mask_rows_capacity * mask_columns_capacity
-    if workspace is None or workspace.numel() < elements or workspace.device != torch.device(device):
-        workspace = torch.empty(elements, device=device, dtype=model.target_model.dtype)
-        model._opd_tree_mask_workspace = workspace
-    tree_mask_workspace = workspace
-    model._opd_initial_batch=bsz;model._opd_max_path_capacity=max_draft_token_length+1
-    pad_capacity=mask_columns_capacity
-    pad_mask=getattr(model,'_opd_padding_workspace',None)
-    if pad_mask is None or pad_mask.shape!=(bsz,pad_capacity) or pad_mask.device!=torch.device(device):
-        pad_mask=torch.empty((bsz,pad_capacity),device=device,dtype=torch.bool);model._opd_padding_workspace=pad_mask
-    pad_mask.zero_()
-    pad_mask[:,:input_ids.shape[-1]].copy_(initial_padding.repeat_interleave(max(1,repeated_generate_nums or 1),0))
-    owners=torch.arange(bsz,device=device,dtype=torch.long)
-    padding_positions_tensor=pad_mask
-    pad_counts=[len(pad) for pad in padding_positions]
-    max_recorded_pad_column=input_ids.shape[-1]
-
     if statistical_time:
         torch.cuda.synchronize()
         draft_time_start = time.time()
@@ -420,26 +408,50 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
         torch.cuda.synchronize()
         total_draft_time += time.time() - draft_time_start
     total_prefill_time = time.time() - prefill_time_start
+    verification_batches=active_response_rounds=verified_tree_nodes=0
     for token_num in range(1, max_length):
         past_kv_len = _cache_seq_length(target_past_key_values)
         kv_length = past_kv_len + draft_total_token + 1
         q_length = draft_total_token + 1
-        verification_batches += 1
-        active_response_rounds += bsz
-        verified_tree_nodes += bsz * q_length
+        verification_batches+=1;active_response_rounds+=bsz;verified_tree_nodes+=bsz*q_length
         target_trees = draft_trees
+        for (idx_tree, tree) in enumerate(target_trees):
+            unique_index = past_kv_len + 1
+            for index in trees_chosen_index[idx_tree]:
+                node = tree[index]
+                node.target_index = unique_index
+                unique_index += 1
         next_token_trees = torch.concat([target_next_token, next_token_trees], dim=-1)
         target_position_ids = target_position_ids + 2
         target_position_ids = torch.concat([(past_position_ids_tensor + 1).unsqueeze(-1), target_position_ids], dim=-1)
         min_dtype = torch.finfo(model.target_model.dtype).min
-        target_attention_mask = tensor_tree.attention_mask(past_kv_len, model.target_model.dtype, kernels=opd._kernels, workspace=tree_mask_workspace)
+        target_attention_mask = torch.zeros((q_length, kv_length), dtype=model.target_model.dtype, device=device)
+        target_attention_mask[..., past_kv_len + 1:] = min_dtype
+        target_attention_mask = target_attention_mask.unsqueeze(0).unsqueeze(0).repeat(bsz, 1, 1, 1)
         indices = []
+        for (idx_tree, tree) in enumerate(target_trees):
+            for index in trees_chosen_index[idx_tree]:
+                node = tree[index]
+                cur_index = node.target_index - past_kv_len
+                for index in node.parent:
+                    seen_token_index = tree[index].target_index
+                    indices.append([idx_tree, cur_index, seen_token_index])
+                indices.append([idx_tree, cur_index, node.target_index])
         if indices:
             indices = torch.tensor(indices, dtype=torch.int16).to(device).long()
             target_attention_mask[indices[:, 0], 0, indices[:, 1], indices[:, 2]] = 0
         if isinstance(padding_positions_tensor, torch.Tensor):
-            target_attention_mask.masked_fill_(padding_positions_tensor[:,None,None,:kv_length],min_dtype)
-        transfer_thread = None
+            target_attention_mask[padding_positions_tensor[:, 0], 0, :, padding_positions_tensor[:, 1]] = min_dtype
+
+        def transfer_input_ids(trees, trees_chosen_index, device, stream):
+            torch.cuda.set_device(device)
+            with torch.cuda.stream(stream):
+                for (idx_tree, tree) in enumerate(trees):
+                    for index in trees_chosen_index[idx_tree]:
+                        node = tree[index]
+                        node.input_id = node.input_id.cpu()
+            return trees
+        transfer_thread = executor.submit(transfer_input_ids, target_trees, trees_chosen_index, device, transfer_stream)
         if statistical_time:
             torch.cuda.synchronize()
             target_time_start = time.time()
@@ -450,43 +462,106 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
             target_hidden_states_tree = target_outputs['target_hidden_state']
             target_outputs_logits = model.target_model.lm_head(target_hidden_states_tree)
             (target_next_token_tree, target_sampling_probs) = sample_target_from_logits(target_outputs_logits, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k, eos_token_id=eos_token_id)
+            _ = target_sampling_probs
         if statistical_time:
             torch.cuda.synchronize()
             total_target_time += time.time() - target_time_start
-        path = trace_verified_path(tensor_tree, target_next_token_tree, eos_token_id, kernels=opd._kernels, workspace=opd.path_workspace)
-        if enabled:
-            teacher = target_sampling_probs if do_sample else target_next_token_tree
-            if update_stream is not None:
-                source_ready.record(torch.cuda.current_stream(device))
-                update_stream.wait_event(source_ready)
-                for shared in (teacher, tensor_tree.parents, tensor_tree.feedback_contexts):
-                    shared.record_stream(update_stream)
-                with torch.cuda.stream(update_stream):
-                    opd.feedback(tensor_tree, path, teacher, greedy=not do_sample)
-                    update_done.record(update_stream)
+        target_trees = transfer_thread.result()
+        acc_length = [0] * bsz
+        chosen_index = [[] for _ in range(bsz)]
+        next_token = [[] for _ in range(bsz)]
+        target_next_token_tree_list = target_next_token_tree.tolist()
+        for (idx_tree, tree) in enumerate(target_trees):
+            if end_sig[idx_tree] == 0:
+                proposed_draft_tokens = len(trees_chosen_index[idx_tree])
+                cur_next_token = [target_next_token_tree_list[idx_tree][0]]
+                cur_acc_length = 1
+                cur_chosen_index = [past_kv_len]
+                tmp_sig = True
+                for index in trees_chosen_index[idx_tree]:
+                    if index >= draft_k:
+                        break
+                    node = tree[index]
+                    if cur_next_token[-1] == node.input_id.item():
+                        cur_next_token.append(target_next_token_tree_list[idx_tree][node.target_index - past_kv_len])
+                        cur_acc_length += 1
+                        cur_chosen_index.append(node.target_index)
+                        while tmp_sig:
+                            tmp_sig = False
+                            for child_index in node.child:
+                                child = tree[child_index]
+                                if cur_next_token[-1] == child.input_id.item():
+                                    cur_next_token.append(target_next_token_tree_list[idx_tree][child.target_index - past_kv_len])
+                                    cur_acc_length += 1
+                                    cur_chosen_index.append(child.target_index)
+                                    tmp_sig = True
+                                    node = child
+                                    break
+                        break
+                acc_length[idx_tree] = cur_acc_length
+                next_token[idx_tree] = cur_next_token
+                chosen_index[idx_tree] = cur_chosen_index
+                for (cur_idx, token) in enumerate(next_token[idx_tree]):
+                    if token == eos_token_id:
+                        end_sig[idx_tree] = 1
+                        chosen_index[idx_tree] = chosen_index[idx_tree][:cur_idx + 1]
+                        next_token[idx_tree] = next_token[idx_tree][:cur_idx + 1]
+                        acc_length[idx_tree] = cur_idx + 1
+                        break
+                total_proposed_draft_tokens += int(proposed_draft_tokens)
+                total_accepted_draft_tokens += max(int(acc_length[idx_tree]) - 1, 0)
+                avg_acc_length[0] = avg_acc_length[0] + acc_length[idx_tree]
+                avg_acc_length[1] += 1
             else:
-                opd.feedback(tensor_tree, path, teacher, greedy=not do_sample)
-        scheduling_packet,next_token,chosen_index,newly_padded,last_valid_index,max_acc_length=schedule(
-            path,past_kv_len,eos_token_id,opd.padded_path_workspace,opd.scheduling_packet,opd._kernels)
-        acc_length=[row[0] for row in scheduling_packet]
-        end_sig=[row[1] for row in scheduling_packet]
-        for idx_tree,length in enumerate(acc_length):
-            pad_counts[idx_tree]+=sum(index>=0 for index in scheduling_packet[idx_tree][3:])
-            total_proposed_draft_tokens+=draft_total_token
-            total_accepted_draft_tokens+=max(length-1,0)
-            avg_acc_length[0]+=length;avg_acc_length[1]+=1
-        output_columns=past_kv_len+torch.arange(max_acc_length,device=device)
-        pad_mask[owners[:,None],output_columns[None,:]]=newly_padded
-        padding_positions_tensor[:,output_columns]=newly_padded
-        max_recorded_pad_column=max(max_recorded_pad_column,past_kv_len+max_acc_length)
-        del target_sampling_probs, target_outputs_logits
+                acc_length[idx_tree] = 0
         max_acc_length = max(acc_length)
         for (active_index, accepted_length) in enumerate(acc_length):
             if accepted_length > 0:
                 original_index = residual_index[active_index]
                 response_accepted_length_sum[original_index] += int(accepted_length)
                 response_verification_rounds[original_index] += 1
-        feature_states_index = chosen_index - past_kv_len
+        last_valid_index = [max_acc_length - 1] * bsz
+        for idx_batch in range(bsz):
+            cur_index_length = len(chosen_index[idx_batch])
+            if cur_index_length < max_acc_length:
+                padding_num = max_acc_length - cur_index_length
+                new_chosen_index = []
+                new_next_token = []
+                cur_index = past_kv_len
+                for (index, token) in zip(chosen_index[idx_batch], next_token[idx_batch]):
+                    if padding_num > 0:
+                        if index != cur_index:
+                            while cur_index != index and padding_num != 0:
+                                new_chosen_index.append(cur_index)
+                                new_next_token.append(eos_token_id)
+                                padding_positions[idx_batch].add(cur_index)
+                                cur_index += 1
+                                padding_num -= 1
+                            new_chosen_index.append(index)
+                            new_next_token.append(token)
+                            last_valid_index[idx_batch] = len(new_chosen_index) - 1
+                            cur_index += 1
+                        else:
+                            new_chosen_index.append(index)
+                            new_next_token.append(token)
+                            last_valid_index[idx_batch] = len(new_chosen_index) - 1
+                            cur_index += 1
+                    else:
+                        new_chosen_index.append(index)
+                        new_next_token.append(token)
+                        last_valid_index[idx_batch] = len(new_chosen_index) - 1
+                while padding_num > 0:
+                    new_chosen_index.append(cur_index)
+                    new_next_token.append(eos_token_id)
+                    padding_positions[idx_batch].add(cur_index)
+                    cur_index += 1
+                    padding_num -= 1
+                chosen_index[idx_batch] = new_chosen_index
+                next_token[idx_batch] = new_next_token
+        feature_states_index = [[index - past_kv_len for index in row] for row in chosen_index]
+        next_token = torch.tensor(next_token, device=device)
+        last_valid_index = torch.tensor(last_valid_index, dtype=torch.int16).unsqueeze(-1).to(device).long()
+        feature_states_index = torch.tensor(feature_states_index, dtype=torch.int16).to(device).long()
         target_next_token = next_token.gather(index=last_valid_index, dim=-1)
         (B, T, D) = feature_states_tree.shape
         feature_states_index = feature_states_index.unsqueeze(-1).expand(B, -1, D)
@@ -501,12 +576,12 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
         finished_indices = [index for (index, finished) in enumerate(end_sig) if finished]
         if 0 not in end_sig:
             if update_stream is not None:
-                wait_for_opd_update()
+                wait_for_reflex_update()
             break
-        real_sequences_length = max(history.lengths['generated_ids']+input_ids.shape[-1]-count for count in pad_counts)
+        real_sequences_length = max((history.lengths['generated_ids'] + input_ids.shape[-1] - len(pad) for pad in padding_positions))
         if real_sequences_length >= max_length:
             if update_stream is not None:
-                wait_for_opd_update()
+                wait_for_reflex_update()
             break
         if finished_indices:
             keep_rows = [row for (row, finished) in enumerate(end_sig) if not finished]
@@ -514,7 +589,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
             for row in finished_indices:
                 original = residual_index[row]
                 finished_history = history.finish(original)
-                # Padding masks are materialized once at rollout completion.
+                padding_positions_dict[str(original)] = padding_positions[row]
                 generated_sequences_dict[str(original)] = finished_history['generated_ids']
                 if return_all_draft_input:
                     draft_input_states_dict[str(original)] = finished_history['features']
@@ -522,38 +597,81 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
                     draft_input_ids_dict[str(original)] = finished_history['input_ids']
                 del finished_history
             end_sig = [end_sig[row] for row in keep_rows]
-            pad_counts=[pad_counts[row] for row in keep_rows]
-            owners=owners.index_select(0,keep)
-            padding_positions_tensor=padding_positions_tensor.index_select(0,keep)
-            past_position_ids_tensor=past_position_ids_tensor.index_select(0,keep)
+            padding_positions = [padding_positions[row] for row in keep_rows]
+            past_position_ids = [past_position_ids[row] for row in keep_rows]
             residual_index = [residual_index[row] for row in keep_rows]
-            chosen_index = chosen_index.index_select(0, keep)
+            chosen_index = [chosen_index[row] for row in keep_rows]
             for layer in range(_cache_num_layers(target_past_key_values)):
                 (key, value) = _cache_get_layer(target_past_key_values, layer)
                 _cache_set_layer(target_past_key_values, layer, key.index_select(0, keep), value.index_select(0, keep))
             draft_past_key_values = [[key.index_select(0, keep), value.index_select(0, keep)] for (key, value) in draft_past_key_values]
             next_token = next_token.index_select(0, keep)
-            newly_padded=newly_padded.index_select(0,keep)
             target_next_token = target_next_token.index_select(0, keep)
             feature_states = feature_states.index_select(0, keep)
             target_hidden_states = target_hidden_states.index_select(0, keep)
             last_valid_index = last_valid_index.index_select(0, keep)
             bsz = len(keep_rows)
             (draft_token_length, draft_k, draft_total_token) = get_adaptive_hyperparameters(bsz, verification_capacity, max_draft_token_length, max_draft_k, max_verification_num, min_draft_token_length, draft_token_length_c)
-        positions = torch.arange(max_acc_length, device=device)[None, :] + past_kv_len
-        extension = min(row[2] for row in scheduling_packet if row[1]==0)
-        prefix_length = min(_cache_seq_length(target_past_key_values), past_kv_len + extension)
-        full_chosen_length = past_kv_len + max_acc_length
-        # OPD ONLY. Historical baseline retains its original stacked gather.
-        for layer in range(_cache_num_layers(target_past_key_values)):
-            key,value=_cache_get_layer(target_past_key_values,layer)
-            key,value=compact_suffix_inplace(key,value,chosen_index,past_kv_len,extension,model)
-            _cache_set_layer(target_past_key_values,layer,key,value)
-        target_past_key_values.crop(full_chosen_length)
+        padding_positions_indices = []
+        for (batch_id, pad_positions) in enumerate(padding_positions):
+            for pos in pad_positions:
+                padding_positions_indices.append([batch_id, pos])
+        if padding_positions_indices:
+            padding_positions_indices = torch.tensor(padding_positions_indices, device=model.device)
+        padding_positions_tensor = padding_positions_indices
+        for idx_batch in range(bsz):
+            chosen_index[idx_batch] = [x for x in range(past_kv_len)] + chosen_index[idx_batch]
+        prefix_length = _cache_seq_length(target_past_key_values)
+        for idx_batch in range(len(chosen_index)):
+            the_prefix_length = 0
+            for (idx, index) in enumerate(chosen_index[idx_batch]):
+                if idx == index:
+                    the_prefix_length = idx + 1
+                else:
+                    break
+            prefix_length = min(the_prefix_length, prefix_length)
+        full_chosen_length = len(chosen_index[0])
+        if prefix_length == full_chosen_length:
+            target_past_key_values.crop(prefix_length)
+        else:
+            suffix_indices = [[x - prefix_length for x in item[prefix_length:]] for item in chosen_index]
+            gather_index = torch.tensor(suffix_indices, device=device)
+            if kv_gather_strategy == 'per_layer':
+                for layer in range(_cache_num_layers(target_past_key_values)):
+                    (key, value) = _cache_get_layer(target_past_key_values, layer)
+                    (heads, head_dim) = (key.shape[1], key.shape[-1])
+                    index_expanded = gather_index[:, None, :, None].expand(bsz, heads, -1, head_dim)
+                    new_key = torch.cat((key[..., :prefix_length, :], key[..., prefix_length:, :].gather(-2, index_expanded)), dim=-2)
+                    new_value = torch.cat((value[..., :prefix_length, :], value[..., prefix_length:, :].gather(-2, index_expanded)), dim=-2)
+                    _cache_set_layer(target_past_key_values, layer, new_key, new_value)
+            else:
+                target_past_key_tensor = torch.stack([_cache_get_layer(target_past_key_values, idx_layer)[0] for idx_layer in range(_cache_num_layers(target_past_key_values))], dim=0)
+                target_past_value_tensor = torch.stack([_cache_get_layer(target_past_key_values, idx_layer)[1] for idx_layer in range(_cache_num_layers(target_past_key_values))], dim=0)
+                (L, B, H, T, D) = target_past_key_tensor.shape
+                index_expanded = gather_index.unsqueeze(1).unsqueeze(-1).unsqueeze(0).expand(L, B, H, -1, D)
+                prefix_key = target_past_key_tensor[..., :prefix_length, :]
+                prefix_value = target_past_value_tensor[..., :prefix_length, :]
+                suffix_key = target_past_key_tensor[..., prefix_length:, :].gather(-2, index_expanded)
+                suffix_value = target_past_value_tensor[..., prefix_length:, :].gather(-2, index_expanded)
+                new_key = torch.concat([prefix_key, suffix_key], dim=-2)
+                new_value = torch.concat([prefix_value, suffix_value], dim=-2)
+                for layer in range(L):
+                    _cache_set_layer(target_past_key_values, layer, new_key[layer], new_value[layer])
         draft_attention_mask = get_attention_mask(draft_past_key_values[0][0].shape[-2], max_acc_length, model.dtype, bsz, padding_positions=padding_positions_tensor)
-        assert _cache_seq_length(target_past_key_values)==draft_past_key_values[0][0].shape[-2]+max_acc_length
-        draft_position_ids=past_position_ids_tensor[:,None]+(~newly_padded).long().cumsum(1)
-        past_position_ids_tensor=draft_position_ids[:,-1]
+        draft_position_ids = [[] for _ in range(bsz)]
+        assert _cache_seq_length(target_past_key_values) == draft_past_key_values[0][0].shape[-2] + max_acc_length
+        draft_position_ids = [[] for _ in range(bsz)]
+        for idx_batch in range(bsz):
+            cur_position_ids = past_position_ids[idx_batch]
+            cur_index = draft_past_key_values[0][0].shape[-2]
+            for idx_token in range(max_acc_length):
+                if cur_index not in padding_positions[idx_batch]:
+                    cur_position_ids += 1
+                draft_position_ids[idx_batch].append(cur_position_ids)
+                cur_index += 1
+            past_position_ids[idx_batch] = draft_position_ids[idx_batch][-1]
+        draft_position_ids = torch.tensor(draft_position_ids, dtype=torch.int16).to(device).long()
+        past_position_ids_tensor = draft_position_ids[:, -1]
         if statistical_time:
             torch.cuda.synchronize()
             draft_time_start = time.time()
@@ -571,7 +689,9 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
             draft_hidden_states = draft_outputs['hidden_states'].gather(index=last_valid_index, dim=1)
             next_feature_states = draft_outputs['next_feature_states'].gather(index=last_valid_index, dim=1)
             if update_stream is not None:
-                wait_for_opd_update()
+                wait_for_reflex_update()
+                if finished_indices:
+                    None.remove_finished(finished_indices)
             outputs = draft_generate(model, next_feature_states, draft_hidden_states, draft_past_key_values, draft_token_length, past_position_ids_tensor, padding_positions_tensor, draft_k=draft_k, draft_total_token=draft_total_token)
             draft_trees = outputs['trees']
             trees_chosen_index = outputs['trees_chosen_index']
@@ -582,13 +702,10 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
             torch.cuda.synchronize()
             total_draft_time += time.time() - draft_time_start
     post_time_start = time.time()
-    padding_cpu=pad_mask[:,:max_recorded_pad_column].cpu()
-    padding_positions_dict={str(row):set(torch.nonzero(mask,as_tuple=False).flatten().tolist())
-        for row,mask in enumerate(padding_cpu)}
     for idx_batch in range(bsz):
         delete_idx = idx_batch
         ori_idx = residual_index[idx_batch]
-        # Global padding mask already contains the finished owner row.
+        padding_positions_dict[str(ori_idx)] = padding_positions[delete_idx]
         finished_history = history.finish(ori_idx)
         generated_sequences_dict[str(ori_idx)] = finished_history['generated_ids']
         if return_all_draft_input:
@@ -649,8 +766,6 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
         filtered_generated_token_ids.append(sequence_without_padding)
         max_sequence_length = max(max_sequence_length, len(sequence_without_padding))
     draft_acceptance_rate = total_accepted_draft_tokens / max(total_proposed_draft_tokens, 1)
-    opd_statistics = opd.finish()
-    opd.clear()
-    result = {'generated_token_ids': filtered_generated_token_ids, 'max_sequence_length': max_sequence_length, 'total_acc_length': avg_acc_length[0], 'total_acc': max_sequence_length / token_num, 'total_decoded_token_num': avg_acc_length[1], 'total_accepted_draft_tokens': total_accepted_draft_tokens, 'total_proposed_draft_tokens': total_proposed_draft_tokens, 'total_accepted_medusa_tokens': total_accepted_draft_tokens, 'total_proposed_medusa_tokens': total_proposed_draft_tokens, 'draft_acceptance_rate': draft_acceptance_rate, 'medusa_acceptance_rate': draft_acceptance_rate, 'total_time_cost': time.perf_counter() - start_time, 'target_time_cost': total_target_time, 'draft_time_cost': total_draft_time, 'check_time_cost': total_check_time, 'prefill_time_cost': total_prefill_time, 'post_time_cost': time.time() - post_time_start, 'all_draft_input_states': all_draft_input_states, 'all_target_hidden_states': all_target_hidden_states, 'all_draft_input_ids': all_draft_input_ids, 'response_accepted_length_sum': response_accepted_length_sum, 'response_verification_rounds': response_verification_rounds, 'response_generated_tokens': [len(item) for item in filtered_generated_token_ids], 'batch_verification_rounds': verification_batches, 'verification_batches': verification_batches, 'active_response_rounds': active_response_rounds, 'verified_tree_nodes': verified_tree_nodes}
-    result.update(opd_statistics)
+    result = {'generated_token_ids': filtered_generated_token_ids, 'max_sequence_length': max_sequence_length, 'total_acc_length': avg_acc_length[0], 'total_acc': max_sequence_length / token_num, 'total_decoded_token_num': avg_acc_length[1], 'total_accepted_draft_tokens': total_accepted_draft_tokens, 'total_proposed_draft_tokens': total_proposed_draft_tokens, 'total_accepted_medusa_tokens': total_accepted_draft_tokens, 'total_proposed_medusa_tokens': total_proposed_draft_tokens, 'draft_acceptance_rate': draft_acceptance_rate, 'medusa_acceptance_rate': draft_acceptance_rate, 'total_time_cost': time.perf_counter() - start_time, 'target_time_cost': total_target_time, 'draft_time_cost': total_draft_time, 'check_time_cost': total_check_time, 'prefill_time_cost': total_prefill_time, 'post_time_cost': time.time() - post_time_start, 'all_draft_input_states': all_draft_input_states, 'all_target_hidden_states': all_target_hidden_states, 'all_draft_input_ids': all_draft_input_ids, 'response_accepted_length_sum': response_accepted_length_sum, 'response_verification_rounds': response_verification_rounds, 'response_generated_tokens': [len(item) for item in filtered_generated_token_ids]}
+    result.update(batch_verification_rounds=verification_batches,verification_batches=verification_batches,active_response_rounds=active_response_rounds,verified_tree_nodes=verified_tree_nodes)
     return result

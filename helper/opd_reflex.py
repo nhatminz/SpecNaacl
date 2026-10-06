@@ -1,12 +1,18 @@
-"""Shared exact proposal engine and inference-only, rollout-local OPD Reflex.
+"""Exact optimized proposal engine and rollout-local OPD Reflex.
 
-A is a persistent fixed projector owned/saved by the EAGLE adapter. B_fast is
-ONE shared compact-vocab adapter, reset every rollout. No optimizer/autograd or
-model forward is used here. CUDA production requires Triton; Torch is CPU oracle.
+A is a persistent learned projector owned/saved by the EAGLE adapter. Its
+analytical gradients accumulate here, but only the existing draft optimizer
+boundary updates A. B_fast is ONE shared compact-vocab adapter, reset every
+rollout. No optimizer/autograd or extra model forward runs here. CUDA production
+requires Triton; Torch is CPU oracle.
 """
 from contextlib import nullcontext
 import importlib
 import math
+import json
+import os
+import hashlib
+from pathlib import Path
 import torch
 
 OPD_COUNTER_NAMES=(
@@ -14,13 +20,18 @@ OPD_COUNTER_NAMES=(
     'opd_kl_sum','opd_union_size_sum','opd_compact_mass_sum','opd_draft_topk_target_mass_sum',
     'opd_invalid_states','opd_updates','opd_active_rows_sum','opd_rounds',
     'opd_nonfinite_kl_states',
+    'opd_proposal_mode_sparse_rounds','opd_proposal_mode_dense_rounds',
 )
 GENERATION_COUNTER_NAMES=('verification_batches','active_response_rounds','verified_tree_nodes')
 
 
-def initialize_projector(hidden,rank,seed=42):
+def initialize_projector(hidden,rank,seed=42,head=None):
     if not 1<=rank<=64:raise ValueError('OPD rank must be in [1,64]')
-    # Separate generator: never consume the target sampler/global RNG.
+    if head is not None:
+        ids=torch.linspace(0,head.shape[0]-1,rank,device=head.device).long()
+        rows=head.detach().index_select(0,ids).float().t().cpu()
+        return torch.linalg.qr(rows,mode='reduced').Q.contiguous()
+    # Oracle fixtures only. Production uses a deterministic head-aligned basis.
     return torch.randn(hidden,rank,generator=torch.Generator().manual_seed(seed),dtype=torch.float32)/math.sqrt(hidden)
 
 
@@ -41,9 +52,10 @@ def union_reference(p,q,target_ids,draft_ids):
     """Top-k union + ONE tail; not a renormalized shortlist loss."""
     k=draft_ids.shape[-1]
     ids=torch.cat((draft_ids,target_ids),-1)
+    positive_target=(target_ids>=0)&(p.gather(-1,target_ids.clamp_min(0))>0)
     valid=torch.cat((torch.ones_like(draft_ids,dtype=torch.bool),
-                     ~(target_ids[:,:,None]==draft_ids[:,None,:]).any(-1)),-1)
-    pu=torch.where(valid,p.gather(-1,ids),0.);qu=torch.where(valid,q.gather(-1,ids),0.)
+                     positive_target&~(target_ids[:,:,None]==draft_ids[:,None,:]).any(-1)),-1)
+    pu=torch.where(valid,p.gather(-1,ids.clamp_min(0)),0.);qu=torch.where(valid,q.gather(-1,ids.clamp_min(0)),0.)
     empty_tail=valid.sum(-1)==p.shape[-1]
     pt=torch.where(empty_tail,0.,(1-pu.sum(-1)).clamp_min(0.))
     qt=torch.where(empty_tail,0.,(1-qu.sum(-1)).clamp_min(0.))
@@ -54,7 +66,7 @@ def union_reference(p,q,target_ids,draft_ids):
 
 class OPDReflex:
     def __init__(self,rank=8,topk=16,fast_lr=.01,visited_weight=1.,frontier_weight=1.,
-                 profile=False,diagnostics=False,enabled=True,backend='auto'):
+                 profile=False,diagnostics=False,enabled=True,backend='auto',train_projector=False):
         if not 1<=rank<=64 or topk<1 or fast_lr<0 or min(visited_weight,frontier_weight)<0:
             raise ValueError('invalid OPD rank/topk/lr/state weights')
         if backend not in ('auto','torch','triton'):raise ValueError('invalid OPD backend')
@@ -62,6 +74,19 @@ class OPDReflex:
         self.visited_weight,self.frontier_weight=float(visited_weight),float(frontier_weight)
         self.profile,self.diagnostics,self.enabled=bool(profile),bool(diagnostics),bool(enabled)
         self.requested_backend=backend;self._events=[];self._layout=None
+        self.proposal_mode=os.environ.get('OPD_PROPOSAL_MODE','sparse')
+        if self.proposal_mode not in ('sparse','dense','adaptive'):raise ValueError('invalid OPD_PROPOSAL_MODE')
+        profile_path=os.environ.get('OPD_PROPOSAL_PROFILE','')
+        self.tuning=json.loads(Path(profile_path).read_text()) if profile_path else None
+        if self.proposal_mode=='adaptive' and self.tuning is None:
+            raise ValueError('adaptive requires measured OPD_PROPOSAL_PROFILE; no guessed crossover')
+        self.train_projector=bool(train_projector)
+        self._validated_tuning=False
+
+    def proposal_threshold(self,b,c):
+        if self.proposal_mode!='adaptive':return self.vocab+1
+        key=f'{b},{c},{self.vocab},{self.rank},{self.logits_dtype}'
+        return int(self.tuning.get('thresholds',{}).get(key,self.vocab+1))
 
     def start(self,model,batch,mapping,hidden_size,*,max_contexts,max_nodes,max_path,max_proposal_contexts):
         device=mapping.device;v=mapping.numel();k=min(v,self.requested_topk)
@@ -72,16 +97,29 @@ class OPDReflex:
         if self.requested_backend=='triton' and device.type!='cuda':raise ValueError('Triton OPD requires CUDA')
         self._kernels=importlib.import_module('helper.tree_kernels') if self.backend=='triton' else None
         self._opd_kernels=importlib.import_module('helper.opd_reflex_kernels') if self.backend=='triton' else None
+        if self.proposal_mode=='adaptive' and not self._validated_tuning:
+            if self.backend!='triton':raise ValueError('measured adaptive CUDA profile requires Triton')
+            fingerprint=dict(gpu=torch.cuda.get_device_name(device),torch=torch.__version__,
+                triton=self._opd_kernels.triton.__version__,cuda=torch.version.cuda,
+                kernel_sha256=hashlib.sha256(Path(self._opd_kernels.__file__).read_bytes()).hexdigest())
+            if any(self.tuning.get(k)!=value for k,value in fingerprint.items()):
+                raise ValueError('tuning profile GPU/compiler/kernel mismatch; retune')
+            self._validated_tuning=True
         self.mapping,self.vocab,self.topk,self.max_batch=mapping,v,k,batch
         self.cache_contexts=max_contexts
         layout=(batch,v,hidden_size,max_contexts,max_nodes,max_path,max_proposal_contexts,k,str(device),self.enabled)
         self.head=model.draft_model.lm_head if hasattr(model,'draft_model') else model.draft_head
+        self.model=model
         if self.enabled:
             self.projector=model.get_opd_projector(self.rank) if hasattr(model,'get_opd_projector') else None
             if self.projector is None:
                 if not hasattr(model,'opd_projector'):model.opd_projector=initialize_projector(hidden_size,self.rank).to(device)
                 self.projector=model.opd_projector
             if tuple(self.projector.shape)!=(hidden_size,self.rank):raise ValueError('persistent A rank/hidden mismatch')
+            if self.train_projector and not hasattr(model,'opd_projector_grad_sum'):
+                with torch.inference_mode(False):
+                    model.opd_projector_grad_sum=torch.zeros_like(self.projector)
+                    model.opd_projector_grad_weight=torch.zeros(1,device=device)
         if layout!=self._layout:
             self._layout=layout
             def alloc(shape,dtype=torch.float32):return torch.empty(shape,device=device,dtype=dtype)
@@ -93,10 +131,14 @@ class OPDReflex:
             self.proposal_q=alloc(batch*max_proposal_contexts*k)
             self.proposal_ids=alloc(batch*max_proposal_contexts*k,torch.long)
             self.proposal_norm=alloc(batch*max_proposal_contexts*2)
+            # Reserved proposal-only workspace: sparse touches ONLY S token
+            # scalars; dense GEMM writes all. Not a feedback probability cache.
+            self.score_workspace=alloc(batch*max_proposal_contexts*v if self.enabled else 1)
             tiles=(v+255)//256+1
             self.proposal_tiles=[alloc(batch*max_proposal_contexts*tiles*(k if i>=2 else 1),torch.long if i==3 else torch.float32) for i in range(4)] if self.backend=='triton' else []
             self.path_workspace=[alloc((batch,max_path),torch.long) for _ in range(3)]+[alloc(batch,torch.long)]
             self.padded_path_workspace=[alloc((batch,max_path),torch.bool if i==2 else torch.long) for i in range(3)]+[alloc((batch,1),torch.long)]
+            self.scheduling_packet=alloc((batch,max_path+3),torch.long)
             if self.enabled:
                 self.head_cache=alloc((batch,max_contexts,hidden_size),self.head.weight.dtype)
                 self.u_cache=alloc((batch,max_contexts,self.rank))
@@ -111,6 +153,10 @@ class OPDReflex:
                 self.state_stats=alloc(n*10);self.round_weight=alloc(1)
                 self.teacher_tiles=[alloc(n*t*(k if i>=2 else 1),torch.long if i==3 else torch.float32) for i in range(4)] if self.backend=='triton' else []
                 self.counters=alloc(len(OPD_COUNTER_NAMES),torch.float64)
+                if self.train_projector:
+                    self.projector_head=alloc((n,hidden_size))
+                    self.projector_v=alloc((n,self.rank))
+                    self.projector_delta=alloc((hidden_size,self.rank))
         self.bitmap.zero_();self.active_count.zero_()
         if self.enabled:self.B_fast.zero_();self.counters.zero_()
         self._ever_updated=False;self._events.clear()
@@ -134,14 +180,14 @@ class OPDReflex:
         if self.enabled:
             if head_inputs is None:head_inputs=hidden
             u=self.proposal_u[:b*c].view(b,c,self.rank)
-            if self.backend=='triton':self._opd_kernels.feature(hidden,self.projector,u,head_inputs,self,context_offset)
+            if self.backend=='triton':self._opd_kernels.feature(head_inputs,self.projector,u,head_inputs,self,context_offset)
             else:
-                with torch.autocast(device_type='cpu',enabled=False):u.copy_(hidden.float().matmul(self.projector))
+                with torch.autocast(device_type='cpu',enabled=False):u.copy_(head_inputs.float().matmul(self.projector))
         self.end(ticket);ticket=self.begin('proposal_ms')
         values=self.proposal_q[:b*c*keep].view(b,c,keep);ids=self.proposal_ids[:b*c*keep].view(b,c,keep)
         norm=self.proposal_norm[:b*c*2].view(b,c,2)
         if self.backend=='triton':
-            self._opd_kernels.propose(logits,u,self,keep,self.proposal_tiles,(values,ids,norm),self.enabled and self._ever_updated)
+            self._opd_kernels.propose(logits,u,self,keep,self.proposal_tiles,(values,ids,norm),self.enabled and self._ever_updated,root)
         else:
             z=logits.float().clone()
             if self.enabled and self._ever_updated:
@@ -149,7 +195,7 @@ class OPDReflex:
                 z[...,active.long()]+=u.matmul(self.B_fast[active.long()].t())
             maximum=z.amax(-1);total=(z-maximum[...,None]).exp().sum(-1)
             norm[...,0].copy_(maximum);norm[...,1].copy_(total)
-            # Deterministic low-ID tie convention, same for OFF and OPD.
+            # Deterministic low-ID tie convention for the OPD CPU oracle.
             order=torch.argsort(z,dim=-1,descending=True,stable=True)[...,:keep]
             probabilities=z.softmax(-1)
             ids.copy_(order);values.copy_(probabilities.gather(-1,order))
@@ -165,12 +211,6 @@ class OPDReflex:
                 self.q_cache[:b,context_offset:context_offset+c].copy_(values)
                 self.norm_cache[:b,context_offset:context_offset+c].copy_(norm)
         self.end(ticket)
-        if self.backend=='torch':
-            # CPU oracle only: reproduce legacy Torch's K-dependent tie rule
-            # for integration parity. CUDA production NEVER takes this path:
-            # it uses one Top16 scan and its shared low-ID tie convention.
-            tree_q,tree_ids=torch.topk(probabilities,k=k,dim=-1)
-            return tree_q,tree_ids,mapping[tree_ids]
         return values[...,:k],ids[...,:k],mapping[ids[...,:k]]
 
     @torch.no_grad()
@@ -197,6 +237,7 @@ class OPDReflex:
         w=torch.where(good,weights,0.).reshape(-1)
         di=self.ids_cache[batch,context].reshape(-1,k)
         ti=torch.argsort(teacher,dim=-1,descending=True,stable=True)[...,:k].reshape(-1,k)
+        ti=torch.where(teacher.reshape(-1,self.vocab).gather(-1,ti)>0,ti,-1)
         ids,valid,p,qq,pt,qt,kl=union_reference(teacher.reshape(-1,self.vocab),draft.reshape(-1,self.vocab),ti,di)
         # Cached top-k q avoids selected-row output-head reconstruction drift.
         qq[:,:k]=self.q_cache[batch,context].reshape(-1,k)
@@ -204,9 +245,14 @@ class OPDReflex:
         kl=torch.where(p>0,p*(p.log()-qq.log()),0.).sum(-1)+torch.where(pt>0,pt*(pt.log()-qt.log()),0.)
         selected=w>0;g=torch.where(valid,(qq-p)*w[:,None],0.)
         total=w.sum()
+        if self.train_projector and self._ever_updated:
+            rows=self.B_fast[ids.clamp_min(0)]
+            v=((g[...,None]*rows)*valid[...,None]).sum(1)
+            self.model.opd_projector_grad_sum.add_(head_inputs.reshape(-1,head_inputs.shape[-1]).float().t().matmul(v))
+        if self.train_projector:self.model.opd_projector_grad_weight.add_(total)
         if self.fast_lr>0 and total>0:
             delta=torch.zeros_like(self.B_fast)
-            delta.index_add_(0,ids.flatten(),(g[...,None]*u.reshape(-1,self.rank)[:,None,:]).reshape(-1,self.rank))
+            delta.index_add_(0,ids.clamp_min(0).flatten(),(g[...,None]*u.reshape(-1,self.rank)[:,None,:]).reshape(-1,self.rank))
             self.B_fast.add_(delta,alpha=-self.fast_lr/float(total))
             active=torch.nonzero(self.B_fast.abs().sum(-1)>0,as_tuple=False).flatten()
             self.active_count.fill_(active.numel());self.active_ids[:active.numel()].copy_(active)
@@ -217,7 +263,7 @@ class OPDReflex:
             torch.where(selected,mass.flatten(),0.).sum(),torch.where(selected,p[:,:k].sum(-1),0.).sum(),
             ((weights>0)&~good).sum(),((total>0)&(self.fast_lr>0)).float(),self.active_count[0].float(),total.new_tensor(1.),
             (selected&~finite).sum()))
-        self.counters.add_(stats.to(torch.float64))
+        self.counters[:13].add_(stats.to(torch.float64))
 
     def remove_finished(self,indices):
         # B is shared, not row-owned. Current contexts are overwritten next tree.

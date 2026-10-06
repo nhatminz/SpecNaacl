@@ -16,6 +16,7 @@ def validate_training_sources(repo_root: Path, backend: str):
         "__init__.py", "rewards.py", "get_QAs.py", "specualtive_generate.py",
         "checkpointing.py", "method_config.py", "drift_metrics.py", "rollout_history.py", "step_metrics.py",
         "opd_reflex.py", "opd_reflex_kernels.py", "tree_kernels.py", "sampling.py", "tree_verification.py",
+        "historical_fastgrpo.py","opd_scheduling.py",
     ]
     required.append("eagle3_specforge.py" if backend == "eagle3" else "modeling_draft.py")
     # The entrypoint still imports the adapter definition for both backends;

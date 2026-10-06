@@ -1,128 +1,121 @@
-# OPD Reflex implementation report — 2026-10-06
+# Learned OPD / historical baseline optimization — 2026-10-07
 
-Only METHOD=fastgrpo/opd_reflex remains; LK implementation is retired. Existing
-model/data/pretrain/output paths and dependency pins are unchanged. No full
-training, Internet download or sibling-repo edits performed.
+This supersedes the fixed-A/shared-baseline implementation at d9766ad.
+FastGRPO now dispatches to frozen historical c3f05ad OFF: exact native softmax,
+torch.topk(draft_k), original tree/Python verifier/RNG/stacked KV. No OPD engine
+or scheduler/cache optimization reaches this baseline.
 
-## Algorithm / hot path
+User explicitly accepted OPD always fused Top16, including cold; Top16 prefix
+ties need NOT match historical K. Cold invariant is raw corrected logits = raw,
+same full compact softmax distribution, no slow fallback. Mathematical
+probabilities validated with FP32 tolerance, not false old-Torch bitwise claims.
 
-Native unchanged FastGRPO GRPO/rewards/optimizer/update schedule and real
-SpecForge EAGLE3 architecture/feature capture/loss/unrolling inherited.
+## Implemented
 
-Fixed checkpoint-persistent A:[H,8], ONE shared rollout-local B:[compactV,8].
-Visited + expanded final-tree one-hop rejected siblings, GPU masks, no recursive
-rejected descendants. Existing post-sampling teacher probabilities conditioned
-on compact vocabulary. Top16 union + tail forward KL, exact prescribed union
-coordinate gradient q-p; weighted batched SGD. No Adam/autograd/all-reduce on B.
-A is fixed, outside optimizers. Both A/draft resume/export save/load verified.
-B changes only after verification and is reset at rollout completion/start.
+- A is an nn.Parameter ON draft_model, head-aligned deterministic basis only
+  at initialization; post-norm/head-input representation. Existing A checkpoint
+  loaded unchanged. GPU gradient sum/weight accumulated before B_t changes.
+  Cold B=0 has zero A gradient but its valid state weights still count.
+  Apply at existing draft optimizer boundary before existing DDP sync.
+  Pending gradient buffers checkpointed separately PER RANK for training resume.
+  Older fixed-A optimizer checkpoints fail with an explicit initialization-only
+  migration message rather than silently dropping/misassigning pending feedback.
+  Auxiliary evaluation/analysis and frozen benchmark never accumulate A grads.
+- Exact adaptive sparse/dense: ordered FP32 rank GEMM with tile B reuse,
+  no FMA/TF32 association change. Sparse writes only S scalars; dense writes
+  reused current-proposal workspace. SAME scan positions/normalization gives
+  bitwise switch outputs. Current proposal scratch O(B*C*V), allocated once,
+  not a probability cache of all rollout states. No guessed B200 crossover.
+- TargetTop16 positive-only, sentinel -1/0 for absent entries; no arbitrary
+  zero-probability target additions/updates. DraftTop16 preserved and tail intact.
+- OPD metadata: THREE round transfers reduced to ONE fixed packet; GPU pad
+  masks and position cumsums, no per-round Python padding-set walks. Necessary
+  HF crop/active sampler batch host boundary remains (not claimed zero-sync).
+- OPD KV suffix gathered into reused small per-head scratch, copied in-place
+  and cropped. Accepted history prefix never copied after verification; no
+  stacked all-layer/full-history concat. Native HF next update creates normal
+  contiguous KV before attention. Finished batch copy still remains.
+- Native target/draft transformer work unchanged per verification/expansion;
+  no extra forwards/backward/full-vocab KL backward. Shared B local/reset,
+  no per-response state or round all-reduce. Two reusable dependency events,
+  late wait, no new profiling/default synchronization.
+- Existing per-step CSV/JSONL definitions preserved; added cumulative/delta
+  sparse/dense root-round usage and existing active-row mean.
+- All 14 paired .sh export train-projector/mode/profile knobs. Benchmark is
+  HISTORICAL FastGRPO vs optimized OPD, no shared Top16 baseline.
+  Crossover tuner fingerprints GPU/Torch/Triton/CUDA/kernel and exact geometry.
+  Untuned geometries stay sparse, incompatible profiles fail clearly.
 
-Sparse full-vocab proposal: raw inactive scan via bitmap + ONLY S active r-dots
-+ exact global merge. Negative corrections included, no duplicates/ANN/gates.
-One CUDA Top16 serves tree K and feedback. No all-state full-vocab probability
-cache, no V*r feedback gradient, no per-response adapter. Exact cancellation
-prunes zero rows; no magnitude threshold or eviction.
+## Evidence actually measured (NOT B200/full-model)
 
-Cache normalized head inputs/u/Top16 IDs,q/normalization in reusable buffers.
-Selected output-head rows reconstruct teacher-only union q, not another draft
-transformer. Teacher workspace TOTAL capacity bounded by verification_capacity+B,
-not B*max_verification_num. Two stream dependency events per rollout, late wait
-before next proposal, transient tensor recording only. Mandatory metrics share
-one end-rollout packet. No new production cuda.synchronize.
+RTX3090 / Torch2.5.1+cu124 / Triton3.1 / Python3.10 existing test environment.
+Final focused suite:107 passed,2 skipped (CPU stream cases),1 torch.load warning.
+Revised 26-test suite
+covers actual historical dispatch unchanged/no OPD constructor, positive-only
+teacher1/3/8 support, sparse/dense/edge ties/full S oracle and bitwise switching,
+GPU adaptive counters, learned A gradient/optimizer boundary/checkpoint,
+one-packet scheduling and in-place KV suffix parity, per-rank pending-gradient
+checkpoint restoration. Earlier broader focused run:127 passed,2 skipped.
 
-14 model launchers export knobs, default simplelr, target/draft LR1e-5, batch8,
-accum4, responses8, online draft tokens2048/log1. Stream0/LR0.01 are conservative
-UNTUNED defaults; only real end-to-end B200 data can choose performance winner.
-Profiling/diagnostics OFF. Fixed cuda-tile validator namespace cuda.tile only;
-no dependency version relaxation.
+Final full pytest attempt:189 passed,2 skipped,1 torch.load warning,
+12 failures/37 setup errors: missing transformers for actual SpecForge native
+training/position tests and three pre-existing missing offline packaging files.
+These tests retained; whole-suite PASS or pinned-stack native run NOT claimed.
+compileall/shell syntax/source integrity/CLI dry-run/diff checks/pip check pass.
 
-## Exactness qualifications
+Controlled component benchmark at V32768/H2048/r8, BF16,10 samples per median:
+Final isolated run: B8,C8,S32768 sparse0.5033ms vs dense0.3363ms;
+S8192 sparse0.3649 vs dense0.3363. B8,C1,S32768 sparse0.2642 vs dense0.2423.
+All measured sparse/dense values/IDs
+bitwise identical. Component speed is NOT generation speed or acceptance gain;
+profiles from this GPU are not B200 profiles. Raw JSON/logs in
+validation/opd_20261007, authoritative final component profile:
+`crossover_isolated_rtx3090.json`. Do not use `crossover_final_rtx3090.json`
+(concurrent tests) as a performance profile. The older archived profile also
+has a pre-final kernel fingerprint; it is historical evidence, not runtime config.
 
-CUDA OFF/B0 OPD identity tested bitwise through proposals/tree/verifier/tokens,
-history, CPU/CUDA RNG and target/draft forward counts. CPU golden rollouts match
-prechange tokens/masks/history/counts. Positive OPD counts can legitimately
-change with verification rounds: zero EXTRA means inherited work per round,
-not forced equal totals despite different AAL.
+Configured production target3B config / pretrained / simplelr data absent here.
+Actual asset check fails clearly. No B200 model benchmark, full policy/draft
+training, fake data/model or fabricated AAL/tokens/s result generated.
 
-Shared fused CUDA normalization and low-ID tie rule differ from historical
-Torch softmax/topk. Both production modes use the SAME engine; no old-Torch
-bitwise claim. CPU oracle retains Torch K-dependent tree topk via a DEBUG-only
-second topk and is blocked on CUDA.
+## Remaining bottlenecks / limits
 
-Selected BF16 head at H32/2048 compared to native dense rows with explicit
-rtol1%/atol1e-6 q tolerance; independent reductions can round at BF16 boundaries.
-This auxiliary tolerance NEVER relaxes exact target/proposal/B0 identity.
-Shared FP32 atomic gradients checked with dense oracle tolerance, not falsely
-claimed bitwise positive-update reproducibility. TEST-only autograd verifies
-union q-p derivative of forward KL INCLUDING tail.
+One host scheduling boundary required by native dynamic batch/HF crop and exact
+sampling; cannot defer it without unverified fixed-batch/RNG changes. Batch KV
+compaction and HF next-cache append still copy history when necessary. Full
+compact normalization/teacher scan, selected head rows, A gradient GEMM and
+side-stream contention remain measurable costs. S may approach V, now exact
+measured dense crossover available. Canonical dense GEMM prioritizes exactness;
+cuBLAS/TensorCore speed claims require a separate numerical proof.
 
-## Checks actually performed
+A initialized from a learned head is NOT itself trained until optimizer steps
+occur. Use an OPD-trained checkpoint to measure learned A. Frozen sweep does not
+silently train A. Default sparse/stream0/LR0.01 is untuned conservative; no claim
+OPD always beats historical FastGRPO. Preserve/report negative AAL or cost>benefit.
 
-Local RTX3090 / Torch2.5.1+cu124 / Triton3.1 / Python3.10 test interpreter
-(not pinned B200 stack; existing installed environments untouched).
+## Commands / files
 
-- Relevant suite: **102 passed,2 skipped** (CPU stream-only cases).
-- Full pytest: **163 passed,2 skipped,12 failed,37 setup errors**.
-  Nine failures/37 errors: missing transformers in actual SpecForge pretrain,
-  position and training-input tests. Three retained pre-existing packaging tests
-  refer to missing requirements-bootstrap.txt/requirements-external.txt/
-  scripts/build_offline_wheelhouse.sh. Not removed or rewritten to hide failures.
-- compileall . / authored shell syntax / diff check: PASS.
-- Real entrypoint parser fed both actual launcher commands: PASS.
-- All paired model dry runs/overrides, source integrity, sweep CLI dry run: PASS.
-- pip check of test interpreter: No broken requirements found.
-- Configured target3B config, pretrained/data assets absent locally. Production
-  asset check fails clearly; no fake model/data or native train substituted.
+All commands and paths in huongdanchay.md; detailed algorithm METHOD_OPD_REFLEX.md.
+Run scripts/tune_opd_proposals.sh on ACTUAL B200, export its real profile,
+then sweep scripts/sweep_opd_reflex.sh and validate held-out end-to-end results.
 
-Validation logs: validation/opd_20261006. No B200/full-checkpoint AAL or tok/s
-available. Controlled unit test shows future fixed-state teacher mass increases
-and target token enters Top2 without transformers: correctness/capability ONLY,
-not claimed production benefit.
-
-## Telemetry / benchmark / limitations
-
-Definitions in METHOD_OPD_REFLEX.md. Exact per-step cumulative differences,
-accepted_length/SEQUENCE verification rounds, target bonus included, prefill
-token excluded. One timing.csv row per completed inherited GRPO label in both
-methods, no moving averages or unweighted batch AAL. Same logging schema.
-
-Frozen sweep warms measured seed/prompt schedules, measures end-to-end wall,
-tokens/s, weighted AAL, rounds/acceptance/memory/counters, keeps negative results.
-Separate profile replay excluded from throughput and cannot evict warmed cache.
-recommendation=null unless some OPD config improves BOTH AAL and throughput.
-Same seed is not assumed to imply identical responses. Plot exact step counters.
-
-S can approach V. Remaining cost: full scan/top-k/normalization, compact teacher
-extraction, selected head rows, side-stream bandwidth contention, HF eager/KV
-and inherited host scheduling metadata. No guessed speedup or async advantage.
-
-Memory: A O(Hr), B O(Vr), bitmap O(V/32), active-ID reserved O(V), cached head
-inputs O(B*expandedContexts*H), proposal summaries O(B*C*ceil(V/256)*TopK),
-teacher summaries O((verification_capacity+B)*ceil(V/256)*TopK). No B*V*r state
-or allStates*V probability cache.
-
-## Files created/changed
-
+Created/modified:
+- `METHOD_OPD_REFLEX.md`
 - `README.md`
-- `RUNNING.md`
 - `configs/_shared/b200_common.env`
 - `grpo_speculative.py`
 - `helper/eagle3_specforge.py`
-- `helper/method_config.py`
-- `helper/sampling.py`
+- `helper/opd_reflex.py`
+- `helper/opd_reflex_kernels.py`
 - `helper/specualtive_generate.py`
-- `helper/step_metrics.py`
+- `helper/tree_kernels.py`
 - `huongdanchay.md`
+- `scripts/benchmark_opd_reflex.py`
 - `scripts/check_training_sources.py`
 - `scripts/launch/train_model.sh`
-- `scripts/run_fastgrpo_fair.sh`
-- `scripts/validate_environment.py`
-- `tests/test_rollout_history.py`
-- `tests/test_sampling.py`
-- `tests/test_shell_scripts.py`
-- `tests/test_step_metrics.py`
-- `tests/test_training_imports.py`
-- `train_fastgrpo.sh`
+- `tests/opd_fixtures.py`
+- `tests/test_opd_contracts.py`
+- `tests/test_opd_reflex.py`
 - `train_llama31_8b.sh`
 - `train_llama31_8b_fastgrpo.sh`
 - `train_qwen25_14b.sh`
@@ -137,42 +130,10 @@ or allStates*V probability cache.
 - `train_qwen3_1p7b_fastgrpo.sh`
 - `train_qwen3_4b.sh`
 - `train_qwen3_4b_fastgrpo.sh`
-- `METHOD_OPD_REFLEX.md`
-- `helper/opd_reflex.py`
-- `helper/opd_reflex_kernels.py`
-- `helper/tree_kernels.py`
-- `scripts/benchmark_opd_reflex.py`
-- `scripts/plot_opd_aal.py`
-- `scripts/run_opd_reflex.sh`
-- `scripts/sweep_opd_reflex.sh`
-- `tests/fastgrpo_golden.json`
-- `tests/opd_fixtures.py`
-- `tests/test_opd_contracts.py`
-- `tests/test_opd_reflex.py`
-- `train_opd_reflex.sh`
-- `IMPLEMENTATION_REPORT.md` and `validation/opd_20261006/`.
-
-## Retired LK-only files (recoverable from Git history)
-
-- `helper/fast_lk_reflex.py`
-- `helper/fast_lk_reflex_kernels.py`
-- `tests/test_fast_lk_reflex.py`
-- `tests/test_reflex_rollout.py`
-- `tests/test_reflex_fused_source.py`
-- `tests/test_reflex_optimized_strategies.py`
-- `tests/test_reflex_kernel_equations.py`
-- `tests/test_reflex_benchmark.py`
-- `tests/test_reflex_tensor_path.py`
-- `tests/test_reflex_cuda_pipeline.py`
-- `scripts/run_specnaacl.sh`
-- `scripts/benchmark_reflex.py`
-- `scripts/benchmark_reflex_pipeline.py`
-- `scripts/benchmark_reflex_training.sh`
-- `scripts/benchmark_reflex_strategies.py`
-- `scripts/benchmark_reflex_bookkeeping.py`
-- `scripts/benchmark_reflex_rollout.py`
-- `scripts/summarize_reflex_training.py`
-- `METHOD_FAST_LK_REFLEX.md`
-- `REFLEX_B200_OPTIMIZATION.md`
-
-No model/data/weights/outputs/venv deleted.
+- `helper/historical_fastgrpo.py`
+- `helper/opd_scheduling.py`
+- `scripts/tune_opd_proposals.py`
+- `scripts/tune_opd_proposals.sh`
+- `tests/test_opd_revision.py`
+- `IMPLEMENTATION_REPORT.md`, validation/opd_20261007 evidence.
+No model/data/checkpoints/venv/sibling code deleted or altered.

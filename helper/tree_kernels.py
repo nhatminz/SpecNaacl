@@ -3,6 +3,42 @@ import torch
 import triton
 import triton.language as tl
 
+
+@triton.jit
+def _pad_schedule(TOKENS,INDICES,LENGTHS,OT,OI,OM,LAST,PACKET,
+                   B:tl.constexpr,CAP:tl.constexpr,PAST:tl.constexpr,EOS:tl.constexpr,
+                   TS0,TS1,IS0,IS1,OS0,OS1,PS0,PS1,
+                   BW:tl.constexpr,BB:tl.constexpr):
+    batch=tl.program_id(0).to(tl.int64);slot=tl.arange(0,BW);rows=tl.arange(0,BB)
+    lengths=tl.load(LENGTHS+rows,rows<B,other=0);width=tl.max(lengths,axis=0)
+    length=tl.load(LENGTHS+batch)
+    index=tl.load(INDICES+batch*IS0+slot*IS1,slot<CAP,other=-1)
+    valid=slot<length;budget=width-length
+    before=tl.minimum(tl.maximum(index-slot,0),budget);destination=slot+before
+    candidates=tl.where((destination[None,:]==slot[:,None])&valid[None,:],
+                         tl.broadcast_to(slot[None,:],(BW,BW)),BW)
+    source=tl.min(candidates,axis=1);accepted=source<BW;safe=tl.minimum(source,CAP-1)
+    token=tl.load(TOKENS+batch*TS0+safe*TS1,accepted&(slot<width),other=EOS)
+    chosen=tl.load(INDICES+batch*IS0+safe*IS1,accepted&(slot<width),other=0)
+    output_ids=tl.where(accepted,chosen+PAST,slot+PAST)
+    last=tl.max(tl.where(valid,destination,-1),axis=0)
+    tl.store(OT+batch*OS0+slot*OS1,tl.where(accepted,token,EOS),slot<width)
+    tl.store(OI+batch*OS0+slot*OS1,output_ids,slot<width)
+    tl.store(OM+batch*OS0+slot*OS1,~accepted,slot<width);tl.store(LAST+batch,last)
+    eos_token=tl.load(TOKENS+batch*TS0+(length-1)*TS1)
+    extension=tl.min(tl.where((slot<width)&(output_ids!=slot+PAST),slot,width),axis=0)
+    tl.store(PACKET+batch*PS0,length)
+    tl.store(PACKET+batch*PS0+PS1,(eos_token==EOS).to(tl.int64))
+    tl.store(PACKET+batch*PS0+2*PS1,extension)
+    tl.store(PACKET+batch*PS0+(slot+3)*PS1,tl.where((slot<width)&~accepted,output_ids,-1),slot<CAP)
+
+
+def pad_schedule(path,past,eos,tokens,indices,mask,last,packet):
+    b,cap=path.tokens.shape
+    _pad_schedule[(b,)](path.tokens,path.packed_indices,path.lengths,tokens,indices,mask,last,packet,
+        b,cap,past,eos,*path.tokens.stride(),*path.packed_indices.stride(),*tokens.stride(),*packet.stride(),
+        triton.next_power_of_2(cap),triton.next_power_of_2(b),num_warps=4)
+
 @triton.jit
 def _proposal_merge(MAX, SUM, VALUES, IDS, PROBS, TOP_IDS, NORM,
                     CONTEXTS: tl.constexpr, VOCAB: tl.constexpr, K: tl.constexpr,
@@ -113,4 +149,3 @@ def tree_mask(tree, past_length, mask):
     batch, rows = tree.parents.shape
     _tree_mask[(rows, batch)](tree.parents, mask, rows, past_length, tree.max_depth + 1,
                              torch.finfo(mask.dtype).min, triton.next_power_of_2(past_length + rows), num_warps=4)
-

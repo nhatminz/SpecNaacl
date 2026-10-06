@@ -21,6 +21,8 @@ export OPD_TOPK=16
 export OPD_VISITED_WEIGHT=1.0
 export OPD_FRONTIER_WEIGHT=1.0
 export OPD_UPDATE_STREAM=0   # UNTUNED: đo cả0/1, không giả định async nhanh hơn
+export OPD_TRAIN_PROJECTOR=1 # A học tại draft optimizer boundary, không reset
+export OPD_PROPOSAL_MODE=sparse # chưa có profile B200: không đoán crossover
 export OPD_PROFILE=0
 export OPD_DIAGNOSTICS=0
 ```
@@ -83,6 +85,33 @@ OPD_PROFILE=1 chạy diagnostic replay TÁCH RIÊNG khỏi wall/throughput. Các
 timers không phải authoritative speedup. OPD_DIAGNOSTICS=1 thêm B norm/max ở cuối
 rollout, không thêm target/draft transformer forward.
 
+## Tune sparse/dense trên B200 trước khi dùng adaptive
+
+```bash
+CUDA_VISIBLE_DEVICES=0 bash scripts/tune_opd_proposals.sh
+```
+
+Profile được lưu trong outputs/benchmarks/ (script in đúng tên file). Export
+OPD_PROPOSAL_PROFILE trỏ tới JSON thực đó rồi chạy:
+
+```bash
+export OPD_PROPOSAL_MODE=adaptive
+MODEL_KEY=qwen25_3b bash scripts/sweep_opd_reflex.sh
+```
+
+Shape/V/H phải đúng model; override OPD_TUNE_SHAPES, OPD_TUNE_VOCAB,
+OPD_TUNE_HIDDEN. Default gồm64x1/64x7/64x8/32x1/32x8: effective batch64 với
+verification_capacity512 ban đầu draft_k=7. Profile sai GPU/compiler/hash bị
+reject; shape chưa đo fallback sparse. Không đem profile RTX3090 dùng trên B200.
+Đo sparse/dense/adaptive end-to-end bằng cùng frozen sweep, không chỉ component.
+
+FastGRPO từ nay là historical native TopK(draft_k), không dùng shared Top16.
+OPD luôn fused Top16 kể cả cold; tied candidate IDs khác historical được chấp
+nhận. Không thêm fallback chậm. A phải qua optimizer steps mới gọi là đã train;
+muốn đánh giá learned A hãy dùng DRAFT_CHECKPOINT của run OPD đã train. Sweep
+frozen không tự train A/policy/draft. Một scheduling host boundary vẫn còn để
+giữ đúng dynamic batch/HF crop/RNG; không claim toàn decoder zero-sync.
+
 ## Outputs và plot AAL đúng từng step
 
 Train outputs: `outputs/train/<model_key>/<run_name>/`.
@@ -102,3 +131,5 @@ Các biến trên phải trỏ tới CSV/output bạn thực sự chọn. Plot d
 không dùng cumulative AAL/moving average. Các pretrain launchers vẫn giữ nguyên.
 Không resume optimizer trajectory của method cũ vào OPD; giữ cùng method khi
 resume. Có thể dùng lại pretrained draft/target adapter như initialization.
+Checkpoint trước learned-A không dùng làm optimizer resume; dùng draft weights
+của nó để bắt đầu run mới. Checkpoint mới lưu pending A gradient riêng từng rank.

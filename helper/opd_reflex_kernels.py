@@ -32,81 +32,101 @@ def feature(hidden,projector,out,head_inputs,state,offset):
         triton.next_power_of_2(h),triton.next_power_of_2(r),num_warps=8,enable_fp_fusion=False)
 
 
+
+@triton.jit
+def _sparse_scores(Z,U,B,ACTIVE,COUNT,SCORES,COUNTERS,ZS0,ZS1,ZS2,
+                   C:tl.constexpr,V:tl.constexpr,R:tl.constexpr,THRESHOLD:tl.constexpr,
+                   MODE:tl.constexpr,ROOT:tl.constexpr,BS:tl.constexpr):
+    row=tl.program_id(0).to(tl.int64);count=tl.load(COUNT)
+    use_sparse=(MODE==0)|((MODE==2)&(count<THRESHOLD))
+    if use_sparse:
+        s=tl.arange(0,BS)
+        for start in range(0,count,BS):
+            ids=tl.load(ACTIVE+start+s,start+s<count,other=0).to(tl.int64)
+            dot=tl.full((BS,),0.,tl.float32)
+            for r in tl.static_range(R):
+                w=tl.load(B+ids*R+r,start+s<count,other=0)
+                u=tl.load(U+row*R+r)
+                dot=dot+w*u
+            raw=tl.load(Z+row//C*ZS0+row%C*ZS1+ids*ZS2,start+s<count,other=0).to(tl.float32)
+            tl.store(SCORES+row*V+ids,raw+dot,start+s<count)
+        if ROOT:
+            if row==0:tl.atomic_add(COUNTERS+13,1.)
+
+@triton.jit
+def _dense_gemm(Z,U,B,COUNT,SCORES,COUNTERS,ZS0,ZS1,ZS2,
+                N:tl.constexpr,C:tl.constexpr,V:tl.constexpr,R:tl.constexpr,
+                THRESHOLD:tl.constexpr,MODE:tl.constexpr,ROOT:tl.constexpr,
+                BV:tl.constexpr,BC:tl.constexpr):
+    # Tiled rank GEMM U @ B.T; reuse each B tile across BC contexts.
+    # The explicit ordered FP32 multiply/add is IDENTICAL to sparse dot. No
+    # TF32/FMA/BLAS association drift is allowed merely to switch strategy.
+    tile,ct=tl.program_id(0),tl.program_id(1)
+    count=tl.load(COUNT)
+    use_dense=(MODE==1)|((MODE==2)&(count>=THRESHOLD))
+    if use_dense:
+        row=ct*BC+tl.arange(0,BC);v=tile*BV+tl.arange(0,BV)
+        dot=tl.full((BC,BV),0.,tl.float32)
+        for r in tl.static_range(R):
+            u=tl.load(U+row*R+r,row<N,other=0)
+            w=tl.load(B+v*R+r,v<V,other=0)
+            dot=dot+u[:,None]*w[None,:]
+        raw=tl.load(Z+(row//C)[:,None]*ZS0+(row%C)[:,None]*ZS1+v[None,:]*ZS2,
+                    (row[:,None]<N)&(v[None,:]<V),other=0).to(tl.float32)
+        tl.store(SCORES+row[:,None]*V+v[None,:],raw+dot,(row[:,None]<N)&(v[None,:]<V))
+        if ROOT:
+            if (tile==0)&(ct==0):tl.atomic_add(COUNTERS+14,1.)
+
 @triton.jit(do_not_specialize=['ENABLED'])
-def _raw_scan(Z,BITS,MAX,SUM,VALUES,IDS,ZS0,ZS1,ZS2,C:tl.constexpr,V:tl.constexpr,
-              K:tl.constexpr,TILES:tl.constexpr,BV:tl.constexpr,ENABLED):
+def _corrected_scan(Z,SCORES,BITS,MAX,SUM,VALUES,IDS,ZS0,ZS1,ZS2,
+                     C:tl.constexpr,V:tl.constexpr,K:tl.constexpr,TILES:tl.constexpr,
+                     BV:tl.constexpr,ENABLED):
     tile,context,batch=tl.program_id(0),tl.program_id(1),tl.program_id(2).to(tl.int64)
     v=tile*BV+tl.arange(0,BV)
-    z=tl.load(Z+batch*ZS0+context*ZS1+v*ZS2,v<V,other=0).to(tl.float32)
-    live=v<V
+    raw=tl.load(Z+batch*ZS0+context*ZS1+v*ZS2,v<V,other=0).to(tl.float32)
     if ENABLED:
         bits=tl.load(BITS+v//32,v<V,other=0)
-        live=live&(((bits>>(v%32))&1)==0)
-    z=tl.where(live,z,-float('inf'))
+        active=(v<V)&(((bits>>(v%32))&1)!=0)
+        corrected=tl.load(SCORES+(batch*C+context)*V+v,active,other=0)
+        raw=tl.where(active,corrected,raw)
+    z=tl.where(v<V,raw,-float('inf'));live=v<V
     maximum=tl.max(z,axis=0)
-    total=tl.sum(tl.where(live,tl.exp(z-tl.where(maximum>-float('inf'),maximum,0.)),0.),axis=0)
+    total=tl.sum(tl.where(live,tl.exp(z-maximum),0.),axis=0)
     offset=(batch*C+context)*TILES+tile
     tl.store(MAX+offset,maximum);tl.store(SUM+offset,total)
-    if tile==0:
-        tail=(batch*C+context)*TILES+TILES-1
-        local=tl.arange(0,BV)
-        tl.store(MAX+tail,-float('inf'));tl.store(SUM+tail,0.)
-        tl.store(VALUES+tail*K+local,-float('inf'),local<K)
-        tl.store(IDS+tail*K+local,V,local<K)
     for j in range(K):
-        score=tl.max(z,axis=0)
-        token=tl.min(tl.where((z==score)&live,v,V),axis=0)
+        score=tl.max(z,axis=0);token=tl.min(tl.where((z==score)&live,v,V),axis=0)
         tl.store(VALUES+offset*K+j,score);tl.store(IDS+offset*K+j,token)
         z=tl.where(v==token,-float('inf'),z);live=live&(v!=token)
 
+def prepare_scores(logits,u,state,root=False):
+    b,c,v=logits.shape
+    threshold=state.proposal_threshold(b,c)
+    mode={'sparse':0,'dense':1,'adaptive':2}[state.proposal_mode]
+    if mode in (0,2):
+        _sparse_scores[(b*c,)](logits,u,state.B_fast,state.active_ids,state.active_count,state.score_workspace,
+            state.counters,*logits.stride(),c,v,state.rank,threshold,mode,root,128,
+            num_warps=4,enable_fp_fusion=False)
+    if mode in (1,2):
+        _dense_gemm[(triton.cdiv(v,128),triton.cdiv(b*c,4))](logits,u,state.B_fast,state.active_count,
+            state.score_workspace,state.counters,*logits.stride(),b*c,c,v,state.rank,threshold,mode,root,128,4,
+            num_warps=4,enable_fp_fusion=False)
 
-@triton.jit
-def _active_scan(Z,U,B,ACTIVE,COUNT,MAX,SUM,VALUES,IDS,ZS0,ZS1,ZS2,
-                 C:tl.constexpr,V:tl.constexpr,R:tl.constexpr,K:tl.constexpr,
-                 TILES:tl.constexpr,BS:tl.constexpr,BR:tl.constexpr):
-    context,batch=tl.program_id(0),tl.program_id(1).to(tl.int64)
-    count=tl.load(COUNT)
-    s,r=tl.arange(0,BS),tl.arange(0,BR)
-    u=tl.load(U+(batch*C+context)*R+r,r<R,other=0)
-    best=tl.full((BS,),-float('inf'),tl.float32);best_ids=tl.full((BS,),V,tl.int32)
-    maximum=tl.full((),-float('inf'),tl.float32);total=tl.full((),0.,tl.float32)
-    # Runtime loop S: no inactive token loads B[r] or performs an r-dot.
-    for start in range(0,count,BS):
-        token=tl.load(ACTIVE+start+s,start+s<count,other=0).to(tl.int64)
-        weight=tl.load(B+token[:,None]*R+r[None,:],(start+s[:,None]<count)&(r[None,:]<R),other=0)
-        raw=tl.load(Z+batch*ZS0+context*ZS1+token*ZS2,start+s<count,other=0).to(tl.float32)
-        score=tl.where(start+s<count,raw+tl.sum(weight*u[None,:],axis=1),-float('inf'))
-        m=tl.max(score,axis=0);new_max=tl.maximum(maximum,m)
-        total=total*tl.exp(maximum-new_max)+tl.sum(tl.exp(score-new_max),axis=0)
-        maximum=new_max
-        combined=tl.join(best,score).reshape((2*BS,));ids=tl.join(best_ids,token.to(tl.int32)).reshape((2*BS,))
-        valid=tl.join(s<K,start+s<count).reshape((2*BS,))
-        best=tl.full((BS,),-float('inf'),tl.float32);best_ids=tl.full((BS,),V,tl.int32)
-        for j in range(K):
-            value=tl.max(combined,axis=0)
-            selected=tl.min(tl.where((combined==value)&valid,ids,V),axis=0)
-            best=tl.where(s==j,value,best);best_ids=tl.where(s==j,selected,best_ids)
-            combined=tl.where(ids==selected,-float('inf'),combined);valid=valid&(ids!=selected)
-    offset=(batch*C+context)*TILES+TILES-1
-    tl.store(MAX+offset,maximum);tl.store(SUM+offset,total)
-    tl.store(VALUES+offset*K+s,best,s<K);tl.store(IDS+offset*K+s,best_ids,s<K)
-
-
-def propose(logits,u,state,k,workspace,outputs,enabled):
-    b,c,v=logits.shape;tiles=triton.cdiv(v,256)+1
+def propose(logits,u,state,k,workspace,outputs,enabled,root=False):
+    b,c,v=logits.shape;tiles=triton.cdiv(v,256)
     maxima,sums,values,ids=[p[:b*c*tiles*(k if i>=2 else 1)] for i,p in enumerate(workspace)]
     out,indices,norm=outputs
-    _raw_scan[(tiles-1,c,b)](logits,state.bitmap,maxima,sums,values,ids,*logits.stride(),
-        c,v,k,tiles,256,enabled,num_warps=4,enable_fp_fusion=False)
     if enabled:
         ticket=state.begin('opd_proposal_extra_ms')
-        _active_scan[(c,b)](logits,u,state.B_fast,state.active_ids,state.active_count,
-            maxima,sums,values,ids,*logits.stride(),c,v,state.rank,k,tiles,128,
-            triton.next_power_of_2(state.rank),num_warps=4,enable_fp_fusion=False)
+        prepare_scores(logits,u,state,root)
         state.end(ticket)
+    elif root and state.enabled:
+        # Cold raw path has zero B. No correction preparation at all.
+        state.counters[13:14].add_(1)
+    _corrected_scan[(tiles,c,b)](logits,state.score_workspace,state.bitmap,maxima,sums,values,ids,
+        *logits.stride(),c,v,k,tiles,256,enabled,num_warps=4,enable_fp_fusion=False)
     _proposal_merge[(b*c,)](maxima,sums,values,ids,out,indices,norm,c,v,k,tiles,
         triton.next_power_of_2(tiles),triton.next_power_of_2(tiles*k),num_warps=4,enable_fp_fusion=False)
-
 
 @triton.jit
 def _cache_proposal(Q,IDS,NORM,QC,IC,NC,C:tl.constexpr,CACHE:tl.constexpr,
@@ -165,7 +185,8 @@ def _teacher_scan(TARGET,MAP,W,MAX,SUM,VALUES,IDS,TS0,TS1,TS2,
     else:p=tl.full((BV,),0.,tl.float32)
     offset=state*TILES+tile
     tl.store(MAX+offset,0.);tl.store(SUM+offset,tl.sum(p,axis=0))
-    score=tl.where(v<V,p,-float('inf'));live=v<V
+    live=(v<V)&(p>0)
+    score=tl.where(live,p,-float('inf'))
     for j in range(K):
         value=tl.max(score,axis=0);token=tl.min(tl.where((score==value)&live,v,V),axis=0)
         tl.store(VALUES+offset*K+j,value);tl.store(IDS+offset*K+j,token)
@@ -195,8 +216,9 @@ def _teacher_merge(SUM,VALUES,IDS,P,OUT_IDS,MASS,N:tl.constexpr,V:tl.constexpr,K
     ids=tl.load(IDS+state*TILES*K+candidate,candidate<TILES*K,other=V)
     for j in range(K):
         best=tl.max(value,axis=0);token=tl.min(tl.where(value==best,ids,V),axis=0)
-        tl.store(P+state*K+j,tl.where(valid_mass,tl.div_rn(best,tl.where(valid_mass,mass,1.)),0.))
-        tl.store(OUT_IDS+state*K+j,token)
+        positive=valid_mass&(best>0)&(token<V)
+        tl.store(P+state*K+j,tl.where(positive,tl.div_rn(best,tl.where(valid_mass,mass,1.)),0.))
+        tl.store(OUT_IDS+state*K+j,tl.where(positive,token,-1))
         value=tl.where(ids==token,-float('inf'),value)
 
 
@@ -211,7 +233,7 @@ def _selected_head(H,HEAD,BIAS,U,B,D_IDS,D_Q,T_IDS,NORM,W,MASS,CONTEXTS,OUT,
     k=tl.arange(0,BK);cached_ids=tl.load(D_IDS+(state//ROWS*CACHE+tl.maximum(context,0))*K+k,k<K,other=-1)
     matches=cached_ids==token;found=tl.sum(matches.to(tl.int32),axis=0)>0
     mass=tl.load(MASS+state)
-    if (weight>0)&(context>=0)&(mass>0)&(mass<float('inf')):
+    if (weight>0)&(context>=0)&(mass>0)&(mass<float('inf'))&(token>=0):
         if found:
             q=tl.sum(tl.where(matches,tl.load(D_Q+(state//ROWS*CACHE+context)*K+k,k<K,other=0),0.),axis=0)
         else:
@@ -247,7 +269,8 @@ def _union(TARGET,MAP,W,KIND,CONTEXTS,D_IDS,D_Q,T_IDS,T_P,T_Q,MASS,
     overlap=tl.sum((token[:,None]==draft_ids[None,:]).to(tl.int32),axis=1)>0
     mass=tl.load(MASS+state);weight=tl.load(W+state)
     good=(mass>0)&(mass<float('inf'))
-    valid=(j<2*K)&(first|~overlap)&(weight>0)&good
+    target_positive=(token>=0)&(tl.load(T_P+state*K+kk,j<2*K,other=0)>0)
+    valid=(j<2*K)&(first|(~overlap&target_positive))&(weight>0)&good
     target_id=tl.load(MAP+tl.maximum(token,0),j<2*K,other=0)
     if GREEDY:
         p=(target_id==tl.load(TARGET+state//ROWS*TS0+state%ROWS*TS1)).to(tl.float32)
@@ -331,6 +354,22 @@ def _round_end(B,BITS,ACTIVE,COUNT,WEIGHT,COUNTERS,R:tl.constexpr,
     tl.atomic_add(COUNTERS+11,1.)
 
 
+@triton.jit
+def _projector_terms(IDS,G,HEAD,B,CONTEXTS,H_OUT,V_OUT,
+                      ROWS:tl.constexpr,CACHE:tl.constexpr,K:tl.constexpr,HIDDEN:tl.constexpr,
+                      R:tl.constexpr,BU:tl.constexpr,BH:tl.constexpr,BR:tl.constexpr):
+    state=tl.program_id(0).to(tl.int64)
+    j,r,h=tl.arange(0,BU),tl.arange(0,BR),tl.arange(0,BH)
+    ids=tl.load(IDS+state*2*K+j,j<2*K,other=-1)
+    g=tl.load(G+state*2*K+j,j<2*K,other=0)
+    b=tl.load(B+tl.maximum(ids[:,None],0)*R+r[None,:],(ids[:,None]>=0)&(j[:,None]<2*K)&(r[None,:]<R),other=0)
+    v=tl.sum(g[:,None]*b,axis=0)
+    context=tl.maximum(tl.load(CONTEXTS+state),0)
+    head=tl.load(HEAD+(state//ROWS*CACHE+context)*HIDDEN+h,h<HIDDEN,other=0).to(tl.float32)
+    tl.store(H_OUT+state*HIDDEN+h,head,h<HIDDEN)
+    tl.store(V_OUT+state*R+r,v,r<R)
+
+
 def feedback(state,tree,path,target,greedy=False):
     b,q=tree.parents.shape;n=b*q;k=state.topk;rank=state.rank
     weights=state.selected_weights[:n].view(b,q);kind=state.selected_kind[:n].view(b,q)
@@ -351,6 +390,15 @@ def feedback(state,tree,path,target,greedy=False):
         target.stride(0),target.stride(1),0 if greedy else target.stride(2),q,state.cache_contexts,state.vocab,k,10,
         triton.next_power_of_2(2*k),greedy,num_warps=4,enable_fp_fusion=False)
     _reduce[(10,)](state.state_stats,state.round_weight,state.counters,n,10,triton.next_power_of_2(n),num_warps=4)
+    if state.train_projector and state._ever_updated:
+        # B is STILL frozen B_t. No per-round backward/optimizer/DDP sync.
+        h=state.head.weight.shape[1]
+        _projector_terms[(n,)](state.union_ids,state.union_g,state.head_cache,state.B_fast,tree.feedback_contexts,
+            state.projector_head,state.projector_v,q,state.cache_contexts,k,h,rank,
+            triton.next_power_of_2(2*k),triton.next_power_of_2(h),triton.next_power_of_2(rank),num_warps=4,enable_fp_fusion=False)
+        torch.mm(state.projector_head[:n].t(),state.projector_v[:n],out=state.projector_delta)
+        state.model.opd_projector_grad_sum.add_(state.projector_delta)
+    if state.train_projector:state.model.opd_projector_grad_weight.add_(state.round_weight)
     state.end(ticket);ticket=state.begin('opd_update_ms')
     if state.fast_lr>0:
         _update[(n,)](state.union_ids,state.union_g,state.u_cache,tree.feedback_contexts,state.round_weight,

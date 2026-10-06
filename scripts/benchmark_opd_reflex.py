@@ -54,7 +54,7 @@ def collator(tokenizer,max_prompt_length):
 
 def release_runtime_cache(model):
     # Benchmark boundaries only. Don't charge a previous mode's retained pools.
-    for name in ('_opd_runtime_cache','_opd_tree_mask_workspace'):
+    for name in ('_opd_runtime_cache','_opd_tree_mask_workspace','_opd_padding_workspace','_opd_kv_scratch'):
         if hasattr(model,name):delattr(model,name)
 
 
@@ -76,7 +76,8 @@ def summarize(rows):
             'opd_active_token_rows':'opd_active_rows_sum'}[name]
         d=sum(r.get(denominator,0.) for r in rows)
         result[name]=sum(r.get(raw,0.) for r in rows)/d if d else None
-    for name in ('opd_selected_states','opd_visited_states','opd_frontier_states','opd_updates','opd_invalid_states'):
+    for name in ('opd_selected_states','opd_visited_states','opd_frontier_states','opd_updates','opd_invalid_states',
+                 'opd_proposal_mode_sparse_rounds','opd_proposal_mode_dense_rounds'):
         result[name]=sum(r.get(name,0.) for r in rows)
     result['opd_nonfinite_kl_states']=sum(r.get('opd_nonfinite_kl_states',0.) for r in rows)
     if result['opd_nonfinite_kl_states']:result['opd_kl']=None
@@ -132,8 +133,10 @@ def benchmark(args):
     try:
         off,c0=run('fastgrpo',0.,0,batches[0],args.seed_values[0])
         empty,c1=run('opd_reflex',0.,1,batches[0],args.seed_values[0])
-        if off['generated_token_ids']!=empty['generated_token_ids'] or c0!=c1:
-            raise AssertionError('zero-state identity/forward counts failed; discard benchmark')
+        # OPD Top16 ties may differ from historical TopK(draft_k), by explicit
+        # user choice. Never slow OPD merely to match historical candidates.
+        if c0['target']!=1+off['batch_verification_rounds'] or c1['target']!=1+empty['batch_verification_rounds']:
+            raise AssertionError('extra target forward; discard benchmark')
         for method,lr,stream in configurations:
             torch.cuda.synchronize();release_runtime_cache(model)
             # Warm exactly the measured seed/prompt schedule: compaction gives
@@ -186,12 +189,14 @@ def benchmark(args):
         goal_candidates=[x for x in reports[1:] if x['delta_aal']>0 and x['tokens_per_s']>=baseline['tokens_per_s']]
         recommendation=max(goal_candidates,key=lambda x:x['tokens_per_s']) if goal_candidates else None
         payload=dict(gpu=torch.cuda.get_device_name(),torch=torch.__version__,config=vars(args),
-            zero_state_identity=True,reports=reports,
+            gpu_utilization=None,gpu_utilization_note='No sampling profiler installed; not inferred from throughput',
+            baseline='historical native torch.topk(draft_k), c3f05ad OFF',
+            cold_invariant='B=0 leaves raw logits/distribution unchanged; Top16 tie IDs need not equal historical K',reports=reports,
             fastest_observed=dict(method=best['method'],fast_lr=best['fast_lr'],update_stream=best['update_stream'],
                 delta_aal=best['delta_aal'],tokens_per_s=best['tokens_per_s']),
             recommendation=None if recommendation is None else dict(fast_lr=recommendation['fast_lr'],
                 update_stream=recommendation['update_stream'],delta_aal=recommendation['delta_aal']),
-            note='Frozen policy/draft; both methods share fused Top16 engine. Wall includes ALL OPD work. Separate profiling replay excluded from generation wall. Same seed does not imply same generated responses. No full training/native-B200 claim from a microbenchmark.')
+            note='Historical FastGRPO unchanged, OPD only optimized. Frozen policy/draft/A; no A gradient accumulation in evaluation. Wall includes ALL OPD work. Profiling replay excluded from generation wall. Same seed does not imply same responses.')
         return payload
     finally:target_hook.remove();draft_hook.remove()
 

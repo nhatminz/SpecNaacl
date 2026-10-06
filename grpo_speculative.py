@@ -184,6 +184,14 @@ def save_training_checkpoint(
         "rng": capture_rng_state(),
         "cumulative_elapsed_time_s": float(cumulative_elapsed_time_s),
     }
+    # Pending analytical gradients are rank-local until the existing optimizer
+    # boundary. Never restore rank 0's pending feedback into every rollout worker.
+    for key, attribute in (
+        ('opd_projector_pending_sum', 'opd_projector_grad_sum'),
+        ('opd_projector_pending_weight', 'opd_projector_grad_weight'),
+    ):
+        value = getattr(model, attribute, None)
+        local_state[key] = None if value is None else value.detach().cpu().clone()
     if dist.is_initialized():
         rank_states = [None] * current_world_size
         dist.all_gather_object(rank_states, local_state)
@@ -193,7 +201,7 @@ def save_training_checkpoint(
         return None
     checkpoint_dir = Path(checkpoint_dir)
     state = {
-        "format": "opd_fastgrpo_checkpoint_v4",
+        "format": "opd_fastgrpo_checkpoint_v5",
         "world_size": int(current_world_size),
         "rank_states": rank_states,
         "cumulative_elapsed_time_s": max(
@@ -208,6 +216,8 @@ def save_training_checkpoint(
         "target_lora": _target_lora_state_dict(model.target_model),
         "draft_model": model.draft_model.state_dict(),
         "opd_projector": getattr(model,"opd_projector",None),
+        "opd_projector_pending_sum": getattr(model,'opd_projector_grad_sum',None),
+        "opd_projector_pending_weight": getattr(model,'opd_projector_grad_weight',None),
         "method": getattr(model,"_training_method","fastgrpo"),
         "optimizer_target": optimizer_target.state_dict(),
         "optimizer_draft": optimizer_draft.state_dict(),
@@ -250,8 +260,20 @@ def load_training_checkpoint(path, *, model, optimizer_target, optimizer_draft):
         }
     if checkpoint.get("method","fastgrpo")!=getattr(model,"_training_method","fastgrpo"):
         raise ValueError("resume method mismatch; start a new run for replacement OPD")
+    if hasattr(model, 'opd_projector') and 'opd_projector' not in checkpoint['draft_model']:
+        raise ValueError(
+            'resume checkpoint predates the learned draft projector; start a new '
+            'run using its draft weights as initialization, not optimizer resume'
+        )
     model.draft_model.load_state_dict(checkpoint["draft_model"])
     if checkpoint.get("opd_projector") is not None:model.load_opd_projector(checkpoint["opd_projector"])
+    for key, attribute in (
+        ('opd_projector_pending_sum', 'opd_projector_grad_sum'),
+        ('opd_projector_pending_weight', 'opd_projector_grad_weight'),
+    ):
+        value = local_state.get(key, checkpoint.get(key))
+        if value is not None:
+            getattr(model, attribute).copy_(value)
     _load_target_lora_state_dict(model.target_model, checkpoint["target_lora"])
     optimizer_target.load_state_dict(checkpoint["optimizer_target"])
     optimizer_draft.load_state_dict(checkpoint["optimizer_draft"])
@@ -288,6 +310,7 @@ parser.add_argument('--opd_update_stream',default='0',choices=['0','1'])
 parser.add_argument('--opd_profile',default='0',choices=['0','1'])
 parser.add_argument('--opd_diagnostics',default='0',choices=['0','1'])
 parser.add_argument('--opd_backend',default='triton',choices=['auto','torch','triton'])
+parser.add_argument('--opd_train_projector',default='1',choices=['0','1'])
 parser.add_argument('--draft_train_mode', default='batched', choices=['batched', 'per_response'])
 parser.add_argument('--draft_train_max_batch_size', type=int, default=8)
 parser.add_argument('--draft_train_max_tokens', type=int, default=2048)
@@ -526,8 +549,10 @@ opd_kwargs={"method":method,"opd_rank":args.opd_rank,"opd_topk":args.opd_topk,
     "opd_fast_lr":args.opd_fast_lr,"opd_visited_weight":args.opd_visited_weight,
     "opd_frontier_weight":args.opd_frontier_weight,"opd_update_stream":_as_bool(args.opd_update_stream),
     "opd_profile":_as_bool(args.opd_profile),"opd_diagnostics":_as_bool(args.opd_diagnostics),
-    "opd_backend":args.opd_backend,"kv_gather_strategy":args.kv_gather_strategy}
+    "opd_backend":args.opd_backend,"kv_gather_strategy":args.kv_gather_strategy,
+    "opd_train_projector":_as_bool(args.opd_train_projector) and is_train_draft}
 effective_opd_backend = 'off'
+opd_eval_kwargs=dict(opd_kwargs,opd_train_projector=False)
 reset_rng_on_resume = _as_bool(args.reset_rng_on_resume)
 _seed_everything(trace_seed)
 max_grpo_steps = max(0, int(args.max_grpo_steps))
@@ -710,6 +735,10 @@ for param in model.lm_head.parameters():
     param.requires_grad=False
 for param in model.embed_tokens.parameters():
     param.requires_grad=False
+if hasattr(model, 'opd_projector'):
+    model.opd_projector.requires_grad_(
+        method == 'opd_reflex' and _as_bool(args.opd_train_projector) and is_train_draft
+    )
     
 
 lora_config = LoraConfig(
@@ -1625,7 +1654,7 @@ def _evaluate_analysis_branch(branch_name, draft_state, eval_batch, policy_step)
                 draft_token_length_c=draft_token_length_c,
                 return_all_draft_input=False,
                 statistical_time=False,
-                **opd_kwargs,
+                **opd_eval_kwargs,
             )
         for response_index, (accepted, rounds, generated) in enumerate(zip(
             result['response_accepted_length_sum'],
@@ -1816,6 +1845,8 @@ for epoch in epoch_bar:
             batch_data['draft_sparse_count'] += int(draft_sparse_count)
             draft_accumulated_step += 1
             if is_train_draft and draft_accumulated_step % draft_accumulation_steps == 0:
+                if method=='opd_reflex' and _as_bool(args.opd_train_projector):
+                    model.apply_opd_projector_gradient()
                 _sync_gradients(model.draft_model)
                 if _as_bool(args.draft_train_profile):
                     optimizer_profile_start = torch.cuda.Event(enable_timing=True)
@@ -2166,7 +2197,7 @@ for epoch in epoch_bar:
                         draft_token_length_c=draft_token_length_c,
                         return_all_draft_input=True,
                         statistical_time=False,
-                        **opd_kwargs,
+                        **opd_eval_kwargs,
                     )
                 old_available = sum(
                     max(int(ids.shape[-1]) - int(analysis_train_attention_mask[idx // repeated_generate_nums].sum()) - 1, 0)

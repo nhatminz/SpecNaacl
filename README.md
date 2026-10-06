@@ -1,31 +1,28 @@
-# SpecNaacl — FastGRPO vs OPD Reflex
+# SpecNaacl: historical FastGRPO vs learned OPD Reflex
 
-Current methods only: `METHOD=fastgrpo` and `METHOD=opd_reflex`.
-LK Reflex has been retired. Per-model ordinary launchers select OPD; suffix
-`_fastgrpo.sh` selects the fair in-repository baseline.
+METHOD=fastgrpo dispatches to historical OFF c3f05ad: native FP32 softmax and
+torch.topk EXACT draft_k, original Python tree/verifier/RNG/KV path. It NEVER
+calls OPD's Top16 or optimized scheduler/cache. Baseline is not optimized.
 
-Both methods share the same EAGLE-3, compact vocabulary, fused Top16 proposal
-engine, tree construction, target sampler/verifier, GRPO loss/rewards, real
-SpecForge online draft loss/update schedule, checkpoint and step telemetry.
-OPD alone adds a fixed checkpoint-persistent rank-8 projector and one shared
-rollout-local fast adapter, learning from visited/expanded one-hop frontier
-states with existing verification probabilities. No extra transformer forward.
+METHOD=opd_reflex always uses fused Top16, including B=0/cold. It uses the
+post-norm/head input, persistent LEARNED rank8 A, one shared rollout-local B.
+A gradients accumulate GPU-only and apply at existing draft optimizer boundaries.
+B resets each rollout. No extra target/draft transformer forward/backward per round.
 
-Default dataset is simplelr, target/draft LR1e-5, batch8, accumulation4,
-responses8, draft microbatch token budget2048, log1. OPD LR0.01 is configurable,
-TopK16/rank8, profiling/diagnostics OFF. Stream0 is UNTUNED conservative default:
-benchmark0/1 on your B200 before claiming which is faster.
+Per user decision, Top16[:draft_k] ties may differ from historical K. Cold
+corrected logits equal raw logits; probabilities still normalize the same full
+compact distribution (FP32 reduction tolerance), no temperature/sampling change.
+No slow identity fallback in OPD.
 
-Important exactness boundary: CUDA's shared fused engine uses a deterministic
-low-token-ID tie rule and its FP32 reduction. It is NOT asserted bitwise identical
-to historical Torch topk/softmax on ties. OFF and zero-state OPD in THIS same
-backend are bitwise tested including tree/verifier/tokens/RNG/counts. CPU oracle
-retains legacy Torch's K-dependent tie rule (a debug-only additional topk);
-it is not a production timing baseline.
+Exact sparse/dense strategy uses canonical FP32 rank GEMM and identical scan/
+normalization; bitwise switch parity tested. OPD_PROPOSAL_MODE=sparse is safe
+UNTUNED default. Adaptive requires measured GPU/compiler/hash/shape profile.
+Historical path is never changed by OPD strategy selection.
 
-Read [huongdanchay.md](huongdanchay.md), [METHOD_OPD_REFLEX.md](METHOD_OPD_REFLEX.md)
-and [IMPLEMENTATION_REPORT.md](IMPLEMENTATION_REPORT.md).
-No model/data/checkpoint paths or dependency pins have been replaced. The
-existing SpecForge architecture, feature capture and training-time unrolling are
-unchanged (vendored commit3cb0510f0bd0e8c195ac6e9c5c62f6b50580ff83).
-No pretrained assets/B200 measurements are invented.
+OPD-only GPU pad masks/position IDs, one fixed scheduling packet per round and
+in-place suffix KV compaction. One host boundary remains necessary for exact
+HF crop/active batch/RNG behavior. No claim of zero host sync in entire decoder.
+
+Commands: huongdanchay.md. Algorithm/metric details: METHOD_OPD_REFLEX.md.
+Validation/performance caveats: IMPLEMENTATION_REPORT.md. No B200/full-model
+AAL/throughput improvement claimed without real checkpoint measurements.
