@@ -1,0 +1,116 @@
+"""Shared unchanged GPU tree verifier/padding and exact top-k merge."""
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _proposal_merge(MAX, SUM, VALUES, IDS, PROBS, TOP_IDS, NORM,
+                    CONTEXTS: tl.constexpr, VOCAB: tl.constexpr, K: tl.constexpr,
+                    TILES: tl.constexpr, BT: tl.constexpr, BK: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    t = tl.arange(0, BT)
+    maxima = tl.load(MAX + row * TILES + t, t < TILES, other=-float('inf'))
+    maximum = tl.max(maxima, axis=0)
+    sums = tl.load(SUM + row * TILES + t, t < TILES, other=0)
+    total = tl.sum(sums * tl.exp(maxima - maximum), axis=0)
+    tl.store(NORM + row * 2, maximum)
+    tl.store(NORM + row * 2 + 1, total)
+    candidates = tl.arange(0, BK)
+    values = tl.load(VALUES + row * TILES * K + candidates, candidates < TILES * K, other=-float('inf'))
+    ids = tl.load(IDS + row * TILES * K + candidates, candidates < TILES * K, other=VOCAB)
+    for k in range(K):
+        value = tl.max(values, axis=0)
+        index = tl.min(tl.where(values == value, ids, VOCAB), axis=0)
+        tl.store(PROBS + row * K + k, tl.div_rn(tl.exp(value - maximum), total))
+        tl.store(TOP_IDS + row * K + k, index)
+        values = tl.where(ids == index, -float('inf'), values)
+
+@triton.jit
+def _trace_path(PARENTS, TOKENS, CONTEXTS, SAMPLES, OUT_T, OUT_I, OUT_C, LENGTHS,
+                ROWS: tl.constexpr, WIDTH: tl.constexpr, EOS: tl.constexpr,
+                OS0, OS1, BR: tl.constexpr):
+    batch = tl.program_id(0).to(tl.int64)
+    candidates = tl.arange(0, BR)
+    parents = tl.load(PARENTS + batch * ROWS + candidates, candidates < ROWS, other=-2)
+    tokens = tl.load(TOKENS + batch * ROWS + candidates, candidates < ROWS, other=-1)
+    current = tl.full((), 0, tl.int32)
+    live, length = current == 0, current
+    for j in range(WIDTH):
+        token = tl.load(SAMPLES + batch * ROWS + current)
+        context = tl.load(CONTEXTS + batch * ROWS + current)
+        tl.store(OUT_T + batch * OS0 + j * OS1, tl.where(live, token, -1))
+        tl.store(OUT_I + batch * OS0 + j * OS1, tl.where(live, current, -1))
+        tl.store(OUT_C + batch * OS0 + j * OS1, tl.where(live, context, -1))
+        length = length + live.to(tl.int32)
+        matches = (parents == current) & (tokens == token) & (candidates > 0) & (candidates < ROWS)
+        found = tl.min(tl.where(matches & live & (token != EOS), candidates, ROWS), axis=0)
+        live = live & (found < ROWS) & (token != EOS)
+        current = tl.minimum(found, ROWS - 1)
+    tl.store(LENGTHS + batch, length)
+
+def trace_path(tree, samples, eos, tokens, indices, contexts, lengths):
+    batch, rows = samples.shape
+    _trace_path[(batch,)](tree.parents, tree.tokens, tree.feedback_contexts, samples,
+        tokens, indices, contexts, lengths, rows, tokens.shape[1], int(eos), *tokens.stride(),
+        triton.next_power_of_2(rows), num_warps=4)
+
+@triton.jit
+def _pad_verified_path(TOKENS, INDICES, LENGTHS, OUT_TOKENS, OUT_INDICES, OUT_MASK, LAST,
+                       CAPACITY: tl.constexpr, WIDTH: tl.constexpr, PAST: tl.constexpr,
+                       EOS: tl.constexpr, TS0, TS1, IS0, IS1, OS0, OS1, BW: tl.constexpr):
+    batch = tl.program_id(0).to(tl.int64)
+    slot = tl.arange(0, BW)
+    length = tl.load(LENGTHS + batch)
+    index = tl.load(INDICES + batch * IS0 + slot * IS1, slot < CAPACITY, other=-1)
+    valid = slot < length
+    budget = WIDTH - length
+    before = tl.minimum(tl.maximum(index - slot, 0), budget)
+    destination = slot + before
+    candidates = tl.where((destination[None, :] == slot[:, None]) & valid[None, :],
+                          tl.broadcast_to(slot[None, :], (BW, BW)), BW)
+    source = tl.min(candidates, axis=1)
+    accepted = source < BW
+    safe_source = tl.minimum(source, CAPACITY - 1)
+    token = tl.load(TOKENS + batch * TS0 + safe_source * TS1, accepted & (slot < WIDTH), other=EOS)
+    chosen = tl.load(INDICES + batch * IS0 + safe_source * IS1, accepted & (slot < WIDTH), other=0)
+    tl.store(OUT_TOKENS + batch * OS0 + slot * OS1, tl.where(accepted, token, EOS), slot < WIDTH)
+    tl.store(OUT_INDICES + batch * OS0 + slot * OS1,
+             tl.where(accepted, chosen + PAST, slot + PAST), slot < WIDTH)
+    tl.store(OUT_MASK + batch * OS0 + slot * OS1, ~accepted, slot < WIDTH)
+    tl.store(LAST + batch, tl.max(tl.where(valid, destination, -1), axis=0))
+
+def pad_verified_path(path, past_length, width, eos_token_id, workspace=None):
+    batch, capacity = path.tokens.shape
+    if workspace is None:
+        tokens = torch.empty((batch, width), device=path.tokens.device, dtype=torch.long)
+        indices = torch.empty_like(tokens)
+        mask = torch.empty((batch, width), device=path.tokens.device, dtype=torch.bool)
+        last = torch.empty((batch, 1), device=path.tokens.device, dtype=torch.long)
+    else:
+        tokens, indices, mask = [buffer[:batch, :width] for buffer in workspace[:3]]
+        last = workspace[3][:batch, :1]
+    _pad_verified_path[(batch,)](path.tokens, path.packed_indices, path.lengths,
+        tokens, indices, mask, last, capacity, width, int(past_length), int(eos_token_id),
+        *path.tokens.stride(), *path.packed_indices.stride(), *tokens.stride(),
+        triton.next_power_of_2(capacity),
+        num_warps=4)
+    return tokens, indices, mask, last
+
+@triton.jit
+def _tree_mask(PARENTS, MASK, ROWS: tl.constexpr, PAST: tl.constexpr,
+               WIDTH: tl.constexpr, MINIMUM: tl.constexpr, BK: tl.constexpr):
+    row, batch = tl.program_id(0), tl.program_id(1).to(tl.int64)
+    columns = tl.arange(0, BK)
+    visible = columns <= PAST  # prefix and root are shared by every query
+    current = row.to(tl.int64)  # parent loads are int64; stable loop-carried dtype
+    for depth in range(WIDTH):
+        visible = visible | ((current >= 0) & (columns == PAST + current))
+        current = tl.load(PARENTS + batch * ROWS + tl.maximum(current, 0))
+    tl.store(MASK + (batch * ROWS + row) * (PAST + ROWS) + columns,
+             tl.where(visible, 0., MINIMUM), columns < PAST + ROWS)
+
+def tree_mask(tree, past_length, mask):
+    batch, rows = tree.parents.shape
+    _tree_mask[(rows, batch)](tree.parents, mask, rows, past_length, tree.max_depth + 1,
+                             torch.finfo(mask.dtype).min, triton.next_power_of_2(past_length + rows), num_warps=4)
+

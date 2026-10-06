@@ -50,8 +50,6 @@ def sample_target_from_logits(
     top_p,
     top_k,
     eos_token_id,
-    reflex=None,
-    compact_to_target=None,
 ):
     """Sample once from existing logits and reuse the same probs for Reflex.
 
@@ -68,11 +66,4 @@ def sample_target_from_logits(
         probs = None
     else:
         raise ValueError('"do_sample" must be True or False')
-    if reflex is not None:
-        if compact_to_target is None:
-            raise ValueError("compact_to_target is required for Reflex supervision")
-        if probs is None:
-            reflex.update_from_target_tokens(tokens[:, 0], compact_to_target)
-        else:
-            reflex.update_from_target_probs(probs[:, 0, :], compact_to_target)
     return tokens, probs

@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from helper.rollout_history import RolloutHistory
-from test_reflex_rollout import TinyModel, load_rollout
+from opd_fixtures import TinyModel, load_rollout
 
 
 class ConcatHistoryReference:
@@ -81,7 +81,7 @@ def test_append_preserves_data_across_capacity_growth_and_row_finish():
     assert all(buffer is None for buffer in history.buffers['features'])
 
 
-@pytest.mark.parametrize('mode', ['off', 'active'])
+@pytest.mark.parametrize('mode', ['fastgrpo', 'opd_reflex'])
 @pytest.mark.parametrize('sample', [False, True])
 @pytest.mark.parametrize('collect', [False, True])
 def test_full_rollout_matches_concat_history(mode, sample, collect, monkeypatch):
@@ -100,7 +100,7 @@ def test_full_rollout_matches_concat_history(mode, sample, collect, monkeypatch)
                 do_sample=sample, repeated_generate_nums=8, max_length=22,
                 verification_capacity=80, max_verification_num=16, max_draft_k=3,
                 max_draft_token_length=3, min_draft_token_length=2,
-                reflex_mode=mode, reflex_backend='torch', reflex_lr=.05,
+                method=mode, opd_backend='auto', opd_fast_lr=.05,
                 return_all_draft_input=collect)
         records.append((result, model.calls, model.masks))
     old, new = records
@@ -173,13 +173,13 @@ def test_cuda_triton_root_stream_preserves_collected_history(monkeypatch):
                 do_sample=True, repeated_generate_nums=8, max_length=22,
                 verification_capacity=80, max_verification_num=16, max_draft_k=3,
                 max_draft_token_length=3, min_draft_token_length=2,
-                reflex_mode='active', reflex_backend='triton', reflex_lr=.05,
-                reflex_feedback_scope='root', reflex_update_stream=True,
+                method='opd_reflex', opd_backend='triton', opd_fast_lr=.05,
+                opd_update_stream=True,
                 return_all_draft_input=True)
         records.append((output, model.calls))
     old, new = records
     assert old[1] == new[1]
-    assert new[0]['reflex_update_stream'] is True
+    assert new[0]['opd_updates']>0
     for key in ('generated_token_ids', 'response_accepted_length_sum', 'response_verification_rounds'):
         assert old[0][key] == new[0][key]
     for key in ('all_draft_input_states', 'all_target_hidden_states', 'all_draft_input_ids'):

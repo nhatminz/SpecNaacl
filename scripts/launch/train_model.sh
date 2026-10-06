@@ -10,9 +10,8 @@ source "$COMMON_ENV"
 source "$MODEL_ENV"
 : "${MODEL:?MODEL is required}"
 case "$METHOD" in
-  fastgrpo) REFLEX_MODE="off" ;;
-  specnaacl) REFLEX_MODE="active" ;;
-  *) echo "ERROR: METHOD must be fastgrpo or specnaacl, got: $METHOD" >&2; exit 2 ;;
+  fastgrpo|opd_reflex) ;;
+  *) echo "ERROR: METHOD must be fastgrpo or opd_reflex, got: $METHOD" >&2; exit 2 ;;
 esac
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
@@ -52,7 +51,7 @@ RUN_NAME="${RUN_NAME:-${MODEL_KEY}__${DATASET}__method-${METHOD}__seed${TRAIN_SU
 RUN_DIR="${RUN_DIR:-$TRAIN_MODEL_ROOT/$RUN_NAME}"
 if [[ "$RESUME" == "auto" && -z "$REQUESTED_RUN_DIR" && -e "$TRAIN_MODEL_ROOT/active_run" ]]; then
   active_run="$(readlink -f "$TRAIN_MODEL_ROOT/active_run")"
-  if [[ -f "$active_run/checkpoints/resume/latest.pt" && ! -f "$active_run/summary.json" ]]; then
+  if [[ "$(basename "$active_run")" == *"method-${METHOD}"* && -f "$active_run/checkpoints/resume/latest.pt" && ! -f "$active_run/summary.json" ]]; then
     RUN_DIR="$active_run"
     RUN_NAME="$(basename "$RUN_DIR")"
   fi
@@ -122,20 +121,11 @@ cmd=(
   --statistical_time "$STATISTICAL_TIME"
   --num_workers "$NUM_WORKERS"
   --persistent_workers "$PERSISTENT_WORKERS"
-  --reflex_mode "$REFLEX_MODE"
-  --reflex_feature_dim "$REFLEX_FEATURE_DIM"
-  --reflex_lr "$REFLEX_LR"
-  --reflex_weight_decay "$REFLEX_WEIGHT_DECAY"
-  --reflex_seed "$REFLEX_SEED"
-  --reflex_feedback_scope "$REFLEX_FEEDBACK_SCOPE"
-  --reflex_profile "$REFLEX_PROFILE"
-  --reflex_diagnostics "$REFLEX_DIAGNOSTICS"
-  --reflex_backend "$REFLEX_BACKEND"
-  --reflex_proposal_strategy "${REFLEX_PROPOSAL_STRATEGY:-fused}"
-  --reflex_correction_strategy "${REFLEX_CORRECTION_STRATEGY:-serial}"
-  --reflex_feedback_strategy "${REFLEX_FEEDBACK_STRATEGY:-serial}"
-  --reflex_feature_strategy "${REFLEX_FEATURE_STRATEGY:-auto}"
-  --reflex_update_stream "$REFLEX_UPDATE_STREAM"
+  --opd_rank "$OPD_RANK" --opd_topk "$OPD_TOPK"
+  --opd_fast_lr "$OPD_FAST_LR"
+  --opd_visited_weight "$OPD_VISITED_WEIGHT" --opd_frontier_weight "$OPD_FRONTIER_WEIGHT"
+  --opd_update_stream "$OPD_UPDATE_STREAM" --opd_backend "$OPD_BACKEND"
+  --opd_profile "$OPD_PROFILE" --opd_diagnostics "$OPD_DIAGNOSTICS"
   --kv_gather_strategy "${KV_GATHER_STRATEGY:-stacked}"
   --log_interval "$LOG_INTERVAL"
   --log_file "$LOG_DIR/metrics.jsonl"
@@ -152,8 +142,8 @@ cmd=(
 )
 if (($#)); then cmd+=("$@"); fi
 
-printf 'Run name : %s\nRun dir  : %s\nModel    : %s\nDataset  : %s\nDraft    : %s\nMethod   : %s\nReflex   : %s\nGPUs     : %s\n' \
-  "$RUN_NAME" "$RUN_DIR" "$MODEL" "$DATASET_PATH" "$DRAFT_CHECKPOINT" "$METHOD" "$REFLEX_MODE" "$NPROC_PER_NODE"
+printf 'Run name : %s\nRun dir  : %s\nModel    : %s\nDataset  : %s\nDraft    : %s\nMethod   : %s\nEngine   : %s\nGPUs     : %s\n' \
+  "$RUN_NAME" "$RUN_DIR" "$MODEL" "$DATASET_PATH" "$DRAFT_CHECKPOINT" "$METHOD" "$METHOD" "$NPROC_PER_NODE"
 printf 'Command  :'; printf ' %q' "${cmd[@]}"; printf '\n'
 if [[ "${DRY_RUN:-false}" == "true" ]]; then return 0 2>/dev/null || exit 0; fi
 
@@ -188,15 +178,11 @@ ln -sfn "$RUN_DIR" "$TRAIN_MODEL_ROOT/active_run"
   --item "top_p=$TOP_P" --item "max_length=$GEN_MAX_LENGTH" \
   --item "max_prompt_length=$MAX_PROMPT_LENGTH" --item "num_epochs=$NUM_EPOCHS" \
   --item "resume_checkpoint=$RESUME_CHECKPOINT" --item "method=$METHOD" \
-  --item "reflex_mode=$REFLEX_MODE" --item "reflex_diagnostics=$REFLEX_DIAGNOSTICS" \
-  --item "reflex_feature_dim=$REFLEX_FEATURE_DIM" --item "reflex_lr=$REFLEX_LR" \
-  --item "reflex_weight_decay=$REFLEX_WEIGHT_DECAY" --item "reflex_backend=$REFLEX_BACKEND" \
-  --item "reflex_feedback_scope=$REFLEX_FEEDBACK_SCOPE" \
-  --item "reflex_proposal_strategy=${REFLEX_PROPOSAL_STRATEGY:-fused}" \
-  --item "reflex_correction_strategy=${REFLEX_CORRECTION_STRATEGY:-serial}" \
-  --item "reflex_feedback_strategy=${REFLEX_FEEDBACK_STRATEGY:-serial}" \
-  --item "reflex_feature_strategy=${REFLEX_FEATURE_STRATEGY:-auto}" \
-  --item "reflex_update_stream=$REFLEX_UPDATE_STREAM" \
+  --item "opd_rank=$OPD_RANK" --item "opd_topk=$OPD_TOPK" \
+  --item "opd_fast_lr=$OPD_FAST_LR" --item "opd_update_stream=$OPD_UPDATE_STREAM" \
+  --item "opd_visited_weight=$OPD_VISITED_WEIGHT" --item "opd_frontier_weight=$OPD_FRONTIER_WEIGHT" \
+  --item "opd_profile=$OPD_PROFILE" --item "opd_diagnostics=$OPD_DIAGNOSTICS" \
+  --item "opd_backend=$OPD_BACKEND" \
   --item "kv_gather_strategy=${KV_GATHER_STRATEGY:-stacked}" \
   --item "nproc_per_node=$NPROC_PER_NODE"
 

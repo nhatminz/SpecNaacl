@@ -1,173 +1,75 @@
 import os
+from pathlib import Path
 import shlex
-import shutil
 import subprocess
 import sys
-from itertools import product
-from pathlib import Path
+import pytest
 
+ROOT=Path(__file__).resolve().parents[1]
+PYTHON=sys.executable
+BASH='bash'
+MODEL_KEYS=('qwen25_1p5b','qwen25_3b','qwen25_7b','qwen25_14b','qwen3_1p7b','qwen3_4b','llama31_8b')
 
-ROOT = Path(__file__).parents[1]
-BASH = os.environ.get("BASH_BIN") or shutil.which("bash") or "bash"
-PYTHON = os.environ.get("PYTHON") or Path(sys.executable).as_posix()
-MODEL_KEYS = (
-    "qwen25_1p5b", "qwen25_3b", "qwen25_7b", "qwen25_14b",
-    "qwen3_1p7b", "qwen3_4b", "llama31_8b",
-)
+def command(script,**overrides):
+    env=dict(os.environ,DRY_RUN='true',PYTHON_BIN=PYTHON,**overrides)
+    out=subprocess.run([BASH,str(ROOT/script)],cwd=ROOT,env=env,check=True,text=True,capture_output=True).stdout
+    return shlex.split(next(x.split(':',1)[1] for x in out.splitlines() if x.startswith('Command  :')))
 
+@pytest.mark.parametrize('key',MODEL_KEYS)
+def test_paired_model_launchers_only_differ_by_method_and_keep_paths_hyperparameters(key,tmp_path):
+    commands=[]
+    for suffix,method in (('','opd_reflex'),('_fastgrpo','fastgrpo')):
+        script=f'train_{key}{suffix}.sh'
+        args=command(script,RUN_NAME='paired',RUN_DIR=str(tmp_path/'paired'))
+        flags=dict(zip(args[args.index('--method')::2],args[args.index('--method')+1::2]))
+        assert flags.pop('--method')==method
+        for flag,value in (('--target_lr','1e-5'),('--draft_lr','1e-5'),('--batch_size','8'),
+                           ('--accumulation_steps','4'),('--repeated_generate_nums','8'),
+                           ('--opd_rank','8'),('--opd_topk','16'),('--opd_fast_lr','0.01'),
+                           ('--opd_update_stream','0'),('--opd_profile','0'),('--opd_diagnostics','0'),
+                           ('--train_option','simplelr_abel_level3to5'),('--log_interval','1')):
+            assert flags[flag]==value
+        assert flags['--adapter_path'].endswith(f'/pretrain/{key}/latest_checkpoint')
+        assert flags['--dataset_path']=='/workspace/storage-shared/nlp/minhpn19/data/simplelr_abel_level3to5/train.parquet'
+        source=(ROOT/script).read_text()
+        for name in ('CUDA_VISIBLE_DEVICES','DATASET','OPD_FAST_LR','TARGET_LR','DRAFT_LR','BATCH_SIZE','RESPONSES_PER_PROMPT'):
+            assert 'export '+name+'=' in source
+        commands.append(flags)
+    assert commands[0]==commands[1]
 
-def test_all_launch_shells_have_valid_syntax_and_dry_run():
-    env = dict(os.environ, DRY_RUN="true", PYTHON_BIN=PYTHON)
-    scripts = [ROOT / f"train_{key}.sh" for key in MODEL_KEYS]
-    scripts += [ROOT / f"train_{key}_fastgrpo.sh" for key in MODEL_KEYS]
-    scripts += [ROOT / f"pretrain_{key}.sh" for key in MODEL_KEYS]
-    scripts += [
-        ROOT / "scripts" / "run_fastgrpo_fair.sh",
-        ROOT / "scripts" / "run_specnaacl.sh",
-    ]
-    scripts += [ROOT / "scripts" / "plot_training_time.sh"]
-    for script in scripts + [ROOT / "pretrain_eagle3_sharegpt_b200.sh",
-                             ROOT / "scripts/benchmark_pretrain.sh",
-                             ROOT / "scripts/benchmark_reflex_training.sh",
-                             ROOT / "scripts/benchmark_online_draft_training.sh"]:
-        subprocess.run([BASH, "-n", str(script)], check=True)
-    for script in scripts[:-1]:
-        result = subprocess.run(
-            [BASH, str(script)], env=env, cwd=ROOT,
-            capture_output=True, text=True,
-        )
-        assert result.returncode == 0, f"{script.name}: {result.stderr}\n{result.stdout}"
-
-
-def test_fair_launchers_differ_only_by_method_and_reflex_toggle(tmp_path):
-    env = dict(
-        os.environ,
-        DRY_RUN="true",
-        PYTHON_BIN=PYTHON,
-        RUN_NAME="fair-parity",
-        RUN_DIR=str(tmp_path / "fair-parity"),
-    )
-
-    def command_for(name):
-        result = subprocess.run(
-            [BASH, str(ROOT / "scripts" / name)], env=env, cwd=ROOT,
-            capture_output=True, text=True, check=True,
-        )
-        command_line = next(
-            line[len("Command  :"):]
-            for line in result.stdout.splitlines()
-            if line.startswith("Command  :")
-        )
-        return shlex.split(command_line)
-
-    def without_method_flags(command):
-        normalized = list(command)
-        for flag in ("--method", "--reflex_mode"):
-            index = normalized.index(flag)
-            del normalized[index:index + 2]
-        return normalized
-
-    baseline = command_for("run_fastgrpo_fair.sh")
-    treatment = command_for("run_specnaacl.sh")
-    assert baseline[baseline.index("--method") + 1] == "fastgrpo"
-    assert baseline[baseline.index("--reflex_mode") + 1] == "off"
-    assert treatment[treatment.index("--method") + 1] == "specnaacl"
-    assert treatment[treatment.index("--reflex_mode") + 1] == "active"
-    assert without_method_flags(baseline) == without_method_flags(treatment)
-
-
-def test_all_paired_model_launchers_share_training_and_use_streamed_triton(tmp_path):
+def test_all_shells_syntax_and_pretrain_dry_run():
+    for script in ROOT.rglob('*.sh'):
+        if 'third_party' not in script.parts:subprocess.run([BASH,'-n',str(script)],check=True)
     for key in MODEL_KEYS:
-        commands = {}
-        for method, suffix in (("specnaacl", ""), ("fastgrpo", "_fastgrpo")):
-            env = dict(os.environ, DRY_RUN="true", PYTHON_BIN=PYTHON,
-                       RUN_NAME="paired", RUN_DIR=str(tmp_path / key))
-            result = subprocess.run([BASH, str(ROOT / f"train_{key}{suffix}.sh")],
-                                    env=env, cwd=ROOT, capture_output=True, text=True, check=True)
-            line = next(line[len("Command  :"):] for line in result.stdout.splitlines()
-                        if line.startswith("Command  :"))
-            command = shlex.split(line)
-            flags = {command[i]: command[i + 1] for i in range(len(command) - 1)
-                     if command[i].startswith("--")}
-            assert flags["--method"] == method
-            assert flags["--reflex_mode"] == ("active" if method == "specnaacl" else "off")
-            for flag, value in (("--target_lr", "1e-5"), ("--draft_lr", "1e-5"),
-                                ("--batch_size", "8"), ("--accumulation_steps", "4"),
-                                ("--reflex_backend", "triton"),
-                                ("--reflex_feedback_scope", "root"),
-                                ("--reflex_update_stream", "1"),
-                                ("--draft_train_mode", "batched"),
-                                ("--repeated_generate_nums", "8"),
-                                ("--draft_train_max_tokens", "2048"),
-                                ("--log_interval", "1"),
-                                ("--reflex_diagnostics", "0"),
-                                ("--reflex_profile", "0"),
-                                ("--train_option", "DAPO-math")):
-                assert flags[flag] == value
-            for flag, name in (("--adapter_path", "latest_checkpoint"),
-                               ("--draft_config", "latest_draft_config.json"),
-                               ("--vocab_mapping", "latest_vocab_mapping.pt")):
-                assert flags[flag].endswith(f'/pretrain/{key}/{name}')
-            commands[method] = command
-        for command in commands.values():
-            del command[command.index("--method"):command.index("--method") + 2]
-            del command[command.index("--reflex_mode"):command.index("--reflex_mode") + 2]
-        assert commands["specnaacl"] == commands["fastgrpo"]
+        subprocess.run([BASH,str(ROOT/f'pretrain_{key}.sh')],cwd=ROOT,
+            env=dict(os.environ,DRY_RUN='true',PYTHON_BIN=PYTHON),check=True,capture_output=True)
 
+def test_opd_hyperparameter_overrides_reach_cli(tmp_path):
+    args=command('train_qwen25_3b.sh',CUDA_VISIBLE_DEVICES='2,3',NPROC_PER_NODE='2',
+        DATASET='dapo',TARGET_LR='2e-5',DRAFT_LR='3e-5',BATCH_SIZE='4',ACCUMULATION_STEPS='8',
+        RESPONSES_PER_PROMPT='3',OPD_FAST_LR='0.05',OPD_UPDATE_STREAM='1',OPD_RANK='16',OPD_TOPK='32')
+    for flag,value in (('--train_option','DAPO-math'),('--target_lr','2e-5'),('--draft_lr','3e-5'),
+                       ('--batch_size','4'),('--accumulation_steps','8'),('--repeated_generate_nums','3'),
+                       ('--opd_fast_lr','0.05'),('--opd_update_stream','1'),('--opd_rank','16'),('--opd_topk','32')):
+        assert args[args.index(flag)+1]==value
+    assert '--nproc_per_node=2' in args
 
-def test_rollout_and_logging_default_overrides_are_shared_by_both_methods(tmp_path):
-    for key, suffix in product(MODEL_KEYS, ('', '_fastgrpo')):
-        env = dict(os.environ, DRY_RUN='true', PYTHON_BIN=PYTHON,
-                   RUN_NAME='overrides', RUN_DIR=str(tmp_path / 'overrides'),
-                   REPEATED_GENERATE_NUMS='3', DRAFT_TRAIN_MAX_TOKENS='1024', LOG_INTERVAL='7',
-                   TARGET_LR='2e-5', DRAFT_LR='3e-5', BATCH_SIZE='4', ACCUMULATION_STEPS='8',
-                   CUDA_VISIBLE_DEVICES='2,3', NPROC_PER_NODE='2')
-        env.pop('RESPONSES_PER_PROMPT', None)
-        result = subprocess.run([BASH, str(ROOT / f'train_{key}{suffix}.sh')], env=env,
-                                cwd=ROOT, capture_output=True, text=True, check=True)
-        command = shlex.split(next(line[len('Command  :'):] for line in result.stdout.splitlines()
-                                  if line.startswith('Command  :')))
-        for flag, value in (('--repeated_generate_nums', '3'), ('--draft_train_max_tokens', '1024'),
-                            ('--log_interval', '7'), ('--target_lr', '2e-5'), ('--draft_lr', '3e-5'),
-                            ('--batch_size', '4'), ('--accumulation_steps', '8')):
-            assert command[command.index(flag) + 1] == value
-        assert '--nproc_per_node=2' in command
+def test_real_sweep_dry_run_no_writes_and_quick_settings(tmp_path):
+    destination=tmp_path/'not-created'
+    out=subprocess.run([BASH,str(ROOT/'scripts/sweep_opd_reflex.sh')],cwd=ROOT,
+        env=dict(os.environ,DRY_RUN='true',PYTHON_BIN=PYTHON,BENCH_OUTPUT=str(destination)),
+        check=True,capture_output=True,text=True).stdout
+    assert '--fast-lrs' in out and '--streams 0\\,1' in out
+    assert '--max-length 512' in out and '--responses 8' in out
+    assert not destination.exists()
 
-
-def test_reflex_backend_override_is_forwarded_to_training_launcher():
-    env = dict(os.environ, DRY_RUN="true", PYTHON_BIN=PYTHON, METHOD="specnaacl",
-               REFLEX_BACKEND="torch")
-    result = subprocess.run([BASH, str(ROOT / "train_qwen25_3b.sh")], env=env,
-                            cwd=ROOT, capture_output=True, text=True, check=True)
-    command = shlex.split(next(line[len("Command  :"):] for line in result.stdout.splitlines()
-                              if line.startswith("Command  :")))
-    assert command[command.index("--reflex_backend") + 1] == "torch"
-
-
-def test_visited_feedback_override_is_forwarded_without_changing_method_binding():
-    env = dict(os.environ, DRY_RUN='true', PYTHON_BIN=PYTHON, METHOD='specnaacl', REFLEX_MODE='off',
-               REFLEX_FEEDBACK_SCOPE='visited_path')
-    result = subprocess.run([BASH, str(ROOT / 'train_qwen25_3b.sh')], env=env,
-                            cwd=ROOT, capture_output=True, text=True, check=True)
-    command = shlex.split(next(line[len('Command  :'):] for line in result.stdout.splitlines()
-                              if line.startswith('Command  :')))
-    assert command[command.index('--reflex_feedback_scope') + 1] == 'visited_path'
-    assert command[command.index('--reflex_mode') + 1] == 'active'
-
-
-def test_real_training_benchmark_dry_run_is_isolated_and_bounded(tmp_path):
-    run_root = tmp_path / 'new_benchmark'
-    env = dict(os.environ, DRY_RUN='true', PYTHON_BIN=PYTHON, MODEL_KEY='qwen25_3b',
-               BENCHMARK_ROOT=run_root.as_posix(), BENCHMARK_STEPS='20', REFLEX_BACKEND='torch',
-               REFLEX_FEEDBACK_SCOPE='visited_path')
-    result = subprocess.run([BASH, str(ROOT / 'scripts/benchmark_reflex_training.sh')], env=env,
-                            cwd=ROOT, capture_output=True, text=True, check=True)
-    assert result.stdout.count('--max_grpo_steps 20') == 2
-    assert '--method fastgrpo' in result.stdout and '--method specnaacl' in result.stdout
-    assert f'{run_root.as_posix()}/fastgrpo' in result.stdout
-    assert f'{run_root.as_posix()}/specnaacl' in result.stdout
-    assert not run_root.exists()  # no links/checkpoints/training in dry run
-
+def test_only_two_methods_and_old_lk_arguments_are_gone():
+    from helper.method_config import resolve_method
+    assert resolve_method('fastgrpo')[0]=='fastgrpo'
+    assert resolve_method('opd_reflex')[0]=='opd_reflex'
+    with pytest.raises(ValueError):resolve_method('specnaacl')
+    source=(ROOT/'grpo_speculative.py').read_text()
+    assert '--reflex_lr' not in source and '--reflex_mode' not in source
 
 def test_pretrain_wrapper_reports_explicit_backend_topology_and_batch():
     env = dict(os.environ, DRY_RUN="true", PYTHON_BIN=PYTHON,

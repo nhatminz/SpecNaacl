@@ -19,6 +19,7 @@ from helper.specualtive_generate import speculative_generate
 from helper.eagle3_specforge import Eagle3FastGRPOAdapter, rollout_tensor_for_training
 from helper.checkpointing import capture_rng_state, restore_rng_state
 from helper.method_config import resolve_method
+from helper.opd_reflex import OPD_COUNTER_NAMES, GENERATION_COUNTER_NAMES
 from helper.step_metrics import PhaseTimings, StepMetricsWriter, completed_step_snapshot
 from policy_lag_analysis import (
     BranchSummary,
@@ -192,7 +193,7 @@ def save_training_checkpoint(
         return None
     checkpoint_dir = Path(checkpoint_dir)
     state = {
-        "format": "specnaacl_fastgrpo_checkpoint_v3",
+        "format": "opd_fastgrpo_checkpoint_v4",
         "world_size": int(current_world_size),
         "rank_states": rank_states,
         "cumulative_elapsed_time_s": max(
@@ -206,6 +207,8 @@ def save_training_checkpoint(
         "draft_accumulated_step": int(draft_accumulated_step),
         "target_lora": _target_lora_state_dict(model.target_model),
         "draft_model": model.draft_model.state_dict(),
+        "opd_projector": getattr(model,"opd_projector",None),
+        "method": getattr(model,"_training_method","fastgrpo"),
         "optimizer_target": optimizer_target.state_dict(),
         "optimizer_draft": optimizer_draft.state_dict(),
         "scheduler_target": None,
@@ -245,7 +248,10 @@ def load_training_checkpoint(path, *, model, optimizer_target, optimizer_draft):
             "draft_gradients": checkpoint.get("draft_gradients"),
             "rng": checkpoint.get("all_rng_states"),
         }
+    if checkpoint.get("method","fastgrpo")!=getattr(model,"_training_method","fastgrpo"):
+        raise ValueError("resume method mismatch; start a new run for replacement OPD")
     model.draft_model.load_state_dict(checkpoint["draft_model"])
+    if checkpoint.get("opd_projector") is not None:model.load_opd_projector(checkpoint["opd_projector"])
     _load_target_lora_state_dict(model.target_model, checkpoint["target_lora"])
     optimizer_target.load_state_dict(checkpoint["optimizer_target"])
     optimizer_draft.load_state_dict(checkpoint["optimizer_draft"])
@@ -272,22 +278,16 @@ parser.add_argument('--eagle_ttt_length', type=int, default=7)
 parser.add_argument('--eagle_lk_loss_type', type=str, default='', choices=['', 'lambda', 'alpha', 'tv'])
 parser.add_argument('--eagle_kl_scale', type=float, default=1.0)
 parser.add_argument('--eagle_kl_decay', type=float, default=1.0)
-parser.add_argument('--method', type=str, default='fastgrpo', choices=['fastgrpo', 'specnaacl'])
-parser.add_argument('--reflex_mode', type=str, default='', choices=['', 'off', 'active'])
-parser.add_argument('--reflex_feature_dim', type=int, default=8)
-parser.add_argument('--reflex_lr', type=float, default=0.05)
-parser.add_argument('--reflex_weight_decay', type=float, default=0.0)
-parser.add_argument('--reflex_seed', type=int, default=42)
-parser.add_argument('--reflex_feedback_scope', '--reflex_update_scope', dest='reflex_feedback_scope',
-                    type=str, default='root', choices=['root', 'visited_path'])
-parser.add_argument('--reflex_profile', default='0')
-parser.add_argument('--reflex_diagnostics', default='0')
-parser.add_argument('--reflex_backend', default='triton', choices=['auto', 'torch', 'triton'])
-parser.add_argument('--reflex_proposal_strategy', default='fused', choices=['fused', 'sort', 'hybrid', 'torch'])
-parser.add_argument('--reflex_correction_strategy', default='serial', choices=['serial', 'parallel', 'tiled'])
-parser.add_argument('--reflex_feedback_strategy', default='serial', choices=['serial', 'parallel'])
-parser.add_argument('--reflex_feature_strategy', default='auto', choices=['auto', 'triton', 'torch'])
-parser.add_argument('--reflex_update_stream', default='1', choices=['0', '1'])
+parser.add_argument('--method',default='fastgrpo',choices=['fastgrpo','opd_reflex'])
+parser.add_argument('--opd_rank',type=int,default=8)
+parser.add_argument('--opd_topk',type=int,default=16)
+parser.add_argument('--opd_fast_lr',type=float,default=.01)
+parser.add_argument('--opd_visited_weight',type=float,default=1.)
+parser.add_argument('--opd_frontier_weight',type=float,default=1.)
+parser.add_argument('--opd_update_stream',default='0',choices=['0','1'])
+parser.add_argument('--opd_profile',default='0',choices=['0','1'])
+parser.add_argument('--opd_diagnostics',default='0',choices=['0','1'])
+parser.add_argument('--opd_backend',default='triton',choices=['auto','torch','triton'])
 parser.add_argument('--draft_train_mode', default='batched', choices=['batched', 'per_response'])
 parser.add_argument('--draft_train_max_batch_size', type=int, default=8)
 parser.add_argument('--draft_train_max_tokens', type=int, default=2048)
@@ -383,13 +383,7 @@ parser.add_argument('--analysis_draft_update_steps', type=int, default=1)
 parser.add_argument('--analysis_bootstrap_samples', type=int, default=2000)
 parser.add_argument('--analysis_resume', default='true')
 args = parser.parse_args()
-method, method_reflex_mode = resolve_method(args.method)
-if args.reflex_mode and args.reflex_mode != method_reflex_mode:
-    raise ValueError(
-        f"--method={method} requires --reflex_mode={method_reflex_mode}; "
-        "the fair benchmark permits no independent Reflex toggle"
-    )
-args.reflex_mode = method_reflex_mode
+method,_=resolve_method(args.method)
 world_size = int(os.environ.get('WORLD_SIZE', '1'))
 local_rank = int(os.environ.get('LOCAL_RANK', '0'))
 if world_size > 1:
@@ -411,8 +405,8 @@ def _sync_gradients(module):
 
 
 def _aggregate_job_metrics(
-    data, device, cumulative_elapsed_time_s, *, include_reflex_diagnostics=False,
-    include_reflex_profile=False,
+    data,device,cumulative_elapsed_time_s,*,
+    include_opd_profile=False,
 ):
     """Aggregate cumulative counters only at log/final boundaries."""
     sum_names = (
@@ -421,18 +415,17 @@ def _aggregate_job_metrics(
         'reward_sum', 'reward_count', 'target_loss_sum', 'target_loss_count',
         'draft_loss1_sum', 'draft_loss2_sum', 'draft_loss_count',
         'draft_sparse_tv_sum', 'draft_sparse_kl_sum', 'draft_sparse_count',
-        'reflex_updates',
+        'opd_updates',
         'trace_rollout_count', 'used_items', 'ignore_due_correct', 'ignore_due_incorrect',
     )
-    if include_reflex_diagnostics:
-        sum_names += ('reflex_alpha_sum', 'reflex_loss_sum')
+    sum_names += tuple(name for name in OPD_COUNTER_NAMES+GENERATION_COUNTER_NAMES if name!='opd_updates')
     max_names = (
         'generate_time_cost', 'train_time_cost', 'draft_train_time_cost',
         'prefill_time_cost', 'target_time_cost', 'draft_time_cost',
         'check_time_cost',
     )
-    if include_reflex_profile:
-        max_names += ('reflex_profile_time_ms',)
+    if include_opd_profile:
+        max_names += ('opd_profile_time_ms',)
     sums = torch.tensor(
         [float(data.get(name, 0.0)) for name in sum_names],
         device=device, dtype=torch.float64,
@@ -529,24 +522,12 @@ resume_checkpoint = args.resume_checkpoint
 append_log = bool(resume_checkpoint) if str(args.append_log) == '' else _as_bool(args.append_log)
 trace_seed = int(args.seed)
 log_interval = max(1, int(args.log_interval))
-reflex_kwargs = {
-    "reflex_mode": args.reflex_mode,
-    "reflex_feature_dim": int(args.reflex_feature_dim),
-    "reflex_lr": float(args.reflex_lr),
-    "reflex_weight_decay": float(args.reflex_weight_decay),
-    "reflex_seed": int(args.reflex_seed),
-    "reflex_profile": _as_bool(args.reflex_profile),
-    "reflex_diagnostics": _as_bool(args.reflex_diagnostics),
-    "reflex_backend": args.reflex_backend,
-    "reflex_feedback_scope": args.reflex_feedback_scope,
-    "reflex_proposal_strategy": args.reflex_proposal_strategy,
-    "reflex_correction_strategy": args.reflex_correction_strategy,
-    "reflex_feedback_strategy": args.reflex_feedback_strategy,
-    "reflex_feature_strategy": args.reflex_feature_strategy,
-    "reflex_update_stream": _as_bool(args.reflex_update_stream),
-    "kv_gather_strategy": args.kv_gather_strategy,
-}
-effective_reflex_backend = 'off'
+opd_kwargs={"method":method,"opd_rank":args.opd_rank,"opd_topk":args.opd_topk,
+    "opd_fast_lr":args.opd_fast_lr,"opd_visited_weight":args.opd_visited_weight,
+    "opd_frontier_weight":args.opd_frontier_weight,"opd_update_stream":_as_bool(args.opd_update_stream),
+    "opd_profile":_as_bool(args.opd_profile),"opd_diagnostics":_as_bool(args.opd_diagnostics),
+    "opd_backend":args.opd_backend,"kv_gather_strategy":args.kv_gather_strategy}
+effective_opd_backend = 'off'
 reset_rng_on_resume = _as_bool(args.reset_rng_on_resume)
 _seed_everything(trace_seed)
 max_grpo_steps = max(0, int(args.max_grpo_steps))
@@ -597,10 +578,9 @@ if draft_lr_multiplier <= 0.0:
 if (args.draft_train_max_batch_size < 1 or args.draft_train_max_tokens < 1 or
         args.draft_train_max_padding_ratio < 1.0):
     raise ValueError('draft microbatch size/tokens must be positive and padding ratio >= 1')
-if args.reflex_mode == 'active' and args.draft_backend != 'eagle3':
-    raise ValueError('--reflex_mode=active requires --draft_backend=eagle3')
-if args.reflex_feature_dim <= 0 or args.reflex_lr < 0 or args.reflex_weight_decay < 0:
-    raise ValueError('invalid Fast Reflex feature dimension/lr/weight decay')
+if args.draft_backend!='eagle3':raise ValueError('fair OPD/FastGRPO pipeline requires eagle3')
+if not 1<=args.opd_rank<=64 or args.opd_topk<max_draft_k or args.opd_fast_lr<0 or min(args.opd_visited_weight,args.opd_frontier_weight)<0:
+    raise ValueError('invalid OPD rank/topk/lr/weights')
 fastgrpo_ablation = not np.isclose(draft_lr_multiplier, 1.0)
 model_torch_dtype = _dtype_from_name(args.dtype)
 attn_impl = _resolve_attn_implementation(args.attn_implementation)
@@ -638,10 +618,7 @@ print(f"B200/spec: dtype={args.dtype}, attn_impl={attn_impl or 'default'}, "
       f"max_draft_len={max_draft_token_length}, max_draft_k={max_draft_k}, "
       f"statistical_time={statistical_time}")
 print(f"Draft: train={is_train_draft}")
-print(f"Method: {method} | Reflex: mode={args.reflex_mode}, scope={args.reflex_feedback_scope}, "
-      f"dim={args.reflex_feature_dim}, lr={args.reflex_lr}, "
-      f"wd={args.reflex_weight_decay}, profile={_as_bool(args.reflex_profile)}, "
-      f"diagnostics={_as_bool(args.reflex_diagnostics)}, backend={args.reflex_backend}")
+print(f"Method: {method} | OPD: rank={args.opd_rank}, topk={args.opd_topk}, fast_lr={args.opd_fast_lr}, stream={args.opd_update_stream}")
 print(f"Trace: max_new_grpo_steps={max_grpo_steps}, drift_topk={drift_topk}, "
       f"drift_temperature={drift_temperature}, drift_row_chunk={drift_row_chunk_size}")
 print(f"FastGRPO ablation: enabled={fastgrpo_ablation}, draft_lr_multiplier={draft_lr_multiplier}")
@@ -674,6 +651,7 @@ if args.draft_backend == 'eagle3':
         lk_loss_type=args.eagle_lk_loss_type or None,
         kl_scale=args.eagle_kl_scale,
         kl_decay=args.eagle_kl_decay,
+        opd_rank=args.opd_rank,
     )
 else:
     # The legacy implementation is not a dependency of the EAGLE-3 backend.
@@ -687,6 +665,7 @@ else:
     model.load_model(adapter_path)
 print(adapter_path)
 model=model.cuda()
+model._training_method=method
 tokenizer = AutoTokenizer.from_pretrained(model_dir,padding_side="left")
 
 if args.draft_backend == 'eagle3':
@@ -1398,10 +1377,9 @@ batch_data={
     'draft_sparse_kl_sum':0.0,
     'draft_sparse_count':0,
     'trace_rollout_count':0,
-    'reflex_alpha_sum':0.0,
-    'reflex_loss_sum':0.0,
-    'reflex_updates':0,
-    'reflex_profile_time_ms':0.0,
+    'opd_updates':0,
+    'opd_profile_time_ms':0.0,
+    **{name:0. for name in OPD_COUNTER_NAMES+GENERATION_COUNTER_NAMES},
     'reward_sum':0.0,
     'reward_count':0,
     'target_loss_sum':0.0,
@@ -1470,14 +1448,13 @@ for param_group in optimizer_draft.param_groups:
 effective_draft_lrs = [float(group['lr']) for group in optimizer_draft.param_groups]
 
 run_config_log = {
+    **opd_kwargs,
     "phase": "run_config",
     "run_name": version_name,
     "method": method,
-    "reflex_mode": args.reflex_mode,
-    "reflex_profile": _as_bool(args.reflex_profile),
-    "reflex_diagnostics": _as_bool(args.reflex_diagnostics),
-    "reflex_backend_requested": args.reflex_backend,
-    "reflex_feedback_scope": args.reflex_feedback_scope,
+    "opd_profile": _as_bool(args.opd_profile),
+    "opd_diagnostics": _as_bool(args.opd_diagnostics),
+    "opd_backend_requested": args.opd_backend,
     "resume_checkpoint": str(resume_checkpoint),
     "append_log": bool(append_log),
     "source_grpo_step": int(trace_start_step),
@@ -1648,7 +1625,7 @@ def _evaluate_analysis_branch(branch_name, draft_state, eval_batch, policy_step)
                 draft_token_length_c=draft_token_length_c,
                 return_all_draft_input=False,
                 statistical_time=False,
-                **reflex_kwargs,
+                **opd_kwargs,
             )
         for response_index, (accepted, rounds, generated) in enumerate(zip(
             result['response_accepted_length_sum'],
@@ -1782,15 +1759,17 @@ for epoch in epoch_bar:
             min_draft_token_length=min_draft_token_length,
             draft_token_length_c=draft_token_length_c,
             return_all_draft_input=True,statistical_time=statistical_time,
-            **reflex_kwargs)
-        effective_reflex_backend = outputs.get('reflex_backend', 'off')
-        if _as_bool(args.reflex_profile) and is_main_process:
+            **opd_kwargs)
+        effective_opd_backend = outputs.get('opd_backend', 'off')
+        if _as_bool(args.opd_diagnostics) and is_main_process:
+            with open(log_file,'a',encoding='utf-8') as f:
+                f.write(json.dumps({'phase':'opd_diagnostics','step':int(step),
+                    **{k:v for k,v in outputs.items() if k.startswith('opd_final_')}})+'\n')
+        if _as_bool(args.opd_profile) and is_main_process:
             with open(log_file, 'a', encoding='utf-8') as profile_stream:
                 profile_stream.write(json.dumps({
-                    'phase': 'reflex_profile', 'step': int(step),
-                    'sections_ms': outputs.get('reflex_profile_sections_ms'),
-                    'estimated_overlap_ms': outputs.get('reflex_estimated_overlap_ms'),
-                    'update_stream_ms': outputs.get('reflex_update_stream_ms'),
+                    'phase': 'opd_profile', 'step': int(step),
+                    'sections_ms': outputs.get('opd_profile_sections_ms'),
                 }) + '\n')
             
         
@@ -1924,12 +1903,9 @@ for epoch in epoch_bar:
         batch_data['total_decoded_token_num']+=outputs['total_decoded_token_num']
         batch_data['total_accepted_draft_tokens']+=accepted_draft_tokens
         batch_data['total_proposed_draft_tokens']+=proposed_draft_tokens
-        if outputs.get('reflex_alpha_sum') is not None:
-            batch_data['reflex_alpha_sum'] += float(outputs['reflex_alpha_sum'])
-        if outputs.get('reflex_loss_sum') is not None:
-            batch_data['reflex_loss_sum'] += float(outputs['reflex_loss_sum'])
-        batch_data['reflex_updates'] += int(outputs.get('reflex_updates', 0))
-        batch_data['reflex_profile_time_ms'] += float(outputs.get('reflex_profile_time_ms', 0.0))
+        for name in OPD_COUNTER_NAMES+GENERATION_COUNTER_NAMES:
+            batch_data[name]=batch_data.get(name,0.)+float(outputs.get(name,0.))
+        batch_data['opd_profile_time_ms']+=float(outputs.get('opd_profile_time_ms',0.))
         batch_data['generate_length']+=generate_length
         trace_rollout_count += 1
         batch_data['trace_rollout_count'] = int(batch_data.get('trace_rollout_count', 0)) + 1
@@ -2190,7 +2166,7 @@ for epoch in epoch_bar:
                         draft_token_length_c=draft_token_length_c,
                         return_all_draft_input=True,
                         statistical_time=False,
-                        **reflex_kwargs,
+                        **opd_kwargs,
                     )
                 old_available = sum(
                     max(int(ids.shape[-1]) - int(analysis_train_attention_mask[idx // repeated_generate_nums].sum()) - 1, 0)
@@ -2413,8 +2389,7 @@ for epoch in epoch_bar:
                 "draft_lr_multiplier": float(draft_lr_multiplier),
                 "fastgrpo_ablation": bool(fastgrpo_ablation),
                 "method": method,
-                "reflex_mode": args.reflex_mode,
-                "reflex_updates": int(batch_data['reflex_updates']),
+                "opd_updates": int(batch_data['opd_updates']),
                 
                 "draft_train_time_cost":round(batch_data['draft_train_time_cost']/60,3) if is_train_draft else 0, 
                 f"last_{sample_num}_draft_loss1":round(sum(batch_data['last_draft_loss1'][-real_sample_num:])/len(batch_data['last_draft_loss1'][-real_sample_num:]),4) if is_train_draft and draft_step > 0 else 0,
@@ -2425,8 +2400,7 @@ for epoch in epoch_bar:
                 wall_elapsed = _cumulative_wall_time()
                 global_metrics = _aggregate_job_metrics(
                     batch_data, model.target_model.device, wall_elapsed,
-                    include_reflex_diagnostics=_as_bool(args.reflex_diagnostics),
-                    include_reflex_profile=_as_bool(args.reflex_profile),
+                    include_opd_profile=_as_bool(args.opd_profile),
                 )
                 step_snapshot = completed_step_snapshot(
                     global_metrics, batch_data, phase_timings, model.target_model.device,
@@ -2453,23 +2427,12 @@ for epoch in epoch_bar:
                     "target_loss": float(global_metrics['target_loss']),
                     "draft_loss1": float(global_metrics['draft_loss1']),
                     "draft_loss2": float(global_metrics['draft_loss2']),
-                    "reflex_updates": int(global_metrics['reflex_updates']),
+                    "opd_updates": int(global_metrics['opd_updates']),
                     "tokens_per_s": float(global_metrics['tokens_per_s']),
                 })
-                if _as_bool(args.reflex_diagnostics):
-                    avg_logs.update({
-                        "reflex_alpha": (
-                            global_metrics['reflex_alpha_sum'] /
-                            max(global_metrics['reflex_updates'], 1.0)
-                        ),
-                        "reflex_lk_loss": (
-                            global_metrics['reflex_loss_sum'] /
-                            max(global_metrics['reflex_updates'], 1.0)
-                        ),
-                    })
-                if _as_bool(args.reflex_profile):
-                    avg_logs["reflex_profile_time_ms"] = float(
-                        global_metrics['reflex_profile_time_ms']
+                if _as_bool(args.opd_profile):
+                    avg_logs["opd_profile_time_ms"] = float(
+                        global_metrics['opd_profile_time_ms']
                     )
                 step_metrics.submit(step, step_snapshot, avg_logs)
                 batch_data['_step_metrics_state'] = step_metrics.state_dict()
@@ -2563,8 +2526,7 @@ for epoch in epoch_bar:
 batch_data['used_items'] = int(used_items)
 training_end_metrics = _aggregate_job_metrics(
     batch_data, model.target_model.device, _cumulative_wall_time(),
-    include_reflex_diagnostics=_as_bool(args.reflex_diagnostics),
-    include_reflex_profile=_as_bool(args.reflex_profile),
+    include_opd_profile=_as_bool(args.opd_profile),
 )
 training_end_snapshot = completed_step_snapshot(
     training_end_metrics, batch_data, phase_timings, model.target_model.device,
@@ -2598,8 +2560,7 @@ total_wall_time = _cumulative_wall_time()
 batch_data['used_items'] = int(used_items)
 final_metrics = _aggregate_job_metrics(
     batch_data, model.target_model.device, total_wall_time,
-    include_reflex_diagnostics=_as_bool(args.reflex_diagnostics),
-    include_reflex_profile=_as_bool(args.reflex_profile),
+    include_opd_profile=_as_bool(args.opd_profile),
 )
 final_snapshot = completed_step_snapshot(
     final_metrics, batch_data, phase_timings, model.target_model.device,
@@ -2629,15 +2590,16 @@ summary = {
     "effective_draft_lrs": effective_draft_lrs,
     "fastgrpo_ablation": bool(fastgrpo_ablation),
     "method": method,
-    "reflex_mode": args.reflex_mode,
-    "reflex_feature_dim": int(args.reflex_feature_dim),
-    "reflex_lr": float(args.reflex_lr),
-    "reflex_weight_decay": float(args.reflex_weight_decay),
-    "reflex_diagnostics": _as_bool(args.reflex_diagnostics),
-    "reflex_backend_requested": args.reflex_backend,
-    "reflex_feedback_scope": args.reflex_feedback_scope,
-    "reflex_updates": int(final_metrics['reflex_updates']),
-    "reflex_backend_effective": effective_reflex_backend,
+    "opd_rank": int(args.opd_rank),
+    "opd_topk": int(args.opd_topk),
+    "opd_update_stream": _as_bool(args.opd_update_stream),
+    "opd_visited_weight": args.opd_visited_weight,
+    "opd_frontier_weight": args.opd_frontier_weight,
+    "opd_fast_lr": float(args.opd_fast_lr),
+    "opd_diagnostics": _as_bool(args.opd_diagnostics),
+    "opd_backend_requested": args.opd_backend,
+    "opd_updates": int(final_metrics['opd_updates']),
+    "opd_backend_effective": effective_opd_backend,
     "train_dataset_full_size": int(full_train_samples),
     "train_dataset_selected_size": int(selected_train_samples),
     "dataset_path": str(args.dataset_path),
@@ -2688,19 +2650,8 @@ summary = {
     "cumulative_acceptance_rate": float(final_medusa_acceptance_rate),
     "timing_csv": str(timing_file),
 }
-if _as_bool(args.reflex_diagnostics):
-    summary.update({
-        "reflex_alpha": (
-            float(final_metrics['reflex_alpha_sum']) /
-            max(int(final_metrics['reflex_updates']), 1)
-        ),
-        "reflex_lk_loss": (
-            float(final_metrics['reflex_loss_sum']) /
-            max(int(final_metrics['reflex_updates']), 1)
-        ),
-    })
-if _as_bool(args.reflex_profile):
-    summary["reflex_profile_time_ms"] = float(final_metrics['reflex_profile_time_ms'])
+if _as_bool(args.opd_profile):
+    summary["opd_profile_time_ms"] = float(final_metrics['opd_profile_time_ms'])
 summary_text = json.dumps(summary, indent=2, ensure_ascii=True)
 if is_main_process:
     with open(summary_file, "w", encoding="utf-8") as f:

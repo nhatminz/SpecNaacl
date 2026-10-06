@@ -1,194 +1,104 @@
-# Hướng dẫn chạy nhanh trên B200
+# Chạy FastGRPO và OPD Reflex trên B200
 
-Project yêu cầu Python **>=3.12.0**, không khóa phiên bản patch: **3.12.3 dùng được**
-nếu các dependencies/CUDA tương thích. Không cần file `.python-version` trên server;
-file này chỉ gợi ý dòng 3.12 cho uv, không ép 3.12.12/3.12.13. Có thể dùng tiếp `.venv` hiện tại;
-kiểm tra các dependency theo [ENVIRONMENT.md](ENVIRONMENT.md) trước khi chạy.
+Dùng venv SpecNaacl đã được kiểm tra; KHÔNG dùng venv TLT (khác Torch/Transformers).
+Paths model/data/pretrained draft giữ nguyên. Không cần pretrain lại. Pipeline
+không tải model/dataset từ Internet; giữ nguyên dependencies trong ENVIRONMENT.md.
 
 ```bash
 cd /workspace/storage-shared/nlp/minhpn19/SpecNaacl
+source .venv/bin/activate
 export PYTHON_BIN="$(command -v python)"
+export CUDA_VISIBLE_DEVICES=0
+export DATASET=simplelr
+export TARGET_LR=1e-5
+export DRAFT_LR=1e-5
+export OPD_FAST_LR=0.01   # cũng hỗ trợ FAST_LR nếu OPD_FAST_LR chưa được set
+export BATCH_SIZE=8
+export ACCUMULATION_STEPS=4
+export RESPONSES_PER_PROMPT=8
+export OPD_RANK=8
+export OPD_TOPK=16
+export OPD_VISITED_WEIGHT=1.0
+export OPD_FRONTIER_WEIGHT=1.0
+export OPD_UPDATE_STREAM=0   # UNTUNED: đo cả0/1, không giả định async nhanh hơn
+export OPD_PROFILE=0
+export OPD_DIAGNOSTICS=0
 ```
 
-Đủ 14 launcher cho 7 model (mặc định DAPO, target/draft LR `1e-5`, batch `8`,
-accumulation `4`, SpecNaacl = Triton/root/stream):
+Dataset default:
+`/workspace/storage-shared/nlp/minhpn19/data/simplelr_abel_level3to5/train.parquet`.
+Đổi bằng `DATASET=dapo`/`gsm8k`, hoặc export `DATASET_PATH` tới file thật.
+Draft/config/mapping default: `outputs/pretrain/<model_key>/latest_*`.
+Nếu khác, export DRAFT_CHECKPOINT, DRAFT_CONFIG, VOCAB_MAPPING của cùng pretrained run.
+
+## Chạy từng cặp model
 
 ```bash
-# Chọn cặp model cần chạy; không cần chạy toàn bộ danh sách.
-CUDA_VISIBLE_DEVICES=0 bash train_qwen25_1p5b.sh
-CUDA_VISIBLE_DEVICES=0 bash train_qwen25_1p5b_fastgrpo.sh
-CUDA_VISIBLE_DEVICES=0 bash train_qwen25_7b.sh
-CUDA_VISIBLE_DEVICES=0 bash train_qwen25_7b_fastgrpo.sh
-CUDA_VISIBLE_DEVICES=0 bash train_qwen25_14b.sh
-CUDA_VISIBLE_DEVICES=0 bash train_qwen25_14b_fastgrpo.sh
-CUDA_VISIBLE_DEVICES=0 bash train_llama31_8b.sh
-CUDA_VISIBLE_DEVICES=0 bash train_llama31_8b_fastgrpo.sh
-CUDA_VISIBLE_DEVICES=0 bash train_qwen3_4b.sh
-CUDA_VISIBLE_DEVICES=0 bash train_qwen3_4b_fastgrpo.sh
-CUDA_VISIBLE_DEVICES=0 bash train_qwen25_3b.sh
-CUDA_VISIBLE_DEVICES=0 bash train_qwen25_3b_fastgrpo.sh
-CUDA_VISIBLE_DEVICES=0 bash train_qwen3_1p7b.sh
-CUDA_VISIBLE_DEVICES=0 bash train_qwen3_1p7b_fastgrpo.sh
+# OPD Reflex                       # FastGRPO/OFF
+bash train_qwen25_3b.sh             # bash train_qwen25_3b_fastgrpo.sh
+bash train_qwen3_1p7b.sh             # bash train_qwen3_1p7b_fastgrpo.sh
+bash train_qwen3_4b.sh               # bash train_qwen3_4b_fastgrpo.sh
+bash train_qwen25_1p5b.sh            # bash train_qwen25_1p5b_fastgrpo.sh
+bash train_qwen25_7b.sh              # bash train_qwen25_7b_fastgrpo.sh
+bash train_qwen25_14b.sh             # bash train_qwen25_14b_fastgrpo.sh
+bash train_llama31_8b.sh             # bash train_llama31_8b_fastgrpo.sh
 ```
 
-File thường luôn chạy SpecNaacl; file `_fastgrpo.sh` luôn chạy FastGRPO (Reflex
-OFF). Cùng model thì hai file dùng cùng config, chỉ khác method. Nếu 14B cần
-giảm batch để tiết kiệm VRAM, áp dụng giống nhau cho cả hai:
+Mỗi lệnh là một run riêng. Run name tự có method/seed/timestamp/UUID.
+Không gọi tất cả model nếu chỉ cần một model.
+
+Dry-run và smoke thực với weights thật:
 
 ```bash
-BATCH_SIZE=4 ACCUMULATION_STEPS=8 CUDA_VISIBLE_DEVICES=0 bash train_qwen25_14b.sh
-BATCH_SIZE=4 ACCUMULATION_STEPS=8 CUDA_VISIBLE_DEVICES=0 bash train_qwen25_14b_fastgrpo.sh
+DRY_RUN=true bash train_qwen25_3b.sh
+MAX_TRAIN_SAMPLES=128 bash train_qwen25_3b.sh --max_grpo_steps 2
+MAX_TRAIN_SAMPLES=128 bash train_qwen25_3b_fastgrpo.sh --max_grpo_steps 2
 ```
 
-Outputs: `outputs/train/<model_key>/<run_name>/`; run name tự tạo gồm model,
-dataset, method, seed, timestamp và UUID. Draft mặc định vẫn lấy từ
-`outputs/pretrain/<model_key>/latest_*`; không dùng draft của model khác.
-
-Các launcher cần draft EAGLE-3 đã pretrain đúng model. Có thể chạy ngắn với
-`--max_grpo_steps 2`, hoặc `DRY_RUN=true` để kiểm tra lệnh. Giới hạn VRAM:
-`DRAFT_TRAIN_MAX_BATCH_SIZE=8 DRAFT_TRAIN_MAX_TOKENS=2048
-DRAFT_TRAIN_MAX_PADDING_RATIO=1.25`. Nếu B200 benchmark cho thấy batched
-chậm hơn, đổi `DRAFT_TRAIN_MODE=per_response`; nếu stream chậm hơn, đặt
-`REFLEX_UPDATE_STREAM=0`.
-
-Cả hai method mặc định 8 responses/prompt (`RESPONSES_PER_PROMPT`, hoặc alias
-`REPEATED_GENERATE_NUMS`) và `LOG_INTERVAL=1`. Log `logs/metrics.jsonl`
-(`phase=target_train`) và `logs/timing.csv` có cùng schema: thời gian, token,
-AAL, acceptance rate riêng từng step và cumulative, cùng allocated/reserved/
-peak/free GPU memory. `step_aal = step_accepted_tokens / step_verification_rounds`,
-giữ root/bonus token theo FastGRPO. Các optimizer update có cùng nhãn `step`
-được gộp đúng counters; row được ghi khi nhãn đổi hoặc run kết thúc.
-`LOG_INTERVAL` chỉ điều khiển progress display, không bỏ row dữ liệu.
-Xem [RUNNING.md](RUNNING.md) để biết cách đo time, memory và xử lý resume.
-
-Đo trên B200 trước khi train dài (kết quả nằm trong
-`outputs/benchmarks/<run>/benchmark_report.json`):
+## Sweep nhanh LR/stream: FROZEN model, không train/checkpoint
 
 ```bash
-MODEL_KEY=qwen25_3b BENCHMARK_STEPS=3 bash scripts/benchmark_online_draft_training.sh
-MODEL_KEY=qwen25_3b BENCHMARK_STEPS=3 bash scripts/benchmark_reflex_training.sh
+MODEL_KEY=qwen25_3b OPD_FAST_LRS=0.001,0.01,0.05,0.1 OPD_STREAMS=0,1 \
+BENCH_SEEDS=42,43 BENCH_ITERATIONS=2 BENCH_WARMUP=1 \
+bash scripts/sweep_opd_reflex.sh
 ```
 
-## 1. Pretrain draft Qwen2.5-3B trong 1 epoch
+Quick defaults: prompts8, responses8, total max_length512 (bao gồm prompt),
+max_prompt_length256, verification_capacity512, K8, depth5. Warmup chạy đúng
+seed/prompt schedule để tránh đổ JIT vào timing. Muốn workload train:
 
 ```bash
-MODEL=/workspace/storage-shared/models/Qwen2.5-3B-Instruct \
-PRETRAIN_DATASET=sharegpt \
-PRETRAIN_DATASET_PATH=/workspace/storage-shared/nlp/minhpn19/data/sharegpt/ShareGPT_V4.3_unfiltered_cleaned_split.json \
-PRETRAIN_EPOCHS=1 \
-PRETRAIN_LR=5e-5 \
-PRETRAIN_BATCH_SIZE=8 \
-PRETRAIN_MAX_LENGTH=2048 \
-NPROC_PER_NODE=1 \
-CUDA_VISIBLE_DEVICES=0 \
-bash pretrain_qwen25_3b.sh
+MODEL_KEY=qwen25_3b BENCH_MAX_LENGTH=2048 BENCH_MAX_PROMPT_LENGTH=2048 \
+BENCH_ITERATIONS=3 BENCH_SEEDS=11,29,47 bash scripts/sweep_opd_reflex.sh
 ```
 
-Draft mới nhất được publish tự động tại:
+Prompt đã dài bằng max_length bị reject; tăng max_length hoặc giảm max_prompt_length.
+Dùng BENCH_OUTPUT mới nếu muốn chỉ định output. Script xuất report.json,
+summary.csv, responses.jsonl và fastest_observed.env. recommendation=null nếu
+không config nào đồng thời AAL tăng và throughput>=baseline. fastest_observed.env
+KHÔNG được coi là recommendation mặc định; kiểm tra delta/overhead, sau đó validate
+trên held-out prompts trước khi tự source nó.
 
-```text
-outputs/pretrain/qwen25_3b/latest_checkpoint
-outputs/pretrain/qwen25_3b/latest_draft_config.json
-outputs/pretrain/qwen25_3b/latest_vocab_mapping.pt
-```
+OPD_PROFILE=1 chạy diagnostic replay TÁCH RIÊNG khỏi wall/throughput. Các profile
+timers không phải authoritative speedup. OPD_DIAGNOSTICS=1 thêm B norm/max ở cuối
+rollout, không thêm target/draft transformer forward.
 
-Run đầy đủ nằm trong
-`outputs/pretrain/qwen25_3b/<run_name>/`; terminal cũng in chính xác `Run dir`.
+## Outputs và plot AAL đúng từng step
 
-## 2. Benchmark FastGRPO và SpecNaacl công bằng bằng DAPO
+Train outputs: `outputs/train/<model_key>/<run_name>/`.
+Mỗi completed inherited GRPO step có một row trong logs/timing.csv và một
+target_train row trong logs/metrics.jsonl (các phase khác có row riêng).
+Checkpoint target/draft/resume nằm trong checkpoints/ của chính run.
+Benchmark outputs: `outputs/benchmarks/opd_<model_key>_<timestamp>/`.
 
-Launcher tự lấy draft mới nhất ở bước 1:
+Sau khi có hai run, truyền đường dẫn logs thật của chúng:
 
 ```bash
-MODEL=/workspace/storage-shared/models/Qwen2.5-3B-Instruct \
-DATASET=dapo \
-DATASET_PATH=/workspace/storage-shared/nlp/minhpn19/data/DAPO-Math-17k-Processed/en/train-00000-of-00001.parquet \
-REFLEX_FEATURE_DIM=8 \
-REFLEX_LR=0.05 \
-REFLEX_WEIGHT_DECAY=0.0 \
-TARGET_LR=1e-5 \
-DRAFT_LR=1e-5 \
-BATCH_SIZE=8 \
-ACCUMULATION_STEPS=4 \
-GEN_MAX_LENGTH=2048 \
-MAX_PROMPT_LENGTH=2048 \
-NUM_EPOCHS=1 \
-NPROC_PER_NODE=1 \
-CUDA_VISIBLE_DEVICES=0 \
-bash scripts/run_specnaacl.sh
+python scripts/plot_opd_aal.py --fastgrpo "$FASTGRPO_TIMING_CSV" \
+  --opd-reflex "$OPD_TIMING_CSV" --output "$NEW_AAL_PLOT_PATH"
 ```
 
-Baseline công bằng dùng chính runtime trên, cùng compact EAGLE proposal,
-sampling, verifier, checkpoint và logging; launcher chỉ đổi `METHOD` để tắt
-Reflex:
-
-```bash
-MODEL=/workspace/storage-shared/models/Qwen2.5-3B-Instruct \
-MODEL_KEY=qwen25_3b \
-DATASET=dapo \
-DATASET_PATH=/workspace/storage-shared/nlp/minhpn19/data/DAPO-Math-17k-Processed/en/train-00000-of-00001.parquet \
-REFLEX_FEATURE_DIM=8 \
-REFLEX_LR=0.05 \
-REFLEX_WEIGHT_DECAY=0.0 \
-TARGET_LR=1e-5 \
-DRAFT_LR=1e-5 \
-BATCH_SIZE=8 \
-ACCUMULATION_STEPS=4 \
-GEN_MAX_LENGTH=2048 \
-MAX_PROMPT_LENGTH=2048 \
-NUM_EPOCHS=1 \
-NPROC_PER_NODE=1 \
-CUDA_VISIBLE_DEVICES=0 \
-bash scripts/run_fastgrpo_fair.sh
-```
-
-Muốn chỉ rõ draft thay vì dùng link mới nhất:
-
-```bash
-DRAFT_CHECKPOINT=/absolute/pretrain/run/checkpoints/<run>-latest \
-DRAFT_CONFIG=/absolute/pretrain/run/config/eagle3.json \
-VOCAB_MAPPING=/absolute/pretrain/run/features/vocab_mapping/vocab_mapping.pt \
-bash train_qwen25_3b.sh
-```
-
-Resume run train cũ:
-
-```bash
-RUN_DIR=/absolute/path/to/the/same/run RESUME=auto bash train_qwen25_3b.sh
-```
-
-## 3. Đổi dataset hoặc model
-
-Các dataset train hợp lệ:
-
-```bash
-DATASET=gsm8k bash train_qwen25_3b.sh
-DATASET=simplelr bash train_qwen25_3b.sh
-DATASET=dapo bash train_qwen25_3b.sh
-```
-
-Đổi model chỉ cần dùng wrapper tương ứng: `qwen25_1p5b`, `qwen25_3b`,
-`qwen25_7b`, `qwen25_14b`, `qwen3_1p7b`, `qwen3_4b`, hoặc `llama31_8b`.
-Nếu đường dẫn model trên máy khác tên mặc định, truyền `MODEL=/đường/dẫn/thật`.
-
-## 4. Output và plot
-
-Train output nằm tại:
-
-```text
-outputs/train/qwen25_3b/<run_name>/
-  checkpoints/
-  logs/metrics.jsonl
-  logs/timing.csv
-  config_resolved.yaml
-  summary.json
-  summary.txt
-```
-
-Vẽ nhiều run:
-
-```bash
-bash scripts/plot_training_time.sh \
-  /workspace/storage-shared/nlp/minhpn19/SpecNaacl/outputs/train/qwen25_3b/<baseline_run> \
-  /workspace/storage-shared/nlp/minhpn19/SpecNaacl/outputs/train/qwen25_3b/<reflex_run>
-```
+Các biến trên phải trỏ tới CSV/output bạn thực sự chọn. Plot dùng step counters,
+không dùng cumulative AAL/moving average. Các pretrain launchers vẫn giữ nguyên.
+Không resume optimizer trajectory của method cũ vào OPD; giữ cùng method khi
+resume. Có thể dùng lại pretrained draft/target adapter như initialization.

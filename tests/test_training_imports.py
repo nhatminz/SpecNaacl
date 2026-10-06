@@ -67,7 +67,7 @@ def selection_scope(backend):
         "args": SimpleNamespace(
             draft_backend=backend, eagle_feature_layers="", draft_config="config.json",
             vocab_mapping="mapping.pt", draft_initialization_mode="pretrained",
-            eagle_ttt_length=7, eagle_lk_loss_type="", eagle_kl_scale=1.0, eagle_kl_decay=0.9,
+            opd_rank=8,eagle_ttt_length=7, eagle_lk_loss_type="", eagle_kl_scale=1.0, eagle_kl_decay=0.9,
         ),
         "target_model": object(), "adapter_path": "pretrained-checkpoint",
         "Eagle3FastGRPOAdapter": mock.Mock(), "config": SimpleNamespace(),

@@ -1,9 +1,9 @@
-"""Single source of truth for the fair FastGRPO/SpecNaacl comparison."""
+"""Only the shared FastGRPO engine and OPD Reflex are supported."""
 
 
 METHOD_TO_REFLEX_MODE = {
     "fastgrpo": "off",
-    "specnaacl": "active",
+    "opd_reflex": "opd_reflex",
 }
 
 

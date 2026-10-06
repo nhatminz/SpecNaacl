@@ -138,6 +138,7 @@ class Eagle3FastGRPOAdapter(nn.Module):
         lk_loss_type: Optional[str] = None,
         kl_scale: float = 1.0,
         kl_decay: float = 1.0,
+        opd_rank: int = 8,
     ):
         super().__init__()
         AutoDraftModel, AutoDraftModelConfig, OnlineEagle3Model = require_specforge()
@@ -226,6 +227,14 @@ class Eagle3FastGRPOAdapter(nn.Module):
         self.lm_head = _TargetVocabHead(self.draft_model)
         self.embed_tokens = self.draft_model.embed_tokens
         self.dtype = next(self.draft_model.parameters()).dtype
+        from helper.opd_reflex import initialize_projector
+        self.register_buffer('opd_projector',initialize_projector(self.config.hidden_size,int(opd_rank)))
+        if draft_checkpoint and not is_exported:
+            _,payload=_load_training_state(Path(draft_checkpoint))
+            if payload.get('opd_projector') is not None:self.load_opd_projector(payload['opd_projector'])
+        elif draft_checkpoint and is_exported:
+            projector_file=Path(draft_checkpoint)/'opd_projector.pt'
+            if projector_file.is_file():self.load_opd_projector(torch.load(projector_file,map_location='cpu',weights_only=True))
 
     @property
     def device(self):
@@ -238,6 +247,21 @@ class Eagle3FastGRPOAdapter(nn.Module):
     def compute_compact_logits(self, hidden_states):
         """Return native SpecForge logits without scattering to target vocab."""
         return self.draft_model.compute_logits(hidden_states)
+
+    def compute_compact_logits_with_inputs(self,hidden_states):
+        """Exactly SpecForge compute_logits, retaining its actual head input."""
+        inputs=hidden_states if self.draft_model.norm_output else self.draft_model.norm(hidden_states)
+        return self.draft_model.lm_head(inputs),inputs
+
+    def get_opd_projector(self,rank):
+        if self.opd_projector.shape[1]!=rank:
+            raise ValueError(f'checkpoint OPD rank {self.opd_projector.shape[1]} != requested {rank}')
+        return self.opd_projector
+
+    def load_opd_projector(self,value):
+        if value.shape!=self.opd_projector.shape or not torch.isfinite(value).all():
+            raise ValueError('incompatible/nonfinite persistent OPD projector')
+        self.opd_projector.copy_(value.to(device=self.opd_projector.device,dtype=torch.float32))
 
     def compact_to_target_ids(self, compact_ids=None, *, device=None):
         """Map compact EAGLE indices to target tokenizer ids on device."""
@@ -256,6 +280,8 @@ class Eagle3FastGRPOAdapter(nn.Module):
             "draft_vocab_size": int(self.draft_model.draft_vocab_size),
             "target_vocab_size": int(self.draft_model.vocab_size),
             "fc_norm": bool(getattr(self.config, 'fc_norm', False)),
+            "opd_rank": int(self.opd_projector.shape[1]),
+            "opd_projector_training": "fixed; checkpoint-persistent",
         }
 
     def save_model(self, path):
@@ -266,13 +292,15 @@ class Eagle3FastGRPOAdapter(nn.Module):
                 "format": "specforge_eagle3_fastgrpo_v1",
                 "draft_state_dict": self.draft_model.state_dict(),
                 "metadata": self.checkpoint_metadata(),
+                "opd_projector": self.opd_projector.detach().cpu(),
             },
             path,
         )
 
     def load_model(self, path):
-        state, _ = _load_training_state(Path(path))
+        state, payload = _load_training_state(Path(path))
         self.draft_model.load_state_dict(state, strict=True)
+        if payload.get('opd_projector') is not None:self.load_opd_projector(payload['opd_projector'])
 
     def _project_feature(self, hidden_states):
         if hidden_states.shape[-1] == self.draft_model.target_hidden_size * 3:

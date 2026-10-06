@@ -1,52 +1,31 @@
-# SpecNaacl: FastGRPO EAGLE-3 + Fast LK Reflex
+# SpecNaacl — FastGRPO vs OPD Reflex
 
-This directory is a self-contained copy of the existing FastGRPO workspace.
-It preserves FastGRPO's GRPO reward/loss, target-update schedule, speculative
-tree verifier, concurrency-aware scheduler, and persistent online EAGLE update.
-It adds an optional trajectory-local Fast LK Reflex correction during rollout.
-For fair timing, use `METHOD=fastgrpo` or `METHOD=specnaacl` inside this same
-repository; both modes share persistent training and authoritative target
-sampling/verification semantics. ACTIVE uses the tensor-tree execution path.
-The sibling original `fastgrpo/` checkout is provenance/external reference,
-not the wall-clock baseline for this comparison.
+Current methods only: `METHOD=fastgrpo` and `METHOD=opd_reflex`.
+LK Reflex has been retired. Per-model ordinary launchers select OPD; suffix
+`_fastgrpo.sh` selects the fair in-repository baseline.
 
-- `REFLEX_MODE=off`: compact EAGLE logits, softmax, top-k, then fixed `d2t` mapping.
-- `REFLEX_MODE=active`: `A psi` at every proposal context, followed by an analytic
-  LK update reusing exact target sampling probabilities after temperature/top-p/top-k.
-- `REFLEX_FEEDBACK_SCOPE=root|visited_path`: root ablation (default) or mean
-  feedback from proposal contexts actually entered by the verifier; one state
-  update per verification round, never counterfactual branches.
-- No Reflex backward, optimizer, persistent model update, or extra target forward.
-- `REFLEX_PROFILE=0` and `REFLEX_DIAGNOSTICS=0` are the defaults; diagnostic LK
-  loss is not evaluated in that default path.
-- `REFLEX_BACKEND=triton` and `REFLEX_UPDATE_STREAM=1` are the SpecNaacl
-  production defaults; `REFLEX_FEEDBACK_SCOPE=root` remains default. Each is
-  overrideable. FastGRPO mode creates no Reflex update stream. Run CUDA parity,
-  [component benchmark](scripts/benchmark_reflex_pipeline.py) and
-  [real rollout benchmark](scripts/benchmark_reflex_rollout.py)
-  before trusting GPU speed/quality; local CPU tests are not a B200 benchmark.
-- SpecForge `0.2.0` source is vendored at commit
-  `3cb0510f0bd0e8c195ac6e9c5c62f6b50580ff83`.
-- The inherited FastGRPO source provenance is
-  `yedaotian9/FastGRPO@38e252493149072d2c5905f0a47de1d935d7170a`.
+Both methods share the same EAGLE-3, compact vocabulary, fused Top16 proposal
+engine, tree construction, target sampler/verifier, GRPO loss/rewards, real
+SpecForge online draft loss/update schedule, checkpoint and step telemetry.
+OPD alone adds a fixed checkpoint-persistent rank-8 projector and one shared
+rollout-local fast adapter, learning from visited/expanded one-hop frontier
+states with existing verification probabilities. No extra transformer forward.
 
-Start with [huongdanchay.md](huongdanchay.md). Technical details are in
-[METHOD_FAST_LK_REFLEX.md](METHOD_FAST_LK_REFLEX.md), and all launcher knobs are
-listed in [RUNNING.md](RUNNING.md).
+Default dataset is simplelr, target/draft LR1e-5, batch8, accumulation4,
+responses8, draft microbatch token budget2048, log1. OPD LR0.01 is configurable,
+TopK16/rank8, profiling/diagnostics OFF. Stream0 is UNTUNED conservative default:
+benchmark0/1 on your B200 before claiming which is faster.
 
-For a network-isolated B200, do not install directly from `requirements.txt`.
-Build and validate a binary wheelhouse first; the exact commands and the
-`cuda-tile` placeholder explanation are in
-[OFFLINE_INSTALL.md](OFFLINE_INSTALL.md) and [ENVIRONMENT.md](ENVIRONMENT.md).
-If the server can install ordinary packages itself and only NVIDIA's index is
-blocked, use the much smaller Hugging Face transfer described in
-[EXTERNAL_WHEELS_HF.md](EXTERNAL_WHEELS_HF.md).
+Important exactness boundary: CUDA's shared fused engine uses a deterministic
+low-token-ID tie rule and its FP32 reduction. It is NOT asserted bitwise identical
+to historical Torch topk/softmax on ties. OFF and zero-state OPD in THIS same
+backend are bitwise tested including tree/verifier/tokens/RNG/counts. CPU oracle
+retains legacy Torch's K-dependent tie rule (a debug-only additional topk);
+it is not a production timing baseline.
 
-All new outputs are written under `SpecNaacl/outputs/{pretrain,train}/...`.
-No launcher clones repositories or downloads models/datasets.
-
-Both methods default to 8 responses/prompt, `DRAFT_TRAIN_MAX_TOKENS=2048`,
-and `LOG_INTERVAL=1`. Rollout history uses owned append buffers and clones only
-finished rows; exact per-step/cumulative AAL, timings, throughput and GPU memory
-are exported with the same schema. See [RUNNING.md](RUNNING.md#outputs) for the
-step-label grouping, timing basis and resume behavior.
+Read [huongdanchay.md](huongdanchay.md), [METHOD_OPD_REFLEX.md](METHOD_OPD_REFLEX.md)
+and [IMPLEMENTATION_REPORT.md](IMPLEMENTATION_REPORT.md).
+No model/data/checkpoint paths or dependency pins have been replaced. The
+existing SpecForge architecture, feature capture and training-time unrolling are
+unchanged (vendored commit3cb0510f0bd0e8c195ac6e9c5c62f6b50580ff83).
+No pretrained assets/B200 measurements are invented.

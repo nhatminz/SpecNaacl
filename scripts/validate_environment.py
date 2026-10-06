@@ -12,6 +12,7 @@ import sys
 
 
 IMPORT_NAMES = {
+    "cuda-tile": "cuda.tile",
     "huggingface-hub": "huggingface_hub",
     "latex2sympy2-extended": "latex2sympy2_extended",
     "math-verify": "math_verify",

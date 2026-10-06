@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+"""Frozen-checkpoint end-to-end OPD sweep. Never train policy/draft or fake AAL."""
+import argparse
+import ast
+import csv
+import hashlib
+import json
+from pathlib import Path
+import statistics
+import sys
+import time
+
+ROOT=Path(__file__).resolve().parents[1]
+sys.path.insert(0,str(ROOT))
+
+
+def parse_args(argv=None):
+    p=argparse.ArgumentParser(description=__doc__)
+    for key in ('target-model','draft-checkpoint','draft-config','vocab-mapping','dataset-path','output'):
+        p.add_argument('--'+key,required=True)
+    p.add_argument('--target-adapter',default='')
+    for key,value in (('batch-size',8),('responses',8),('max-length',512),('max-prompt-length',256),
+                      ('verification-capacity',512),('max-verification-num',512),('max-draft-k',8),
+                      ('max-draft-length',5),('min-draft-length',3),('rank',8),('topk',16),
+                      ('iterations',2),('warmup',1)):
+        p.add_argument('--'+key,type=int,default=value)
+    p.add_argument('--fast-lrs',default='0.001,0.01,0.05,0.1')
+    p.add_argument('--streams',default='0,1');p.add_argument('--seeds',default='42,43')
+    p.add_argument('--visited-weight',type=float,default=1.)
+    p.add_argument('--frontier-weight',type=float,default=1.)
+    p.add_argument('--temperature',type=float,default=1.);p.add_argument('--top-p',type=float,default=.95)
+    p.add_argument('--top-k',type=int,default=0);p.add_argument('--draft-length-c',type=float,default=.75)
+    p.add_argument('--attn-implementation',default='eager');p.add_argument('--dtype',choices=['bf16','fp16'],default='bf16')
+    p.add_argument('--profile',action='store_true',help='Separate same-seed replay, excluded from wall/throughput')
+    p.add_argument('--diagnostics',action='store_true',help='Opt-in end-rollout B norm; excluded by default')
+    p.add_argument('--dry-run',action='store_true')
+    a=p.parse_args(argv)
+    a.lr_values=[float(x) for x in a.fast_lrs.split(',')];a.stream_values=[int(x) for x in a.streams.split(',')]
+    a.seed_values=[int(x) for x in a.seeds.split(',')]
+    if any(x<0 for x in a.lr_values) or not set(a.stream_values)<={0,1} or not a.seed_values:
+        p.error('LR>=0, streams=0/1, nonempty seeds required')
+    if min(a.batch_size,a.responses,a.iterations,a.max_length,a.max_prompt_length,a.rank,a.topk)<=0 or a.topk<a.max_draft_k:
+        p.error('positive sizes and OPD_TOPK>=max_draft_k required')
+    if a.warmup<0:p.error('warmup cannot be negative')
+    return a
+
+
+def collator(tokenizer,max_prompt_length):
+    source=ROOT/'grpo_speculative.py'
+    node=next(n for n in ast.parse(source.read_text()).body if isinstance(n,ast.ClassDef) and n.name=='TrainDataCollator')
+    scope={};exec(compile(ast.Module(body=[node],type_ignores=[]),str(source),'exec'),scope)
+    return scope['TrainDataCollator'](tokenizer,max_prompt_length)
+
+
+def release_runtime_cache(model):
+    # Benchmark boundaries only. Don't charge a previous mode's retained pools.
+    for name in ('_opd_runtime_cache','_opd_tree_mask_workspace'):
+        if hasattr(model,name):delattr(model,name)
+
+
+def summarize(rows):
+    tokens=sum(r['generated_tokens'] for r in rows);wall=sum(r['generation_wall_s'] for r in rows)
+    rounds=sum(r['verification_rounds'] for r in rows);accepted=sum(r['accepted_length_sum'] for r in rows)
+    proposed=sum(r['proposed_draft_tokens'] for r in rows)
+    result=dict(aal=accepted/rounds if rounds else 0.,verification_rounds=rounds,
+        draft_acceptance_rate=sum(r['accepted_draft_tokens'] for r in rows)/proposed if proposed else 0.,
+        generated_tokens=tokens,generation_wall_s=wall,tokens_per_s=tokens/wall if wall else 0.,
+        median_wall_s=statistics.median(r['generation_wall_s'] for r in rows),
+        peak_allocated_bytes=max(r['peak_allocated_bytes'] for r in rows),
+        peak_reserved_bytes=max(r['peak_reserved_bytes'] for r in rows))
+    for name,denominator in (('opd_kl','opd_state_weight'),('opd_mean_union_size','opd_selected_states'),
+            ('opd_target_compact_mass','opd_selected_states'),('opd_target_mass_in_draft_top16','opd_selected_states'),
+            ('opd_active_token_rows','opd_rounds')):
+        raw={'opd_kl':'opd_kl_sum','opd_mean_union_size':'opd_union_size_sum',
+            'opd_target_compact_mass':'opd_compact_mass_sum','opd_target_mass_in_draft_top16':'opd_draft_topk_target_mass_sum',
+            'opd_active_token_rows':'opd_active_rows_sum'}[name]
+        d=sum(r.get(denominator,0.) for r in rows)
+        result[name]=sum(r.get(raw,0.) for r in rows)/d if d else None
+    for name in ('opd_selected_states','opd_visited_states','opd_frontier_states','opd_updates','opd_invalid_states'):
+        result[name]=sum(r.get(name,0.) for r in rows)
+    result['opd_nonfinite_kl_states']=sum(r.get('opd_nonfinite_kl_states',0.) for r in rows)
+    if result['opd_nonfinite_kl_states']:result['opd_kl']=None
+    return result
+
+
+def benchmark(args):
+    import torch
+    from transformers import AutoModelForCausalLM,AutoTokenizer
+    from helper.eagle3_specforge import Eagle3FastGRPOAdapter
+    from helper.get_QAs import get_QAs_from_path
+    from helper.specualtive_generate import speculative_generate
+    from helper.opd_reflex import OPD_COUNTER_NAMES
+    if not torch.cuda.is_available():raise RuntimeError('real CUDA + configured pretrained checkpoints required')
+    dtype=torch.bfloat16 if args.dtype=='bf16' else torch.float16
+    torch.cuda.set_device(0);torch.manual_seed(args.seed_values[0])
+    target=AutoModelForCausalLM.from_pretrained(args.target_model,torch_dtype=dtype,
+        attn_implementation=args.attn_implementation,local_files_only=True).cuda().eval()
+    model=Eagle3FastGRPOAdapter(target,args.draft_config,args.draft_checkpoint,args.vocab_mapping,
+                              opd_rank=args.rank).cuda().eval()
+    if args.target_adapter:
+        from peft import PeftModel
+        model.target_model=PeftModel.from_pretrained(model.target_model,args.target_adapter).eval()
+    tokenizer=AutoTokenizer.from_pretrained(args.target_model,padding_side='left',local_files_only=True)
+    if tokenizer.pad_token_id is None:tokenizer.pad_token=tokenizer.eos_token
+    if target.config.model_type=='llama':tokenizer.pad_token,tokenizer.pad_token_id='<|end_of_text|>',128001
+    dataset=get_QAs_from_path(args.dataset_path,'train')
+    required=args.batch_size*args.iterations
+    if len(dataset)<required:raise ValueError(f'need {required} ordered prompts; found {len(dataset)}')
+    make_batch=collator(tokenizer,args.max_prompt_length)
+    batches=[]
+    for offset in range(0,required,args.batch_size):
+        batch=make_batch(dataset[offset:offset+args.batch_size])
+        if batch['input_ids'].shape[1]>=args.max_length:raise ValueError('prompt exhausts total max_length')
+        batches.append({k:batch[k].cuda() for k in ('input_ids','attention_mask')})
+    count={'target':0,'draft':0}
+    target_hook=target.model.register_forward_pre_hook(lambda *unused:count.__setitem__('target',count['target']+1))
+    draft_hook=model.register_forward_pre_hook(lambda *unused:count.__setitem__('draft',count['draft']+1))
+    base=dict(do_sample=True,repeated_generate_nums=args.responses,max_length=args.max_length,
+        temperature=args.temperature,top_p=args.top_p,top_k=args.top_k or None,
+        verification_capacity=args.verification_capacity,max_verification_num=args.max_verification_num,
+        max_draft_token_length=args.max_draft_length,min_draft_token_length=args.min_draft_length,
+        draft_token_length_c=args.draft_length_c,max_draft_k=args.max_draft_k,opd_rank=args.rank,opd_topk=args.topk,
+        opd_visited_weight=args.visited_weight,opd_frontier_weight=args.frontier_weight,
+        opd_profile=False,opd_diagnostics=args.diagnostics,statistical_time=False)
+    def run(method,lr,stream,batch,seed):
+        torch.manual_seed(seed);before=count.copy()
+        out=speculative_generate(model,batch['input_ids'],batch['attention_mask'],tokenizer,
+            method=method,opd_fast_lr=lr,opd_update_stream=bool(stream),**base)
+        return out,{k:count[k]-before[k] for k in count}
+    configurations=[('fastgrpo',0.,0)]+[('opd_reflex',lr,s) for lr in args.lr_values for s in args.stream_values]
+    reports=[];response_file=Path(args.output)/'responses.jsonl'
+    try:
+        off,c0=run('fastgrpo',0.,0,batches[0],args.seed_values[0])
+        empty,c1=run('opd_reflex',0.,1,batches[0],args.seed_values[0])
+        if off['generated_token_ids']!=empty['generated_token_ids'] or c0!=c1:
+            raise AssertionError('zero-state identity/forward counts failed; discard benchmark')
+        for method,lr,stream in configurations:
+            torch.cuda.synchronize();release_runtime_cache(model)
+            # Warm exactly the measured seed/prompt schedule: compaction gives
+            # shape-specialized kernels, so warming only one seed hides JIT cost.
+            for _ in range(args.warmup):
+                for seed in args.seed_values:
+                    for i,batch in enumerate(batches):run(method,lr,stream,batch,seed+i)
+            rows=[];measured_total_begin=time.perf_counter()
+            for seed in args.seed_values:
+                for i,batch in enumerate(batches):
+                    actual_seed=seed+i
+                    torch.cuda.synchronize();torch.cuda.reset_peak_memory_stats();started=time.perf_counter()
+                    output,forwards=run(method,lr,stream,batch,actual_seed)
+                    torch.cuda.synchronize();wall=time.perf_counter()-started
+                    allocated,reserved=torch.cuda.max_memory_allocated(),torch.cuda.max_memory_reserved()
+                    if forwards['target']!=1+output['batch_verification_rounds']:raise AssertionError('extra target forward')
+                    row=dict(method=method,fast_lr=lr,update_stream=stream,seed=actual_seed,prompt_offset=i*args.batch_size,
+                        generation_wall_s=wall,generated_tokens=sum(output['response_generated_tokens']),
+                        accepted_length_sum=output['total_acc_length'],verification_rounds=output['total_decoded_token_num'],
+                        accepted_draft_tokens=output['total_accepted_draft_tokens'],proposed_draft_tokens=output['total_proposed_draft_tokens'],
+                        peak_allocated_bytes=allocated,peak_reserved_bytes=reserved,**forwards,
+                        **{k:output.get(k,0.) for k in OPD_COUNTER_NAMES})
+                    row.update({k:v for k,v in output.items() if k.startswith('opd_final_')})
+                    if args.profile:
+                        # Diagnostic replay does not evict warmed non-profile pools.
+                        cache=getattr(model,'_opd_runtime_cache',None)
+                        model._opd_runtime_cache={};base['opd_profile']=True
+                        try:profile,_=run(method,lr,stream,batch,actual_seed)
+                        finally:base['opd_profile']=False;model._opd_runtime_cache=cache
+                        if profile['generated_token_ids']!=output['generated_token_ids']:
+                            raise AssertionError('profiling changed output; discard timings')
+                        row['profile_sections_ms']=profile['opd_profile_sections_ms']
+                    with response_file.open('a') as f:
+                        for response,(tokens,a,n) in enumerate(zip(output['generated_token_ids'],output['response_accepted_length_sum'],output['response_verification_rounds'])):
+                            f.write(json.dumps(dict(method=method,fast_lr=lr,update_stream=stream,seed=actual_seed,
+                                prompt_index=i*args.batch_size+response//args.responses,response_index=response%args.responses,
+                                accepted_length_sum=a,verification_rounds=n,generated_tokens=len(tokens),
+                                token_ids_sha256=hashlib.sha256(json.dumps(tokens).encode()).hexdigest()))+'\n')
+                    rows.append(row)
+            result=dict(method=method,fast_lr=lr,update_stream=stream,**summarize(rows),rollouts=rows,
+                measured_total_wall_s=time.perf_counter()-measured_total_begin)
+            reports.append(result)
+        baseline=reports[0]
+        for result in reports:
+            result['delta_aal']=result['aal']-baseline['aal']
+            result['relative_generation_overhead_percent']=100*(result['generation_wall_s']/baseline['generation_wall_s']-1)
+        # Keep all results, including negative AAL/cost > benefit. Throughput wins
+        # are not automatically called AAL improvements or production defaults.
+        best=max(reports[1:],key=lambda x:x['tokens_per_s'])
+        goal_candidates=[x for x in reports[1:] if x['delta_aal']>0 and x['tokens_per_s']>=baseline['tokens_per_s']]
+        recommendation=max(goal_candidates,key=lambda x:x['tokens_per_s']) if goal_candidates else None
+        payload=dict(gpu=torch.cuda.get_device_name(),torch=torch.__version__,config=vars(args),
+            zero_state_identity=True,reports=reports,
+            fastest_observed=dict(method=best['method'],fast_lr=best['fast_lr'],update_stream=best['update_stream'],
+                delta_aal=best['delta_aal'],tokens_per_s=best['tokens_per_s']),
+            recommendation=None if recommendation is None else dict(fast_lr=recommendation['fast_lr'],
+                update_stream=recommendation['update_stream'],delta_aal=recommendation['delta_aal']),
+            note='Frozen policy/draft; both methods share fused Top16 engine. Wall includes ALL OPD work. Separate profiling replay excluded from generation wall. Same seed does not imply same generated responses. No full training/native-B200 claim from a microbenchmark.')
+        return payload
+    finally:target_hook.remove();draft_hook.remove()
+
+
+def main():
+    args=parse_args()
+    if args.dry_run:print(json.dumps(vars(args),indent=2));return
+    output=Path(args.output)
+    if output.exists():raise FileExistsError('use a NEW benchmark output directory')
+    for path in (Path(args.target_model)/'config.json',Path(args.draft_config),Path(args.vocab_mapping),Path(args.dataset_path)):
+        if not path.is_file():raise FileNotFoundError(path)
+    if not Path(args.draft_checkpoint).exists():raise FileNotFoundError(args.draft_checkpoint)
+    output.mkdir(parents=True)
+    result=benchmark(args)
+    (output/'report.json').write_text(json.dumps(result,indent=2)+'\n')
+    flat=[{k:v for k,v in x.items() if k!='rollouts'} for x in result['reports']]
+    with (output/'summary.csv').open('w',newline='') as f:
+        writer=csv.DictWriter(f,fieldnames=list(flat[0]));writer.writeheader();writer.writerows(flat)
+    fastest=result['fastest_observed']
+    (output/'fastest_observed.env').write_text(f"# NOT an automatic recommendation. Measured subset delta AAL={fastest['delta_aal']}. Validate held-out prompts.\nexport OPD_FAST_LR={fastest['fast_lr']}\nexport OPD_UPDATE_STREAM={fastest['update_stream']}\n")
+    print(json.dumps({k:v for k,v in result.items() if k!='reports'},indent=2))
+
+
+if __name__=='__main__':main()

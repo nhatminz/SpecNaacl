@@ -8,20 +8,25 @@ import time
 
 import torch
 import torch.distributed as dist
+from helper.opd_reflex import OPD_COUNTER_NAMES,GENERATION_COUNTER_NAMES
 
 
 COUNTERS = (
     'wall_time_s', 'generation_time_s', 'target_train_time_s', 'draft_train_time_s',
     'rollout_tokens', 'accepted_tokens', 'verification_rounds',
     'accepted_draft_tokens', 'proposed_draft_tokens',
-)
+)+OPD_COUNTER_NAMES+GENERATION_COUNTER_NAMES
+DERIVED_OPD_FIELDS=tuple(f'{prefix}_{name}' for prefix in ('step','cumulative') for name in (
+    'opd_kl','opd_mean_union_size','opd_target_compact_mass','opd_target_mass_in_draft_top16',
+    'opd_active_token_rows','mean_active_responses_per_verify_round','mean_verified_tree_nodes',
+    'mean_verified_path_length','mean_frontier_per_visited_state'))
 MEMORY_FIELDS = ('gpu_allocated_gb', 'gpu_reserved_gb', 'gpu_peak_allocated_gb', 'gpu_free_gb')
 STEP_FIELDS = ('step', 'method', 'grpo_step', 'phase_time_basis') + tuple(
     f'{prefix}_{name}' for prefix in ('cumulative', 'step') for name in COUNTERS
 ) + (
     'step_generation_tokens_per_s', 'cumulative_generation_tokens_per_s',
     'step_aal', 'cumulative_aal', 'step_acceptance_rate', 'cumulative_acceptance_rate',
-) + MEMORY_FIELDS + ('rollout_tokens', 'tokens_per_s', 'aal', 'acceptance_rate')
+) + DERIVED_OPD_FIELDS + MEMORY_FIELDS + ('rollout_tokens', 'tokens_per_s', 'aal', 'acceptance_rate')
 
 
 class PhaseTimings:
@@ -103,6 +108,7 @@ def completed_step_snapshot(global_metrics, data, timings, device, wall_time_s):
         'cumulative_accepted_draft_tokens': int(global_metrics['total_accepted_draft_tokens']),
         'cumulative_proposed_draft_tokens': int(global_metrics['total_proposed_draft_tokens']),
         'phase_time_basis': timings.basis,
+        **{f'cumulative_{name}':float(global_metrics.get(name,0.)) for name in OPD_COUNTER_NAMES+GENERATION_COUNTER_NAMES},
         **memory,
     }
 
@@ -114,7 +120,8 @@ def step_record(step, current, previous, extras=None):
     result['step'] = int(step)
     for name in COUNTERS:
         field = f'cumulative_{name}'
-        result[f'step_{name}'] = current[field] - previous.get(field, 0)
+        result[field]=current.get(field,0.)
+        result[f'step_{name}'] = result[field] - previous.get(field, 0)
     for prefix in ('step', 'cumulative'):
         tokens = result[f'{prefix}_rollout_tokens']
         elapsed = result[f'{prefix}_generation_time_s']
@@ -124,6 +131,21 @@ def step_record(step, current, previous, extras=None):
         proposed = result[f'{prefix}_proposed_draft_tokens']
         result[f'{prefix}_acceptance_rate'] = (
             result[f'{prefix}_accepted_draft_tokens'] / proposed if proposed > 0 else 0.0)
+        def ratio(numerator,denominator):
+            n=result[f'{prefix}_{numerator}'];d=result[f'{prefix}_{denominator}']
+            return n/d if d>0 else None
+        for name,numerator,denominator in (
+            ('opd_kl','opd_kl_sum','opd_state_weight'),
+            ('opd_mean_union_size','opd_union_size_sum','opd_selected_states'),
+            ('opd_target_compact_mass','opd_compact_mass_sum','opd_selected_states'),
+            ('opd_target_mass_in_draft_top16','opd_draft_topk_target_mass_sum','opd_selected_states'),
+            ('opd_active_token_rows','opd_active_rows_sum','opd_rounds'),
+            ('mean_active_responses_per_verify_round','active_response_rounds','verification_batches'),
+            ('mean_verified_tree_nodes','verified_tree_nodes','verification_rounds'),
+            ('mean_verified_path_length','accepted_tokens','verification_rounds'),
+            ('mean_frontier_per_visited_state','opd_frontier_states','opd_visited_states'),
+        ):result[f'{prefix}_{name}']=ratio(numerator,denominator)
+        if result[f'{prefix}_opd_nonfinite_kl_states']>0:result[f'{prefix}_opd_kl']=None
     # Legacy plotting columns keep their former cumulative meaning.
     result.update(rollout_tokens=result['cumulative_rollout_tokens'],
                   tokens_per_s=result['cumulative_rollout_tokens'] / max(result['cumulative_wall_time_s'], 1e-9),
