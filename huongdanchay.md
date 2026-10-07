@@ -9,6 +9,7 @@ cd /workspace/storage-shared/nlp/minhpn19/SpecNaacl
 source .venv/bin/activate
 export PYTHON_BIN="$(command -v python)"
 export CUDA_VISIBLE_DEVICES=0
+export ATTENTION_IMPLEMENTATION=sdpa # target; eager vẫn override được
 export DATASET=simplelr
 export TARGET_LR=1e-5
 export DRAFT_LR=1e-5
@@ -147,7 +148,8 @@ Sau khi process bị device assert đã thoát, dùng process Python mới:
 ```bash
 cd /workspace/storage-shared/nlp/minhpn19/SpecNaacl
 export PYTHON_BIN="$(command -v python)"
-CUDA_VISIBLE_DEVICES=0 "$PYTHON_BIN" -m pytest -q tests/test_tree_confidence_selection.py
+CUDA_VISIBLE_DEVICES=0 "$PYTHON_BIN" -m pytest -q \
+  tests/test_tree_confidence_selection.py tests/test_opd_proposal_lifetime.py
 
 # Hai GRPO steps thực trước khi chạy dài, model/data/draft giữ nguyên.
 CUDA_VISIBLE_DEVICES=0 DATASET=gsm8k MAX_TRAIN_SAMPLES=128 \
@@ -160,3 +162,37 @@ CUDA_VISIBLE_DEVICES=0 DATASET=gsm8k PYTHON_BIN="$PYTHON_BIN" \
 
 Pruning mới giữ confidence FP32 nguyên vẹn, dùng node index làm secondary key
 để cha thắng con khi tie. Không đổi target sampling hoặc historical FastGRPO.
+
+Bản sửa tiếp theo còn giữ riêng root confidence trong buffer `B*K` preallocated:
+`OPDReflex.propose()` trả view tạm thời, bị ghi đè ở proposal kế tiếp. Không giữ
+view này trong history confidence; không clone toàn vocab. Cần đồng bộ thêm
+`helper/opd_reflex_kernels.py` và `tests/test_opd_proposal_lifetime.py` cùng các
+file trên. Test mới thay đổi distribution theo depth và batch row để bắt lỗi
+alias mà test distribution cố định không phát hiện. Kernel cũng xử lý đúng
+tile toàn `-inf` (mass=0) và không emit lại token đã chọn ở các slot probability0.
+Nếu đang dùng profile adaptive cũ, retune sau khi cập nhật kernel hash; không
+tắt fingerprint check để dùng profile từ revision khác.
+
+## Target attention: SDPA default
+
+Theo yêu cầu mới, shared config và direct training/benchmark CLI đều mặc định
+`sdpa` thay vì `eager`. Draft EAGLE-3 runtime/online trainer vốn đã dùng SDPA.
+Không cần cài thêm flash-attn để gọi PyTorch SDPA. Custom tree mask vẫn giữ
+nguyên; PyTorch chọn kernel thích hợp, không đảm bảo luôn là flash kernel.
+Backend này có thể thay đổi floating-point rounding/tokens so với eager;
+không coi hai backend là bitwise-identical hoặc exact resume qua backend khác.
+Đo cùng backend cho OPD/FastGRPO, không ghép eager baseline với SDPA OPD.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 ATTENTION_IMPLEMENTATION=sdpa MAX_TRAIN_SAMPLES=128 \
+  PYTHON_BIN="$PYTHON_BIN" bash train_qwen3_1p7b.sh --max_grpo_steps 2
+CUDA_VISIBLE_DEVICES=0 ATTENTION_IMPLEMENTATION=sdpa \
+  PYTHON_BIN="$PYTHON_BIN" bash train_qwen3_1p7b.sh
+
+# Khi muốn giữ backend trước đây:
+ATTENTION_IMPLEMENTATION=eager bash train_qwen3_1p7b.sh
+```
+
+Log startup phải ghi `attn_impl=sdpa`; benchmark sweep dùng cùng biến
+`ATTENTION_IMPLEMENTATION`. Native Qwen/B200 SDPA training chưa được đo tại
+máy phát triển vì weights/data production không có ở đây.

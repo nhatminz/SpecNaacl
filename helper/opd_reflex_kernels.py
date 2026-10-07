@@ -91,7 +91,10 @@ def _corrected_scan(Z,SCORES,BITS,MAX,SUM,VALUES,IDS,ZS0,ZS1,ZS2,
         raw=tl.where(active,corrected,raw)
     z=tl.where(v<V,raw,-float('inf'));live=v<V
     maximum=tl.max(z,axis=0)
-    total=tl.sum(tl.where(live,tl.exp(z-maximum),0.),axis=0)
+    # An all-masked tile has mass zero, not exp(-inf - -inf)=NaN.
+    # Finite tiles keep exactly the previous subtraction/reduction semantics.
+    shift=tl.where(maximum==-float('inf'),0.,maximum)
+    total=tl.sum(tl.where(live,tl.exp(z-shift),0.),axis=0)
     offset=(batch*C+context)*TILES+tile
     tl.store(MAX+offset,maximum);tl.store(SUM+offset,total)
     for j in range(K):

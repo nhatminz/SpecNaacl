@@ -142,6 +142,9 @@ class OPDReflex:
             # Small tree-only lexicographic keys, reused even as the batch shrinks.
             full_nodes=max_proposal_contexts * max_contexts
             self.confidence_key_workspace=alloc(batch*full_nodes,torch.int64)
+            # Root probabilities outlive the next propose(), whose outputs are
+            # views of shared scratch. Keep only B*K values, not all logits.
+            self.tree_root_confidences=alloc((batch,max_proposal_contexts))
             if self.enabled:
                 self.head_cache=alloc((batch,max_contexts,hidden_size),self.head.weight.dtype)
                 self.u_cache=alloc((batch,max_contexts,self.rank))
@@ -175,6 +178,12 @@ class OPDReflex:
 
     @torch.no_grad()
     def propose(self,logits,hidden,k,mapping,*,root=False,context_offset=0,head_inputs=None):
+        """Return transient q/id views, valid only until the next propose().
+
+        Context caches are independent. Consumers retaining returned values
+        across proposal calls must copy just the retained slice to owned storage.
+        Mapped target IDs are already independently materialized by indexing.
+        """
         b,c,v=logits.shape;keep=self.topk
         self.logits_dtype=logits.dtype
         if k>keep or v!=self.vocab:raise ValueError('proposal k/vocabulary mismatch')

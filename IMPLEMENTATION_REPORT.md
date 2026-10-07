@@ -1,6 +1,56 @@
 # Learned OPD / historical baseline optimization — 2026-10-07
 
+## User-requested SDPA target default
+
+Previous target default was eager; EAGLE-3 draft runtime and online trainer were
+already SDPA. Changed shared config, all14 paired model launchers, direct GRPO
+CLI and frozen benchmark CLI to target sdpa, with ATTENTION_IMPLEMENTATION=eager
+override preserved. Both methods use the same selected backend. No sampler,
+tree, reward, optimizer or draft-training algorithm change in this update.
+SDPA is not guaranteed to choose a flash kernel with arbitrary tree masks, or
+to be bitwise identical/faster than eager; no B200 speedup claimed.
+Native PyTorch FP32/BF16 tests cover cached-prefix/left-padding/branch masks,
+forward/backward and blocked-branch isolation on CPU and RTX3090. Native Qwen
+Transformers5.12.1/B200 end-to-end smoke still requires server assets.
+Modified configs/_shared/b200_common.env,14 train wrappers, grpo_speculative.py,
+scripts/benchmark_opd_reflex.py, tests/test_shell_scripts.py, huongdanchay.md;
+added tests/test_sdpa_tree_attention.py. Dependencies unchanged.
+
 ## Follow-up: confidence tree parent-closure crash
+
+### Second traceback: reusable proposal scratch alias (supersedes tie-only diagnosis)
+
+Server tree_kernels.py line168 confirms the tie fix WAS deployed; the remaining
+failure was not an old checkout. Reproduced before this fix with different
+root/child/grandchild distributions, even WITH deterministic confidence ties:
+root confidence was a view of proposal_q, overwritten by the next expansion.
+Earlier same-distribution fixtures masked this lifetime error.
+
+Root beam/confidence history now copies only B*K FP32 values into separately
+preallocated storage. Expansion products/gathers already own their storage;
+mapped target IDs are materialized and context caches copied before scratch
+reuse. No per-vocab cloning, additional transformer forward or CUDA sync.
+Added independent snapshot oracle for actual nested draft_generate, batch64,
+depth3/5, K3/7/8, changing batch/context layouts, repeated buffer reuse and CUDA.
+
+Tests also exposed two masked-logit edge cases: all--inf scan tiles produced
+NaN mass; exhausted Top16 candidates could repeat IDs at q0. Corrected zero
+tile mass and explicit merge eligibility, with support1/3/8 across vocab257/521.
+Finite-logit normalization and historical baseline code unchanged. Kernel hash
+changed: retune any existing adaptive profile, do NOT bypass its fingerprint.
+One test assertion compared uninitialized cache capacity by floating equality
+(NaN != NaN); it now checks bitwise equality over the SAME entire capacity.
+
+Modified helper/{opd_reflex,opd_reflex_kernels,specualtive_generate,tree_kernels}.py,
+tests/test_opd_reflex.py; added tests/test_opd_proposal_lifetime.py; updated docs.
+Final focused rerun: **237 passed, 3 skipped, 1 pre-existing torch.load warning**
+on CPU and real RTX3090 CUDA (Torch2.5.1+cu124/Triton3.1). Includes original
+historical output tests, stream0/1 rollouts, learned-A gradient/checkpoint tests,
+independent changing-distribution tree oracle and masked-logit tests. compileall,
+shell/source/diff checks and local pip check pass. This is NOT a native Qwen/B200
+end-to-end training pass; the server's actual two-step smoke is still required.
+Native B200 Qwen training remains untested locally because weights/data absent;
+see two-step server smoke instructions. Dependency pins not changed.
 
 Server traceback starts at the retained parent-closure device assertion, not
 Triton compilation or a library version mismatch. Reproduced BEFORE the fix on

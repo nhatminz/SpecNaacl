@@ -106,7 +106,9 @@ def test_shared_weighted_update_union_tail_selected_head_and_counters_match_dens
     before_u=s.u_cache.clone()
     s.feedback(tree,path,target)
     torch.testing.assert_close(s.B_fast,expected,rtol=4e-5,atol=2e-7)
-    assert torch.equal(s.u_cache,before_u)  # no feature extraction/forward during feedback
+    # Unused preallocated torch.empty capacity may contain NaN bit patterns.
+    # Compare bytes, not NaN-sensitive floating equality, to prove NO writes.
+    assert torch.equal(s.u_cache.view(torch.int32),before_u.view(torch.int32))
     counters=dict(zip(OPD_COUNTER_NAMES,s.counters.cpu().tolist()))
     assert counters['opd_selected_states']==9-int(invalid)
     assert counters['opd_visited_states']==6-int(invalid) and counters['opd_frontier_states']==3

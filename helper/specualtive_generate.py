@@ -143,7 +143,11 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
         else:
             (compact_logits, head_inputs) = (model.compute_compact_logits(draft_hidden_states), draft_hidden_states)
         (next_token_values, _, draft_next_token) = opd.propose(compact_logits, draft_hidden_states, draft_k, compact_to_target, root=True, context_offset=0, head_inputs=head_inputs)
-        draft_confidences = next_token_values.view(bsz, -1)
+        # propose() returns a view of reused proposal_q scratch. Both the first
+        # beam and confidences[0] must survive later expansion proposals. Merely
+        # view()/detach() aliases that scratch and silently rewrites tree scores.
+        draft_confidences = opd.tree_root_confidences[:bsz, :draft_k]
+        draft_confidences.copy_(next_token_values[:, 0, :])
         past_kv_len = draft_past_key_values_tree[0][0].shape[-2]
         init_kv_len = draft_past_key_values_tree[0][0].shape[-2]
         draft_next_token = draft_next_token.view(bsz, -1)

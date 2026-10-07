@@ -30,7 +30,7 @@ def parse_args(argv=None):
     p.add_argument('--frontier-weight',type=float,default=1.)
     p.add_argument('--temperature',type=float,default=1.);p.add_argument('--top-p',type=float,default=.95)
     p.add_argument('--top-k',type=int,default=0);p.add_argument('--draft-length-c',type=float,default=.75)
-    p.add_argument('--attn-implementation',default='eager');p.add_argument('--dtype',choices=['bf16','fp16'],default='bf16')
+    p.add_argument('--attn-implementation',default='sdpa');p.add_argument('--dtype',choices=['bf16','fp16'],default='bf16')
     p.add_argument('--profile',action='store_true',help='Separate same-seed replay, excluded from wall/throughput')
     p.add_argument('--diagnostics',action='store_true',help='Opt-in end-rollout B norm; excluded by default')
     p.add_argument('--dry-run',action='store_true')

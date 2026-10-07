@@ -72,12 +72,15 @@ def _proposal_merge(MAX, SUM, VALUES, IDS, PROBS, TOP_IDS, NORM,
     candidates = tl.arange(0, BK)
     values = tl.load(VALUES + row * TILES * K + candidates, candidates < TILES * K, other=-float('inf'))
     ids = tl.load(IDS + row * TILES * K + candidates, candidates < TILES * K, other=VOCAB)
+    live = (candidates < TILES * K) & (ids < VOCAB)
     for k in range(K):
-        value = tl.max(values, axis=0)
-        index = tl.min(tl.where(values == value, ids, VOCAB), axis=0)
+        value = tl.max(tl.where(live, values, -float('inf')), axis=0)
+        index = tl.min(tl.where(live & (values == value), ids, VOCAB), axis=0)
         tl.store(PROBS + row * K + k, tl.div_rn(tl.exp(value - maximum), total))
         tl.store(TOP_IDS + row * K + k, index)
-        values = tl.where(ids == index, -float('inf'), values)
+        # -inf is also a legitimate masked score. Keep selection eligibility
+        # separately, or exhausted finite candidates are emitted again at q=0.
+        live = live & (ids != index)
 
 @triton.jit
 def _trace_path(PARENTS, TOKENS, CONTEXTS, SAMPLES, OUT_T, OUT_I, OUT_C, LENGTHS,

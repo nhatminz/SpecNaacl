@@ -36,6 +36,14 @@ encoder writes into a reused small tree-key buffer, not a full-vocabulary
 sort. This tie rule is OPD-only; historical pruning is untouched, and the
 parent-closure device assertion remains enabled. No epsilon/probability change,
 additional target forward, RNG draw or host synchronization is introduced.
+Proposal q/compact-ID outputs are transient views of reusable scratch. The root
+beam/history confidence is copied ONCE into a separate preallocated B*K buffer
+before expansion; child confidence multiplication/gathers already create owned
+tensors. This prevents later proposals from rewriting earlier probability
+products or mixing batch/context rows. No full-vocab cloning. Masked all--inf
+logit tiles contribute zero mass; Top16 merge keeps selection eligibility separate
+from score so zero-probability slots have unique, valid IDs. Finite-logit
+normalization and historical FastGRPO remain unchanged.
 Target sampling and verifier rules unchanged. Actual trajectories/round counts
 may differ; no extra forwards means existing prefill/verify/expand/committed work
 per round, not forcing equal totals when AAL changes.

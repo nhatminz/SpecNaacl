@@ -27,7 +27,8 @@ def test_paired_model_launchers_only_differ_by_method_and_keep_paths_hyperparame
                            ('--accumulation_steps','4'),('--repeated_generate_nums','8'),
                            ('--opd_rank','8'),('--opd_topk','16'),('--opd_fast_lr','0.01'),
                            ('--opd_update_stream','0'),('--opd_profile','0'),('--opd_diagnostics','0'),
-                           ('--train_option','simplelr_abel_level3to5'),('--log_interval','1')):
+                           ('--train_option','simplelr_abel_level3to5'),('--log_interval','1'),
+                           ('--attn_implementation','sdpa')):
             assert flags[flag]==value
         assert flags['--adapter_path'].endswith(f'/pretrain/{key}/latest_checkpoint')
         assert flags['--dataset_path']=='/workspace/storage-shared/nlp/minhpn19/data/simplelr_abel_level3to5/train.parquet'
@@ -70,6 +71,13 @@ def test_only_two_methods_and_old_lk_arguments_are_gone():
     with pytest.raises(ValueError):resolve_method('specnaacl')
     source=(ROOT/'grpo_speculative.py').read_text()
     assert '--reflex_lr' not in source and '--reflex_mode' not in source
+
+
+@pytest.mark.parametrize('suffix', ['', '_fastgrpo'])
+@pytest.mark.parametrize('backend', ['eager', 'sdpa'])
+def test_target_attention_override_reaches_both_methods(suffix, backend):
+    args=command(f'train_qwen3_1p7b{suffix}.sh', ATTENTION_IMPLEMENTATION=backend)
+    assert args[args.index('--attn_implementation')+1] == backend
 
 def test_pretrain_wrapper_reports_explicit_backend_topology_and_batch():
     env = dict(os.environ, DRY_RUN="true", PYTHON_BIN=PYTHON,
