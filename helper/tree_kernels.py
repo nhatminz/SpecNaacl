@@ -4,24 +4,6 @@ import triton
 import triton.language as tl
 
 
-@triton.jit(do_not_specialize=["N","S0","S1"])
-def _confidence_keys(SCORES, KEYS, N, S0, S1,
-                     BLOCK: tl.constexpr):
-    row = tl.program_id(0).to(tl.int64)
-    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    score = tl.load(SCORES + row * S0 + col * S1, col < N, other=0.)
-    bits = score.to(tl.int32, bitcast=True).to(tl.int64)
-    bits = tl.where(score == 0., 0, bits)
-    key = (bits << 32) | (N - col).to(tl.int64)
-    tl.store(KEYS + row * N + col, key, col < N)
-
-
-def confidence_keys(confidences, keys):
-    batch, nodes = confidences.shape
-    _confidence_keys[(batch, triton.cdiv(nodes, 256))](
-        confidences, keys, nodes, *confidences.stride(), 256, num_warps=4)
-
-
 @triton.jit(do_not_specialize=["B","CAP","PAST","TS0","TS1","IS0","IS1","OS0","OS1","PS0","PS1"])
 def _pad_schedule(TOKENS,INDICES,LENGTHS,OT,OI,OM,LAST,PACKET,SNAPSHOT,
                    B,CAP,PAST,EOS:tl.constexpr,

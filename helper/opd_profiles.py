@@ -130,67 +130,23 @@ def active_trials(vocab,topk=16,points=8):
                    *[min(int(vocab),max(1,round(vocab**(i/max(1,points-2))))) for i in range(points-1)]})
 
 
-def inspect_draft(config_path,checkpoint_path,mapping_path,*,rank=None,dtype=None,topk=16):
-    """Read real config, checkpoint tensor headers and compact mapping, no model load."""
+def inspect_draft(config_path,checkpoint_path,*,rank=None,dtype=None,topk=16):
+    """Inspect original FastGRPO weights and FULL target config, without loading a model."""
     import torch
-    config_path,checkpoint_path,mapping_path=map(Path,(config_path,checkpoint_path,mapping_path))
-    for path in (config_path,checkpoint_path,mapping_path):
-        if not path.exists():raise FileNotFoundError(f'missing draft resource: {path}')
+    config_path,checkpoint_path=map(Path,(config_path,checkpoint_path))
     config=json.loads(config_path.read_text())
-    v=int(config.get('draft_vocab_size') or config['vocab_size']);hidden=int(config['hidden_size'])
-    tensors={};metadata={}
-    files=[checkpoint_path] if checkpoint_path.is_file() else sorted(checkpoint_path.glob('*.safetensors'))
-    if not files:
-        files=[p for name in ('training_state.pt','pytorch_model.bin','draft.pth','draft.pt','model.pt') if (p:=checkpoint_path/name).is_file()]
-        index=checkpoint_path/'pytorch_model.bin.index.json'
-        if not files and index.is_file():
-            files=[checkpoint_path/name for name in sorted(set(json.loads(index.read_text())['weight_map'].values()))]
-        if not files:
-            latest=sorted(checkpoint_path.glob('*-latest'))
-            if len(latest)==1 and (latest[0]/'training_state.pt').is_file():files=[latest[0]/'training_state.pt']
-    if not files:raise ValueError(f'no supported draft weights in {checkpoint_path}')
-    for path in files:
-        if path.suffix=='.safetensors':
-            from safetensors import safe_open
-            with safe_open(str(path),framework='pt',device='cpu') as f:
-                for name in f.keys():
-                    if name.endswith(('lm_head.weight','opd_projector')):
-                        view=f.get_slice(name);tensors[name]=(tuple(view.get_shape()),canonical_dtype({'BF16':'bf16','F16':'fp16','F32':'fp32'}[view.get_dtype()]))
-        else:
-            # mmap/meta reads shape/dtype, not multi-GB checkpoint tensor contents.
-            try:payload=torch.load(path,map_location='meta',weights_only=True,mmap=True)
-            except RuntimeError:payload=torch.load(path,map_location='meta',weights_only=True)
-            metadata=payload.get('metadata',{})
-            state=payload.get('draft_state_dict',payload.get('state_dict',payload))
-            for name,value in state.items():
-                if torch.is_tensor(value) and name.endswith(('lm_head.weight','opd_projector')):
-                    tensors[name]=(tuple(value.shape),canonical_dtype(value.dtype))
-            if torch.is_tensor(payload.get('opd_projector')):
-                value=payload['opd_projector'];tensors['opd_projector']=(tuple(value.shape),canonical_dtype(value.dtype))
-    heads=[value for name,value in tensors.items() if name.endswith('lm_head.weight')]
-    if len(heads)!=1 or heads[0][0]!=(v,hidden):raise ValueError('draft config/checkpoint compact lm_head shape mismatch')
-    for name,(shape,dt) in tensors.items():
-        if name.endswith('opd_projector') and (len(shape)!=2 or shape[0]!=hidden):
-            raise ValueError('checkpoint projector hidden shape differs from draft config')
-    saved_ranks={shape[-1] for name,(shape,dt) in tensors.items() if name.endswith('opd_projector')}
-    if checkpoint_path.is_dir() and (checkpoint_path/'opd_projector.pt').is_file():
-        projector=torch.load(checkpoint_path/'opd_projector.pt',map_location='meta',weights_only=True)
-        if projector.ndim!=2 or projector.shape[0]!=hidden:raise ValueError('exported projector hidden shape mismatch')
-        saved_ranks.add(int(projector.shape[-1]))
-    if metadata.get('opd_rank') is not None:saved_ranks.add(int(metadata['opd_rank']))
-    if len(saved_ranks)>1:raise ValueError('checkpoint projector ranks disagree')
-    detected_rank=next(iter(saved_ranks),int(config.get('opd_rank',8)))
-    actual_rank=int(rank) if rank is not None else detected_rank
-    if saved_ranks and actual_rank!=detected_rank:raise ValueError('requested rank differs from learned checkpoint projector')
+    if checkpoint_path.is_dir():checkpoint_path=checkpoint_path/'draft.pth'
+    payload=torch.load(checkpoint_path,map_location='meta',weights_only=True,mmap=True)
+    if 'draft_model' not in payload:raise ValueError('not a FastGRPO draft checkpoint')
+    state=payload['draft_model'];hidden=int(config['hidden_size']);v=int(config['vocab_size'])
+    if state['fs.up_proj.weight'].shape[1]!=hidden:raise ValueError('target/draft hidden size mismatch')
+    if state['states_last_norm.weight'].shape!=(hidden,):raise ValueError('invalid FastGRPO states head')
+    projector=state.get('opd_projector')
+    detected_rank=8 if projector is None else projector.shape[-1]
+    actual_rank=detected_rank if rank is None else int(rank)
+    if projector is not None and tuple(projector.shape)!=(hidden,actual_rank):raise ValueError('projector rank/hidden mismatch')
     if not 1<=actual_rank<=64:raise ValueError('OPD rank must be in [1,64]')
-    mapping=torch.load(mapping_path,map_location='cpu',weights_only=True)
-    if not isinstance(mapping,dict) or not {'d2t','t2d'}<=mapping.keys():raise ValueError('invalid SpecForge vocabulary mapping')
-    d2t,t2d=mapping['d2t'],mapping['t2d'];target=int(config['vocab_size'])
-    if d2t.ndim!=1 or d2t.numel()!=v or t2d.ndim!=1 or t2d.numel()!=target:raise ValueError('mapping/config vocabulary size mismatch')
-    if d2t.dtype not in (torch.int32,torch.int64) or t2d.dtype!=torch.bool:raise ValueError('invalid mapping tensor dtypes')
-    mapped=torch.arange(v)+d2t.long();selected=torch.nonzero(t2d,as_tuple=False).flatten()
-    if mapped.min()<0 or mapped.max()>=target or torch.unique(mapped).numel()!=v or not torch.equal(mapped.sort().values,selected):
-        raise ValueError('mapping d2t/t2d is inconsistent')
-    return dict(vocab=v,rank=actual_rank,dtype=canonical_dtype(dtype or heads[0][1]),hidden=hidden,
-                topk=min(int(topk),v),checkpoint_dtype=heads[0][1],detected_rank=detected_rank,
-                draft_config=str(config_path),draft_checkpoint=str(checkpoint_path),vocab_mapping=str(mapping_path))
+    checkpoint_dtype=canonical_dtype(state['fs.up_proj.weight'].dtype)
+    return dict(vocab=v,rank=actual_rank,dtype=canonical_dtype(dtype or checkpoint_dtype),hidden=hidden,
+                topk=min(int(topk),v),checkpoint_dtype=checkpoint_dtype,detected_rank=detected_rank,
+                target_config=str(config_path),draft_checkpoint=str(checkpoint_path))

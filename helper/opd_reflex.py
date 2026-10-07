@@ -1,8 +1,8 @@
 """Exact optimized proposal engine and rollout-local OPD Reflex.
 
-A is a persistent learned projector owned/saved by the EAGLE adapter. Its
+A is a persistent learned projector owned/saved by the FastGRPO draft. Its
 analytical gradients accumulate here, but only the existing draft optimizer
-boundary updates A. B_fast is ONE shared compact-vocab adapter, reset every
+boundary updates A. B_fast is ONE shared full-vocabulary adapter, reset every
 rollout. No optimizer/autograd or extra model forward runs here. CUDA production
 requires Triton; Torch is CPU oracle.
 """
@@ -162,7 +162,7 @@ class OPDReflex:
         self._opd_kernels=importlib.import_module('helper.opd_reflex_kernels') if self.backend=='triton' else None
         self.mapping,self.vocab,self.topk,self.max_batch=mapping,v,k,batch
         self.cache_contexts=max_contexts
-        self.head=model.draft_model.lm_head if hasattr(model,'draft_model') else model.draft_head
+        self.head=model.lm_head
         layout=(batch,v,hidden_size,max_contexts,max_nodes,max_path,max_proposal_contexts,k,str(device),self.enabled,self.head.weight.dtype)
         execution_shape=(str(device),v,self.rank,self.head.weight.dtype,k)
         if self._profile_execution_shape is not None and execution_shape!=self._profile_execution_shape:
@@ -181,7 +181,7 @@ class OPDReflex:
             print(f'OPD proposal mode: {self.proposal_mode}\nprofile: {self.profile_path or "NONE (uncalibrated fallback)"}\nGPU: {key["gpu"]} cc{key["compute_capability"]}\nV: {v}\nrank: {self.rank}\ndtype: {key["dtype"]}\nkernel hash: {key["kernel_sha256"]}',flush=True)
             self._validated_tuning=True
         self._profile_execution_shape=execution_shape
-        self.full_vocab_inverse=getattr(model,'opd_full_vocab_inverse',None)
+        self.full_vocab_inverse=mapping  # Full target vocabulary: token IDs are identity.
         self.model=model
         if self.enabled:
             self.projector=model.get_opd_projector(self.rank) if hasattr(model,'get_opd_projector') else None
@@ -303,7 +303,7 @@ class OPDReflex:
         if self.tuning is not None and not getattr(self,'_profile_shape_checked',False):
             suffix=f',{v},{self.rank},{logits.dtype}'
             if not any(key.endswith(suffix) for key in self.tuning.get('thresholds',{})):
-                raise ValueError('proposal profile does not cover actual compact vocabulary/rank/dtype; retune with this draft config')
+                raise ValueError('proposal profile does not cover actual full vocabulary/rank/dtype; retune for this target')
             self._profile_shape_checked=True
         if root and self.backend=='torch':self.dispatch_snapshot.copy_(self.active_count)
         if k>keep or v!=self.vocab:raise ValueError('proposal k/vocabulary mismatch')

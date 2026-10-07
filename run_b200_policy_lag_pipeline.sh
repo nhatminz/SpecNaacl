@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_PRETRAIN="${RUN_PRETRAIN:-true}"
 
 if [[ "$RUN_PRETRAIN" == "true" ]]; then
-  bash "$SCRIPT_DIR/pretrain_eagle3_sharegpt_b200.sh"
+  bash "$SCRIPT_DIR/pretrain_qwen25_3b.sh"
 fi
 
 if [[ "${PREPARE_ONLY:-false}" == "true" ]]; then

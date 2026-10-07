@@ -3,16 +3,13 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE="$(cd "$SCRIPT_DIR/.." && pwd)"
-SPECFORGE_DIR="${SPECFORGE_DIR:-$SCRIPT_DIR/third_party/SpecForge}"
 
 # All experiment knobs are overrideable here or as environment variables.
 TARGET_MODEL_PATH="${TARGET_MODEL_PATH:-/workspace/storage-shared/models/Qwen2.5-7B-Instruct}"
 TARGET_ADAPTER_PATH="${TARGET_ADAPTER_PATH:-}"
 TARGET_RESUME_CHECKPOINT="${TARGET_RESUME_CHECKPOINT:-}"
 DRAFT_CHECKPOINT="${DRAFT_CHECKPOINT:-}"
-DRAFT_CONFIG="${DRAFT_CONFIG:-$SCRIPT_DIR/configs/qwen25_7b/eagle3_full_vocab.json}"
 DRAFT_INITIALIZATION_MODE="${DRAFT_INITIALIZATION_MODE:-pretrained}" # pretrained|random (explicit)
-VOCAB_MAPPING="${VOCAB_MAPPING:-}" # empty is valid only for a full-vocabulary draft config
 
 DATASET_PATH="${DATASET_PATH:-$WORKSPACE/data/gsm8k/main}"
 EVAL_DATASET_PATH="${EVAL_DATASET_PATH:-}"
@@ -26,7 +23,7 @@ TOTAL_POLICY_STEPS="${TOTAL_POLICY_STEPS:-10}"
 
 TRAINING_TOKEN_BUDGET="${TRAINING_TOKEN_BUDGET:-1024}"
 DRAFT_UPDATE_STEPS="${DRAFT_UPDATE_STEPS:-1}"
-DRAFT_LR="${DRAFT_LR:-1e-6}"
+DRAFT_LR="${DRAFT_LR:-1e-4}"
 TARGET_LR="${TARGET_LR:-1e-6}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-8}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-8}"
@@ -50,7 +47,7 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 # Existing FastGRPO concurrency-aware scheduler defaults.
 VERIFICATION_CAPACITY="${VERIFICATION_CAPACITY:-512}"
-MAX_VERIFICATION_NUM="${MAX_VERIFICATION_NUM:-512}"
+MAX_VERIFICATION_NUM="${MAX_VERIFICATION_NUM:-160}"
 MAX_DRAFT_TOKEN_LENGTH="${MAX_DRAFT_TOKEN_LENGTH:-5}"
 MAX_DRAFT_K="${MAX_DRAFT_K:-8}"
 MIN_DRAFT_TOKEN_LENGTH="${MIN_DRAFT_TOKEN_LENGTH:-3}"
@@ -85,7 +82,7 @@ if [[ "$DRAFT_INITIALIZATION_MODE" != "pretrained" && "$DRAFT_INITIALIZATION_MOD
 fi
 
 export CUDA_VISIBLE_DEVICES MASTER_ADDR MASTER_PORT
-export PYTHONPATH="$SPECFORGE_DIR:$SCRIPT_DIR:$WORKSPACE${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$SCRIPT_DIR:$WORKSPACE${PYTHONPATH:+:$PYTHONPATH}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
@@ -96,9 +93,9 @@ validation=(
   "$PYTHON_BIN" "$SCRIPT_DIR/policy_lag_analysis.py"
   --mode validate --output-dir "$OUTPUT_DIR/analysis"
   --model-dir "$TARGET_MODEL_PATH" --target-adapter "$TARGET_ADAPTER_PATH"
-  --draft-checkpoint "$DRAFT_CHECKPOINT" --draft-config "$DRAFT_CONFIG"
+  --draft-checkpoint "$DRAFT_CHECKPOINT"
   --draft-initialization-mode "$DRAFT_INITIALIZATION_MODE"
-  --vocab-mapping "$VOCAB_MAPPING" --dataset-path "$DATASET_PATH"
+  --dataset-path "$DATASET_PATH"
   --eval-dataset-path "$EVAL_DATASET_PATH"
 )
 
@@ -135,11 +132,7 @@ cmd=(
   --load_lora_path "$TARGET_ADAPTER_PATH"
   --resume_checkpoint "$resume_checkpoint"
   --adapter_path "$DRAFT_CHECKPOINT"
-  --draft_backend eagle3
-  --draft_config "$DRAFT_CONFIG"
   --draft_initialization_mode "$DRAFT_INITIALIZATION_MODE"
-  --vocab_mapping "$VOCAB_MAPPING"
-  --eagle_ttt_length 7
   --dtype "$MODEL_DTYPE"
   --attn_implementation "$ATTN_IMPLEMENTATION"
   --model_type qwen2

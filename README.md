@@ -1,38 +1,25 @@
-# SpecNaacl: fair shared FastGRPO vs OPD Reflex
+# SpecNaacl: FastGRPO và ReflexOPD
 
-Both methods share persistent/growable target/draft KV, minimal-move compaction,
-mask/position/tree/path workspaces, contiguous history and scheduling/verifier.
-FastGRPO proposal remains historical FP32 raw softmax + native torch.topk(draft_k),
-including its confidence TopK tie semantics. No A/B, teacher union, correction
-dispatcher or OPD update stream is constructed for FastGRPO. Frozen historical
-code remains an external correctness reference, not the default timing baseline.
+Core dùng trực tiếp FastGRPO gốc trong `sources/FastGRPO`, được sao chép từ
+`../FastGRPO-main` và kiểm tra SHA256. Chỉ có `METHOD=fastgrpo` và
+`METHOD=opd_reflex`.
 
-METHOD=opd_reflex always uses fused Top16, including B=0/cold. It uses the
-post-norm/head input, persistent LEARNED rank8 A, one shared rollout-local B.
-A gradients accumulate GPU-only and apply at existing draft optimizer boundaries.
-B resets each rollout. No extra target/draft transformer forward/backward per round.
+Cả hai dùng FastGRPO DraftModel (EagleFS, một DraftDecoderLayer,
+nhánh dự đoán feature/logits), embedding và lm_head của target, full target
+vocabulary, cùng checkpoint pretrain và objective online. Baseline giữ nguyên
+hot path upstream. ReflexOPD thêm correction rank 8, Top16 và cập nhật GPU;
+KV/workspace tối ưu chỉ nằm trong nhánh OPD.
 
-Per user decision, Top16[:draft_k] ties may differ from historical K. Cold
-corrected logits equal raw logits; probabilities still normalize the same full
-compact distribution (FP32 reduction tolerance), no temperature/sampling change.
-No slow identity fallback in OPD.
+Pretrain mặc định ShareGPT, 5 epochs. Training mặc định SimpleLR
+`simplelr_abel_level3to5`, target LR `1e-6`, draft LR `1e-4`, draft accumulation `1`.
+Không có runtime dependency vào SpecForge/EAGLE3/SGLang hay vocabulary mapping.
+Checkpoint SpecForge cũ cần được thay bằng checkpoint pretrain FastGRPO mới.
 
-OPD_PROPOSAL_MODE=auto uses compatible measured profiles; correction-specific
-sparse/fused/GEMM optimization remains OPD-only. No strategy-selection GPU sync.
-OPD's existing tied-candidate/parent-closure policy is retained; it is not imposed
-on historical FastGRPO's native TopK.
+- [Cách cài môi trường](ENVIRONMENT.md)
+- [Lệnh pretrain/train/resume/benchmark](huongdanchay.md)
+- [Kiến trúc, đối chiếu source và kết quả kiểm thử](FASTGRPO_REWRITE.md)
+- [Chi tiết ReflexOPD](METHOD_OPD_REFLEX.md)
+- [Autotuning proposal](OPD_AUTOTUNING.md)
 
-Shared persistent online EAGLE3 loss: 2*SmoothL1(predicted_next_H, target_final_H)
-+ 0.1*soft-label CE, shifted one token, excluding prompt/padding, per-response
-valid-generated-position normalization. Teacher probabilities detach; compact
-support uses fixed d2t mapping and compact-mass renormalization. Architecture and
-checkpoint format retained; SpecForge pretraining unchanged. Online TTT/KL/LK
-is no longer the persistent objective. OPD A/B objective remains separate.
-
-Defaults: target LR1e-6, draft LR1e-4, draft accumulation1, OPD fast LR0.01,
-OPD update_stream1. All environment/CLI overrides remain. Per-iteration loss
-components are in logs/rollout_timing.csv. One scheduling host boundary remains.
-
-Commands: huongdanchay.md. Algorithm/metric details: METHOD_OPD_REFLEX.md.
-Validation/performance caveats: IMPLEMENTATION_REPORT.md. No B200/full-model
-AAL/throughput improvement claimed without real checkpoint measurements.
+Các bản runtime, test và tài liệu trước rewrite được giữ riêng trong
+`legacy_tests/specforge/`; chúng không thuộc bộ test hay runtime hiện tại.

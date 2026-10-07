@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert the four documented local datasets to ShareGPT JSON for SpecForge."""
+"""Convert the four documented local datasets to ShareGPT JSON for FastGRPO."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 def _text(value):
-    if isinstance(value, list) and value:
+    if not isinstance(value, (str, bytes, dict)) and hasattr(value, "__len__") and len(value):
         first = value[0]
         if isinstance(first, dict):
             return str(first.get("content", first))

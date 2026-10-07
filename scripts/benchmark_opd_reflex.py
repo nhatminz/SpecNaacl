@@ -17,11 +17,11 @@ sys.path.insert(0,str(ROOT))
 
 def parse_args(argv=None):
     p=argparse.ArgumentParser(description=__doc__)
-    for key in ('target-model','draft-checkpoint','draft-config','vocab-mapping','dataset-path','output'):
+    for key in ('target-model','draft-checkpoint','dataset-path','output'):
         p.add_argument('--'+key,required=True)
     p.add_argument('--target-adapter',default='')
     for key,value in (('batch-size',8),('responses',8),('max-length',512),('max-prompt-length',256),
-                      ('verification-capacity',512),('max-verification-num',512),('max-draft-k',8),
+                      ('verification-capacity',512),('max-verification-num',160),('max-draft-k',8),
                       ('max-draft-length',5),('min-draft-length',3),('rank',8),('topk',16),
                       ('iterations',2),('warmup',1)):
         p.add_argument('--'+key,type=int,default=value)
@@ -36,7 +36,6 @@ def parse_args(argv=None):
     p.add_argument('--diagnostics',action='store_true',help='Opt-in end-rollout B norm; excluded by default')
     p.add_argument('--gpu-utilization',action='store_true',help='Benchmark-only 0.5s nvidia-smi sampling; may perturb host timing')
     p.add_argument('--dry-run',action='store_true')
-    p.add_argument('--include-previous-opd',action='store_true',help='Also run frozen pre-memory-optimization rollout with same policy/draft/proposal settings')
     a=p.parse_args(argv)
     a.lr_values=[float(x) for x in a.fast_lrs.split(',')];a.stream_values=[int(x) for x in a.streams.split(',')]
     a.seed_values=[int(x) for x in a.seeds.split(',')]
@@ -113,15 +112,10 @@ def summarize(rows):
 def benchmark(args):
     import torch
     from transformers import AutoModelForCausalLM,AutoTokenizer
-    from helper.eagle3_specforge import Eagle3FastGRPOAdapter
+    from helper.fastgrpo_model import FastGRPOModel
+    from copy import deepcopy
     from helper.get_QAs import get_QAs_from_path
     from helper.specualtive_generate import speculative_generate
-    previous_generate=None
-    if args.include_previous_opd:
-        import importlib.util
-        spec=importlib.util.spec_from_file_location('_opd_previous_rollout',ROOT/'tests/oracles/opd_rollout_before_memory.py')
-        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
-        previous_generate=module.speculative_generate
     from helper.opd_reflex import OPD_COUNTER_NAMES
     from scripts.gpu_utilization import GPUUtilization
     if not torch.cuda.is_available():raise RuntimeError('real CUDA + configured pretrained checkpoints required')
@@ -129,8 +123,13 @@ def benchmark(args):
     torch.cuda.set_device(0);torch.manual_seed(args.seed_values[0])
     target=AutoModelForCausalLM.from_pretrained(args.target_model,torch_dtype=dtype,
         attn_implementation=args.attn_implementation,local_files_only=True).cuda().eval()
-    model=Eagle3FastGRPOAdapter(target,args.draft_config,args.draft_checkpoint,args.vocab_mapping,
-                              opd_rank=args.rank).cuda().eval()
+    config=deepcopy(target.config);config.rope_scaling=None;config.num_hidden_layers=1;config.torch_dtype=target.dtype
+    model=FastGRPOModel(config,target).cuda().eval()
+    checkpoint=Path(args.draft_checkpoint)
+    if checkpoint.is_dir():checkpoint=checkpoint/'draft.pth'
+    draft_state=torch.load(checkpoint,map_location='cpu',weights_only=True)['draft_model']
+    saved_projector=draft_state.pop('opd_projector',None)
+    model.draft_model.load_state_dict(draft_state)
     if args.target_adapter:
         from peft import PeftModel
         model.target_model=PeftModel.from_pretrained(model.target_model,args.target_adapter).eval()
@@ -157,7 +156,7 @@ def benchmark(args):
             layers=((layer.keys,layer.values) for layer in cache.layers) if hasattr(cache,'layers') else iter(cache)
             size=sum(t.untyped_storage().nbytes() for layer in layers for t in layer if t is not None)
         observed_kv[kind]=max(observed_kv[kind],size)
-    target_hook=target.model.register_forward_pre_hook(lambda *unused:count.__setitem__('target',count['target']+1))
+    target_hook=target.model.layers[0].register_forward_pre_hook(lambda *unused:count.__setitem__('target',count['target']+1))
     draft_hook=model.register_forward_pre_hook(lambda *unused:count.__setitem__('draft',count['draft']+1))
     target_cache_hook=target.model.register_forward_hook(lambda module,args,out:observe_cache('target',out))
     draft_cache_hook=model.register_forward_hook(lambda module,args,out:observe_cache('draft',out))
@@ -169,17 +168,24 @@ def benchmark(args):
         opd_visited_weight=args.visited_weight,opd_frontier_weight=args.frontier_weight,
         opd_profile=False,opd_diagnostics=args.diagnostics,statistical_time=False)
     def run(method,lr,stream,batch,seed):
+        from helper.modeling_draft import DraftModel, DraftAttention
+        from helper.fastgrpo_model import CachedDraftModel, CachedDraftAttention
+        model.draft_model.__class__=DraftModel if method=='fastgrpo' else CachedDraftModel
+        for layer in model.draft_model.layers:layer.self_attn.__class__=DraftAttention if method=='fastgrpo' else CachedDraftAttention
         torch.manual_seed(seed);before=count.copy()
         observed_kv.update(target=0,draft=0)
-        generator=previous_generate if method=='opd_reflex_previous' else speculative_generate
-        out=generator(model,batch['input_ids'],batch['attention_mask'],tokenizer,
-            method='opd_reflex' if method=='opd_reflex_previous' else method,opd_fast_lr=lr,opd_update_stream=bool(stream),**base)
+        generator=speculative_generate
+        with torch.inference_mode():
+            out=generator(model,batch['input_ids'],batch['attention_mask'],tokenizer,
+                method=method,opd_fast_lr=lr,opd_update_stream=bool(stream),**base)
         return out,{k:count[k]-before[k] for k in count}
     configurations=[('fastgrpo',0.,0)]+[(method,lr,s) for lr in args.lr_values for s in args.stream_values
-        for method in (('opd_reflex_previous','opd_reflex') if args.include_previous_opd else ('opd_reflex',))]
+        for method in ('opd_reflex',)]
     reports=[];response_file=Path(args.output)/'responses.jsonl'
     try:
         off,c0=run('fastgrpo',0.,0,batches[0],args.seed_values[0])
+        model.enable_opd(args.rank)
+        if saved_projector is not None:model.load_opd_projector(saved_projector)
         empty,c1=run('opd_reflex',0.,1,batches[0],args.seed_values[0])
         # OPD Top16 ties may differ from historical TopK(draft_k), by explicit
         # user choice. Never slow OPD merely to match historical candidates.
@@ -221,7 +227,7 @@ def benchmark(args):
                         finally:base['opd_profile']=False;model._opd_runtime_cache=cache
                         if profile['generated_token_ids']!=output['generated_token_ids']:
                             raise AssertionError('profiling changed output; discard timings')
-                        row['profile_sections_ms']=profile['opd_profile_sections_ms']
+                        row['profile_sections_ms']=profile.get('opd_profile_sections_ms',{})
                         sections=profile.get('opd_profile_sections_ms') or {}
                         row['kv_compaction_profile_ms']=(sum(sections.get(key,0) for key in ('kv_batch_compaction_ms','kv_suffix_compaction_ms'))
                             if method.startswith('opd_reflex') else None)
@@ -239,9 +245,6 @@ def benchmark(args):
         for result in reports:
             result['delta_aal']=result['aal']-baseline['aal']
             result['relative_generation_overhead_percent']=100*(result['generation_wall_s']/baseline['generation_wall_s']-1)
-            prior=next((x for x in reports if x['method']=='opd_reflex_previous' and x['fast_lr']==result['fast_lr'] and x['update_stream']==result['update_stream']),None)
-            result['delta_aal_vs_previous_opd']=result['aal']-prior['aal'] if prior and result['method']=='opd_reflex' else None
-            result['tokens_per_s_ratio_vs_previous_opd']=result['tokens_per_s']/prior['tokens_per_s'] if prior and result['method']=='opd_reflex' else None
         # Keep all results, including negative AAL/cost > benefit. Throughput wins
         # are not automatically called AAL improvements or production defaults.
         current=[x for x in reports if x['method']=='opd_reflex']
@@ -253,13 +256,13 @@ def benchmark(args):
             proposal_profile=os.environ.get('OPD_PROPOSAL_PROFILE',''),
             dense_implementation=os.environ.get('OPD_DENSE_IMPLEMENTATION','auto'),
             gpu_utilization_note='Per-configuration nvidia-smi samples when --gpu-utilization is set; includes diagnostic replay if requested.',
-            baseline='FastGRPO shared optimized infrastructure; historical native torch.topk(draft_k) semantics',
+            baseline='Unmodified original FastGRPO hot path, with host metric counters',
             cold_invariant='B=0 leaves raw logits/distribution unchanged; Top16 tie IDs need not equal historical K',reports=reports,
             fastest_observed=dict(method=best['method'],fast_lr=best['fast_lr'],update_stream=best['update_stream'],
                 delta_aal=best['delta_aal'],tokens_per_s=best['tokens_per_s']),
             recommendation=None if recommendation is None else dict(fast_lr=recommendation['fast_lr'],
                 update_stream=recommendation['update_stream'],delta_aal=recommendation['delta_aal']),
-            note='Fair shared cache/memory/tree infrastructure. FastGRPO raw native TopK; OPD correction only. Frozen policy/draft/A, no persistent training or A gradient accumulation in evaluation. Profiling replay excluded from wall. Same seed does not imply same responses.')
+            note='Original FastGRPO baseline versus GPU-optimized ReflexOPD on the same architecture and tree rules. Frozen policy/draft/A, no persistent training or A gradient accumulation in evaluation. Profiling replay excluded from wall. Same seed does not imply same responses.')
         return payload
     finally:
         target_hook.remove();draft_hook.remove()
@@ -271,7 +274,7 @@ def main():
     if args.dry_run:print(json.dumps(vars(args),indent=2));return
     output=Path(args.output)
     if output.exists():raise FileExistsError('use a NEW benchmark output directory')
-    for path in (Path(args.target_model)/'config.json',Path(args.draft_config),Path(args.vocab_mapping),Path(args.dataset_path)):
+    for path in (Path(args.target_model)/'config.json',Path(args.dataset_path)):
         if not path.is_file():raise FileNotFoundError(path)
     if not Path(args.draft_checkpoint).exists():raise FileNotFoundError(args.draft_checkpoint)
     output.mkdir(parents=True)

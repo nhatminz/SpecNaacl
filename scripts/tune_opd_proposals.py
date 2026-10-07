@@ -41,7 +41,7 @@ def benchmark_configuration(key,shapes,slots,iterations,progress=True):
         for b,c in tqdm(shapes,desc='Contexts',position=2,leave=False,disable=not progress):
             mapping=torch.arange(v,device='cuda')
             head=SimpleNamespace(weight=SimpleNamespace(shape=(v,r),dtype=dtype),bias=None)
-            model=SimpleNamespace(draft_head=head,opd_projector=torch.eye(r,device='cuda'))
+            model=SimpleNamespace(lm_head=head,opd_projector=torch.eye(r,device='cuda'))
             s=OPDReflex(r,k,backend='triton');s.tuning=None;s.profile_selector=None;s._validated_tuning=True
             s.start(model,b,mapping,r,max_contexts=c,max_nodes=b*c,max_path=2,max_proposal_contexts=c)
             s.logits_dtype=dtype
@@ -84,11 +84,10 @@ def inspect_models(args,progress=True):
         root=Path(args.pretrain_root)/name
         try:
             if len(args.models.split(','))==1:
-                config=args.draft_config or root/'latest_draft_config.json'
+                config=args.target_config or root/'latest_target_config.json'
                 checkpoint=args.draft_checkpoint or root/'latest_checkpoint'
-                mapping=args.vocab_mapping or root/'latest_vocab_mapping.pt'
-            else:config,checkpoint,mapping=root/'latest_draft_config.json',root/'latest_checkpoint',root/'latest_vocab_mapping.pt'
-            detected=inspect_draft(config,checkpoint,mapping,rank=args.rank,dtype=args.dtype,topk=args.topk)
+            else:config,checkpoint=root/'latest_target_config.json',root/'latest_checkpoint'
+            detected=inspect_draft(config,checkpoint,rank=args.rank,dtype=args.dtype,topk=args.topk)
             models.append(dict(model=name,**detected))
         except (FileNotFoundError,ValueError,KeyError,RuntimeError,OSError,EOFError,pickle.UnpicklingError) as exc:
             warnings.warn(f'{name}: skip: {exc}');skipped.append(dict(model=name,reason=str(exc)))
@@ -143,7 +142,7 @@ def parse_args(argv=None):
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--models',default=','.join(DEFAULT_MODELS));p.add_argument('--pretrain-root',default=str(ROOT/'outputs/pretrain'))
     p.add_argument('--profile-dir',default=str(ROOT/'outputs/benchmarks/opd_proposals'));p.add_argument('--output')
-    for name in ('draft-config','draft-checkpoint','vocab-mapping'):p.add_argument('--'+name)
+    for name in ('target-config','draft-checkpoint'):p.add_argument('--'+name)
     p.add_argument('--rank',type=int);p.add_argument('--dtype',choices=['bf16','fp16','fp32'])
     p.add_argument('--topk',type=int,default=16);p.add_argument('--shapes');p.add_argument('--slots')
     p.add_argument('--batch-size',type=int,default=8);p.add_argument('--responses',type=int,default=8)
@@ -152,7 +151,7 @@ def parse_args(argv=None):
     p.add_argument('--force',action='store_true');p.add_argument('--inspect-only',action='store_true')
     a=p.parse_args(argv)
     if not a.models or min(a.topk,a.batch_size,a.responses,a.max_draft_k,a.context_points,a.active_points,a.iterations)<1:p.error('positive workload sizes required')
-    if len(a.models.split(','))!=1 and any((a.draft_config,a.draft_checkpoint,a.vocab_mapping)):
+    if len(a.models.split(','))!=1 and any((a.target_config,a.draft_checkpoint)):
         p.error('per-model paths require --models <one model>; use --pretrain-root for multiple models')
     return a
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Supervision-lag experiment utilities and result exporter.
 
-The production run is executed by ``grpo_speculative.py`` with its EAGLE-3
+The production run is executed by ``grpo_speculative.py`` with the original FastGRPO
 backend; this module owns invariant checks, exact metrics, resumable boundary
 journals and the dependency/CLI smoke test used by the launcher.
 """
@@ -23,7 +23,6 @@ from typing import Iterable, Mapping, Sequence
 import numpy as np
 
 
-SPECFORGE_COMMIT = "3cb0510f0bd0e8c195ac6e9c5c62f6b50580ff83"
 FASTGRPO_COMMIT = "38e252493149072d2c5905f0a47de1d935d7170a"
 
 
@@ -248,15 +247,12 @@ def plot_results(rows: Sequence[Mapping], path: Path) -> None:
 def validate_paths(args) -> None:
     required_files = {
         "target model config": Path(args.model_dir) / "config.json",
-        "draft config": Path(args.draft_config),
         "dataset": Path(args.dataset_path),
     }
     if args.draft_initialization_mode == "pretrained":
         required_files["draft checkpoint"] = Path(args.draft_checkpoint)
     if args.target_adapter:
         required_files["target adapter/checkpoint"] = Path(args.target_adapter)
-    if args.vocab_mapping:
-        required_files["vocabulary mapping"] = Path(args.vocab_mapping)
     if args.eval_dataset_path:
         required_files["held-out evaluation dataset"] = Path(args.eval_dataset_path)
     failures = [f"{name}: {path}" for name, path in required_files.items() if not path.exists()]
@@ -265,54 +261,13 @@ def validate_paths(args) -> None:
 
 
 def dependency_report(repo: Path) -> dict:
-    report = {
-        "fastgrpo_expected_commit": FASTGRPO_COMMIT,
-        "specforge_expected_commit": SPECFORGE_COMMIT,
-        "python": sys.version.split()[0],
-    }
-    try:
-        report["fastgrpo_commit"] = subprocess.check_output(
-            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
-        ).strip()
-    except Exception as exc:
-        report["fastgrpo_commit_error"] = str(exc)
-    for module in ("torch", "transformers", "sglang", "peft", "datasets", "specforge"):
+    report = {"architecture": "FastGRPO", "python": sys.version.split()[0]}
+    for module in ("torch", "transformers", "peft", "datasets", "triton"):
         try:
-            imported = __import__(module)
-            report[module] = getattr(imported, "__version__", "installed")
+            imported=__import__(module)
+            report[module]=getattr(imported,"__version__","installed")
         except Exception as exc:
-            report[module] = f"MISSING: {type(exc).__name__}: {exc}"
-    try:
-        import specforge
-        package_path = Path(specforge.__file__).resolve()
-        vendored_candidates = [
-            parent / 'VENDORED_COMMIT'
-            for parent in package_path.parents
-            if (parent / 'VENDORED_COMMIT').is_file()
-        ]
-        if vendored_candidates:
-            vendored = vendored_candidates[0]
-            fields = dict(
-                line.split('=', 1)
-                for line in vendored.read_text(encoding='utf-8').splitlines()
-                if '=' in line
-            )
-            report['specforge_commit'] = fields.get('commit')
-            report['specforge_source'] = str(vendored.parent)
-        else:
-            try:
-                checkout = next(parent for parent in package_path.parents if (parent / '.git').exists())
-                report['specforge_commit'] = subprocess.check_output(
-                    ['git', '-C', str(checkout), 'rev-parse', 'HEAD'], text=True
-                ).strip()
-            except (StopIteration, subprocess.SubprocessError):
-                from importlib.metadata import distribution
-
-                direct_url = distribution('specforge').read_text('direct_url.json')
-                metadata = json.loads(direct_url or '{}')
-                report['specforge_commit'] = metadata.get('vcs_info', {}).get('commit_id')
-    except Exception as exc:
-        report['specforge_commit_error'] = str(exc)
+            report[module]=f"MISSING: {type(exc).__name__}: {exc}"
     return report
 
 
@@ -377,9 +332,7 @@ def build_parser():
     parser.add_argument("--model-dir", default="")
     parser.add_argument("--target-adapter", default="")
     parser.add_argument("--draft-checkpoint", default="")
-    parser.add_argument("--draft-config", default="")
     parser.add_argument("--draft-initialization-mode", choices=["pretrained", "random"], default="pretrained")
-    parser.add_argument("--vocab-mapping", default="")
     parser.add_argument("--dataset-path", default="")
     parser.add_argument("--eval-dataset-path", default="")
     return parser
@@ -396,43 +349,10 @@ def main():
     atomic_json(output / "dependencies.json", report)
     if args.mode == "validate":
         validate_paths(args)
-        if sys.version_info < (3, 11):
-            raise RuntimeError(
-                f'pinned SpecForge requires Python >=3.11; found {sys.version.split()[0]}'
-            )
-        if str(report.get("specforge", "")).startswith("MISSING"):
-            raise RuntimeError(report["specforge"])
-        from packaging.version import Version
-
-        torch_version = str(report.get('torch', '')).split('+', 1)[0]
-        transformers_version = str(report.get('transformers', '')).split('+', 1)[0]
-        sglang_version = str(report.get('sglang', '')).split('+', 1)[0]
-        try:
-            torch_parsed = Version(torch_version)
-            transformers_parsed = Version(transformers_version)
-            sglang_parsed = Version(sglang_version)
-        except Exception as exc:
-            raise RuntimeError(f'cannot parse runtime dependency versions: {exc}') from exc
-        if torch_parsed != Version('2.13.0'):
-            raise RuntimeError(
-                'policy-lag EAGLE-3 requires torch 2.13.0; found '
-                f'{report.get("torch")}'
-            )
-        if transformers_parsed != Version('5.12.1'):
-            raise RuntimeError(
-                'policy-lag EAGLE-3 requires transformers 5.12.1; found '
-                f'{report.get("transformers")}'
-            )
-        if sglang_parsed != Version('0.5.18'):
-            raise RuntimeError(
-                'policy-lag EAGLE-3 requires sglang 0.5.18; found '
-                f'{report.get("sglang")}'
-            )
-        if report.get('specforge_commit') != SPECFORGE_COMMIT:
-            raise RuntimeError(
-                'SpecForge commit mismatch: expected '
-                f'{SPECFORGE_COMMIT}, got {report.get("specforge_commit", "unknown")}'
-            )
+        from scripts.validate_environment import validate_python_version
+        validate_python_version()
+        for name,value in report.items():
+            if str(value).startswith('MISSING'):raise RuntimeError(f'{name}: {value}')
         print(f"Validation passed: {output / 'dependencies.json'}")
     else:
         print(json.dumps(report, indent=2, sort_keys=True))

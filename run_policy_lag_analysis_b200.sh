@@ -3,10 +3,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE="$(cd "$SCRIPT_DIR/.." && pwd)"
-SPECFORGE_DIR="${SPECFORGE_DIR:-$SCRIPT_DIR/third_party/SpecForge}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
-GLOBAL_LATEST_RUN="$SCRIPT_DIR/outputs/pretrain/latest_run"
+MODEL_KEY="${MODEL_KEY:-qwen25_3b}"
+GLOBAL_LATEST_RUN="$SCRIPT_DIR/outputs/pretrain/$MODEL_KEY/latest_run"
 TARGET_MODEL_PATH="${TARGET_MODEL_PATH:-}"
 PRETRAIN_ROOT="${PRETRAIN_ROOT:-}"
 if [[ -z "$TARGET_MODEL_PATH" && -z "$PRETRAIN_ROOT" && -e "$GLOBAL_LATEST_RUN" ]]; then
@@ -23,7 +23,7 @@ TARGET_MODEL_PATH="${TARGET_MODEL_PATH:-/workspace/storage-shared/models/Qwen2.5
 MODEL_BASENAME="$(basename "${TARGET_MODEL_PATH%/}")"
 MODEL_SLUG="$(printf '%s' "$MODEL_BASENAME" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '_')"
 MODEL_SLUG="${MODEL_SLUG%_}"
-MODEL_OUTPUT_ROOT="${MODEL_OUTPUT_ROOT:-$SCRIPT_DIR/outputs/pretrain/$MODEL_SLUG}"
+MODEL_OUTPUT_ROOT="${MODEL_OUTPUT_ROOT:-$SCRIPT_DIR/outputs/pretrain/$MODEL_KEY}"
 if [[ -z "$PRETRAIN_ROOT" && -e "$MODEL_OUTPUT_ROOT/latest_run" ]]; then
   PRETRAIN_ROOT="$(readlink -f "$MODEL_OUTPUT_ROOT/latest_run")"
 fi
@@ -44,15 +44,13 @@ DAPO_EVAL_SAMPLES="${DAPO_EVAL_SAMPLES:-512}"
 DAPO_SPLIT_SEED="${DAPO_SPLIT_SEED:-42}"
 
 DRAFT_CHECKPOINT="${DRAFT_CHECKPOINT:-$MODEL_OUTPUT_ROOT/latest_checkpoint}"
-DRAFT_CONFIG="${DRAFT_CONFIG:-$MODEL_OUTPUT_ROOT/latest_draft_config.json}"
-VOCAB_MAPPING="${VOCAB_MAPPING:-$MODEL_OUTPUT_ROOT/latest_vocab_mapping.pt}"
 OUTPUT_DIR="${OUTPUT_DIR:-$SCRIPT_DIR/outputs/policy_lag/$MODEL_SLUG/${PRETRAIN_RUN_ID}_dapo5k}"
 
 FORCE_DAPO_SPLIT="${FORCE_DAPO_SPLIT:-false}"
 PREPARE_DAPO_ONLY="${PREPARE_DAPO_ONLY:-false}"
 
 [[ -f "$DAPO_PARQUET" ]] || { echo "DAPO parquet not found: $DAPO_PARQUET" >&2; exit 2; }
-export PYTHONPATH="$SPECFORGE_DIR:$SCRIPT_DIR:$WORKSPACE${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$SCRIPT_DIR:$WORKSPACE${PYTHONPATH:+:$PYTHONPATH}"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
 
 split_cmd=(
@@ -72,15 +70,14 @@ if [[ "$PREPARE_DAPO_ONLY" == "true" ]]; then
 fi
 
 if [[ "${DRY_RUN:-false}" != "true" ]]; then
-  [[ -f "$DRAFT_CHECKPOINT/training_state.pt" ]] || {
-    echo "SpecForge draft checkpoint not found: $DRAFT_CHECKPOINT/training_state.pt" >&2
-    echo "Run: bash $SCRIPT_DIR/pretrain_eagle3_sharegpt_b200.sh" >&2
+  [[ -f "$DRAFT_CHECKPOINT/draft.pth" ]] || {
+    echo "FastGRPO draft checkpoint not found: $DRAFT_CHECKPOINT/draft.pth" >&2
+    echo "Run: bash $SCRIPT_DIR/pretrain_qwen25_3b.sh" >&2
     exit 2
   }
-  [[ -f "$VOCAB_MAPPING" ]] || { echo "Vocabulary mapping not found: $VOCAB_MAPPING" >&2; exit 2; }
 fi
 
-export SPECFORGE_DIR PYTHON_BIN TARGET_MODEL_PATH DRAFT_CHECKPOINT DRAFT_CONFIG VOCAB_MAPPING OUTPUT_DIR
+export PYTHON_BIN TARGET_MODEL_PATH DRAFT_CHECKPOINT OUTPUT_DIR
 export DRAFT_INITIALIZATION_MODE=pretrained
 export DATASET_PATH="$DAPO_SPLIT_DIR/train.jsonl"
 export EVAL_DATASET_PATH="$DAPO_SPLIT_DIR/eval.jsonl"

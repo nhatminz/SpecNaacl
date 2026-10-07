@@ -7,7 +7,7 @@ from pathlib import Path
 
 def summarize(root):
     reports = {}
-    for mode in ("per_response", "batched"):
+    for mode in ("fastgrpo", "opd_reflex"):
         path = Path(root) / mode / "summary.json"
         if not path.is_file():
             raise FileNotFoundError(f"incomplete benchmark: {path}")
@@ -15,7 +15,7 @@ def summarize(root):
         reports[mode] = {
             "grpo_steps": summary["completed_grpo_steps"],
             "rollout_tokens": summary["total_rollout_tokens"],
-            "draft_supervised_tokens": summary["draft_sparse_count"],
+            "draft_updates": summary["draft_step"],
             "draft_train_s": summary["total_draft_train_time_s"],
             "wall_s": summary["total_wall_time_s"],
             "generation_tokens_per_s": summary["generation_tokens_per_s"],
@@ -25,13 +25,13 @@ def summarize(root):
             "peak_allocated_bytes": summary.get("peak_allocated_bytes"),
             "peak_reserved_bytes": summary.get("peak_reserved_bytes"),
         }
-    old, new = reports["per_response"], reports["batched"]
+    old, new = reports["fastgrpo"], reports["opd_reflex"]
     comparable = old["grpo_steps"] == new["grpo_steps"] and old["grpo_steps"] > 0
     return {
         "benchmark": "real_online_draft_training",
         "modes": reports,
         "matched_grpo_steps": comparable,
-        "matched_draft_supervised_tokens": old["draft_supervised_tokens"] == new["draft_supervised_tokens"],
+        "matched_draft_updates": old["draft_updates"] == new["draft_updates"],
         "matched_rollout_tokens": old["rollout_tokens"] == new["rollout_tokens"],
         "draft_training_speedup": old["draft_train_s"] / new["draft_train_s"] if comparable and new["draft_train_s"] > 0 else None,
         "end_to_end_speedup": old["wall_s"] / new["wall_s"] if comparable and new["wall_s"] > 0 else None,

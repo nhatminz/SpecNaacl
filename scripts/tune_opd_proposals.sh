@@ -19,14 +19,13 @@ if [[ -n "${OPD_TUNE_SHAPES:-}" ]];then cmd+=(--shapes "$OPD_TUNE_SHAPES");fi
 if [[ -n "${OPD_TUNE_SLOTS:-}" ]];then cmd+=(--slots "$OPD_TUNE_SLOTS");fi
 if [[ -n "${OPD_TUNE_OUTPUT:-}" ]];then cmd+=(--output "$OPD_TUNE_OUTPUT");fi
 if [[ "$models" != *,* ]];then
-  for pair in DRAFT_CONFIG:draft-config DRAFT_CHECKPOINT:draft-checkpoint VOCAB_MAPPING:vocab-mapping;do
+  for pair in TARGET_CONFIG:target-config DRAFT_CHECKPOINT:draft-checkpoint;do
     name="${pair%%:*}";flag="${pair#*:}"
     if [[ -n "${!name:-}" ]];then cmd+=("--$flag" "${!name}");fi
   done
   if [[ -n "${PRETRAIN_MODEL_ROOT:-}" ]];then
-    cmd+=(--draft-config "${DRAFT_CONFIG:-$PRETRAIN_MODEL_ROOT/latest_draft_config.json}"
-      --draft-checkpoint "${DRAFT_CHECKPOINT:-$PRETRAIN_MODEL_ROOT/latest_checkpoint}"
-      --vocab-mapping "${VOCAB_MAPPING:-$PRETRAIN_MODEL_ROOT/latest_vocab_mapping.pt}")
+    cmd+=(--target-config "${TARGET_CONFIG:-$PRETRAIN_MODEL_ROOT/latest_target_config.json}"
+      --draft-checkpoint "${DRAFT_CHECKPOINT:-$PRETRAIN_MODEL_ROOT/latest_checkpoint}")
   fi
 fi
 exec "${cmd[@]}" "$@"

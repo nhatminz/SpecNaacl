@@ -27,13 +27,11 @@ esac
 OUTPUT_ROOT="${OUTPUT_ROOT:-$PROJECT_DIR/outputs}"
 PRETRAIN_MODEL_ROOT="${PRETRAIN_MODEL_ROOT:-$OUTPUT_ROOT/pretrain/$MODEL_KEY}"
 export DRAFT_CHECKPOINT="${DRAFT_CHECKPOINT:-$PRETRAIN_MODEL_ROOT/latest_checkpoint}"
-export DRAFT_CONFIG="${DRAFT_CONFIG:-$PRETRAIN_MODEL_ROOT/latest_draft_config.json}"
-export VOCAB_MAPPING="${VOCAB_MAPPING:-$PRETRAIN_MODEL_ROOT/latest_vocab_mapping.pt}"
 export OPD_PROPOSAL_PROFILE_DIR="${OPD_PROPOSAL_PROFILE_DIR:-$OUTPUT_ROOT/benchmarks/opd_proposals}"
 BENCH_OUTPUT="${BENCH_OUTPUT:-$OUTPUT_ROOT/benchmarks/opd_${MODEL_KEY}_$(date -u +%Y%m%dT%H%M%S_%N)}"
 cmd=("$PYTHON_BIN" "$PROJECT_DIR/scripts/benchmark_opd_reflex.py"
  --target-model "$MODEL" --target-adapter "$TARGET_ADAPTER"
- --draft-checkpoint "$DRAFT_CHECKPOINT" --draft-config "$DRAFT_CONFIG" --vocab-mapping "$VOCAB_MAPPING"
+ --draft-checkpoint "$DRAFT_CHECKPOINT"
  --dataset-path "$DATASET_PATH" --output "$BENCH_OUTPUT"
  --batch-size "$BATCH_SIZE" --responses "$RESPONSES_PER_PROMPT"
  --max-length "$BENCH_MAX_LENGTH" --max-prompt-length "$BENCH_MAX_PROMPT_LENGTH"
@@ -49,7 +47,7 @@ if [[ "$OPD_DIAGNOSTICS" == 1 ]];then cmd+=(--diagnostics);fi
 cmd+=("$@")
 printf 'Benchmark output: %s\nCommand:' "$BENCH_OUTPUT";printf ' %q' "${cmd[@]}";printf '\n'
 if [[ "${DRY_RUN:-false}" == true ]];then "${cmd[@]}" --dry-run;exit 0;fi
-export PYTHONPATH="$PROJECT_DIR:$PROJECT_DIR/third_party/SpecForge${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$PROJECT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
 "$PYTHON_BIN" "$PROJECT_DIR/scripts/validate_environment.py" --require-cuda
 exec "${cmd[@]}"

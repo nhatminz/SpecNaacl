@@ -111,7 +111,7 @@ def get_QAs_from_path(path, split):
             question = item['question']
         elif 'prompt' in item:
             prompt = item['prompt']
-            question = prompt[0]['content'] if isinstance(prompt, list) else prompt
+            question = prompt if isinstance(prompt, str) else prompt[0]['content']
         else:
             raise KeyError('dataset row has neither question nor prompt')
         answer = item.get('answer')

@@ -7,10 +7,10 @@ Pools persist across rollouts; logical history resets without exposing stale KV.
 """
 import torch
 import weakref
+from transformers.cache_utils import Cache
 try:
-    from transformers.cache_utils import Cache, CacheLayerMixin
+    from transformers.cache_utils import CacheLayerMixin
 except ImportError:
-    Cache = object
     CacheLayerMixin = object
 
 
@@ -178,8 +178,10 @@ class OPDStaticCache(Cache):
     def __init__(self, capacity=256, *, batch_capacity=0, chunk_size=256):
         if capacity < 1 or chunk_size < 1 or batch_capacity < 0:
             raise ValueError('positive KV capacity/chunk and nonnegative batch capacity required')
-        if Cache is not object: super().__init__(layers=[])
-        else: self.layers = []
+        try: super().__init__(layers=[])
+        except TypeError:
+            super().__init__()
+            self.layers = []
         self.capacity, self.batch_capacity, self.chunk_size = capacity,batch_capacity,chunk_size
         self._scratch = {}
         self.kv_rows_moved=0

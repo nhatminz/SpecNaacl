@@ -19,7 +19,8 @@ from transformers import AutoTokenizer,AutoConfig,AutoModelForCausalLM,Generatio
 from helper.rewards import accuracy_reward_func , format_reward_func
 from helper.get_QAs import get_test_QAs , get_train_QAs, get_QAs_from_path, select_train_subset
 from helper.specualtive_generate import speculative_generate
-from helper.eagle3_specforge import Eagle3FastGRPOAdapter, rollout_tensor_for_training
+from helper.fastgrpo_model import FastGRPOModel as Model
+from helper.fastgrpo_training import training_draft_model as upstream_train_draft, compute_target_loss
 from helper.checkpointing import capture_rng_state, restore_rng_state
 from helper.method_config import resolve_method
 from helper.opd_reflex import OPD_COUNTER_NAMES, GENERATION_COUNTER_NAMES
@@ -238,7 +239,7 @@ def save_training_checkpoint(
 
 
 def load_training_checkpoint(path, *, model, optimizer_target, optimizer_draft):
-    checkpoint = torch.load(path, map_location="cpu")
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     current_world_size = dist.get_world_size() if dist.is_initialized() else 1
     current_rank = dist.get_rank() if dist.is_initialized() else 0
     saved_world_size = int(checkpoint.get("world_size", 1))
@@ -265,7 +266,7 @@ def load_training_checkpoint(path, *, model, optimizer_target, optimizer_draft):
         }
     if checkpoint.get("method","fastgrpo")!=getattr(model,"_training_method","fastgrpo"):
         raise ValueError("resume method mismatch; start a new run for replacement OPD")
-    if hasattr(model, 'opd_projector') and 'opd_projector' not in checkpoint['draft_model']:
+    if getattr(model, 'opd_projector', None) is not None and 'opd_projector' not in checkpoint['draft_model']:
         raise ValueError(
             'resume checkpoint predates the learned draft projector; start a new '
             'run using its draft weights as initialization, not optimizer resume'
@@ -295,16 +296,7 @@ parser = argparse.ArgumentParser(description="Training configuration")
 
 parser.add_argument('--model_dir',type=str)
 parser.add_argument('--adapter_path',type=str)
-parser.add_argument('--draft_backend', type=str, default='legacy', choices=['legacy', 'eagle3'])
-parser.add_argument('--draft_config', type=str, default='')
-parser.add_argument('--draft_initialization_mode', type=str, default='pretrained', choices=['pretrained', 'random'])
-parser.add_argument('--vocab_mapping', type=str, default='')
-parser.add_argument('--eagle_feature_layers', type=str, default='',
-                    help='Comma-separated decoder layer ids; empty uses the SpecForge EAGLE-3 rule.')
-parser.add_argument('--eagle_ttt_length', type=int, default=7)
-parser.add_argument('--eagle_lk_loss_type', type=str, default='', choices=['', 'lambda', 'alpha', 'tv'])
-parser.add_argument('--eagle_kl_scale', type=float, default=1.0)
-parser.add_argument('--eagle_kl_decay', type=float, default=1.0)
+parser.add_argument('--draft_initialization_mode', default='pretrained', choices=['pretrained', 'random'])
 parser.add_argument('--method',default='fastgrpo',choices=['fastgrpo','opd_reflex'])
 parser.add_argument('--opd_rank',type=int,default=8)
 parser.add_argument('--opd_topk',type=int,default=16)
@@ -316,10 +308,6 @@ parser.add_argument('--opd_profile',default='0',choices=['0','1'])
 parser.add_argument('--opd_diagnostics',default='0',choices=['0','1'])
 parser.add_argument('--opd_backend',default='triton',choices=['auto','torch','triton'])
 parser.add_argument('--opd_train_projector',default='1',choices=['0','1'])
-parser.add_argument('--draft_train_mode', default='batched', choices=['batched', 'per_response'])
-parser.add_argument('--draft_train_max_batch_size', type=int, default=8)
-parser.add_argument('--draft_train_max_tokens', type=int, default=2048)
-parser.add_argument('--draft_train_max_padding_ratio', type=float, default=1.25)
 parser.add_argument('--draft_train_profile', default='0', choices=['0', '1'])
 parser.add_argument('--kv_gather_strategy', default='stacked', choices=['stacked', 'per_layer'])
 parser.add_argument('--dtype', type=str, default='auto', choices=['auto', 'bf16', 'fp16', 'fp32'])
@@ -594,8 +582,6 @@ if policy_lag_output_dir and _as_bool(args.analysis_resume):
             for line in summary_jsonl_file.read_text().splitlines()
             if line.strip()
         ]
-if analysis_enabled and args.draft_backend != 'eagle3':
-    raise ValueError('policy-lag analysis requires --draft_backend=eagle3')
 if analysis_enabled and world_size > 1:
     raise ValueError('policy-lag side-branch analysis must be run with NPROC_PER_NODE=1')
 if analysis_enabled and draft_accumulation_steps != 1:
@@ -608,11 +594,7 @@ if drift_temperature <= 0.0:
     raise ValueError('--drift_temperature must be positive')
 if draft_lr_multiplier <= 0.0:
     raise ValueError('--draft_lr_multiplier must be positive')
-if (args.draft_train_max_batch_size < 1 or args.draft_train_max_tokens < 1 or
-        args.draft_train_max_padding_ratio < 1.0):
-    raise ValueError('draft microbatch size/tokens must be positive and padding ratio >= 1')
-if args.draft_backend!='eagle3':raise ValueError('fair OPD/FastGRPO pipeline requires eagle3')
-if not 1<=args.opd_rank<=64 or args.opd_topk<max_draft_k or args.opd_fast_lr<0 or min(args.opd_visited_weight,args.opd_frontier_weight)<0:
+if method=='opd_reflex' and (not 1<=args.opd_rank<=64 or args.opd_topk<max_draft_k or args.opd_fast_lr<0 or min(args.opd_visited_weight,args.opd_frontier_weight)<0):
     raise ValueError('invalid OPD rank/topk/lr/weights')
 fastgrpo_ablation = not np.isclose(draft_lr_multiplier, 1.0)
 model_torch_dtype = _dtype_from_name(args.dtype)
@@ -651,7 +633,7 @@ print(f"B200/spec: dtype={args.dtype}, attn_impl={attn_impl or 'default'}, "
       f"max_draft_len={max_draft_token_length}, max_draft_k={max_draft_k}, "
       f"statistical_time={statistical_time}")
 print(f"Draft: train={is_train_draft}")
-print('Persistent EAGLE3 objective: 2.0*SmoothL1 + 0.1*soft CE; generated positions only; shared by both methods')
+print('Persistent FastGRPO objective: 2.0*SmoothL1 + 0.1*soft CE; generated positions only; shared by both methods')
 print(f"Method: {method} | OPD: rank={args.opd_rank}, topk={args.opd_topk}, fast_lr={args.opd_fast_lr}, stream={args.opd_update_stream}")
 print(f"Trace: max_new_grpo_steps={max_grpo_steps}, drift_topk={drift_topk}, "
       f"drift_temperature={drift_temperature}, drift_row_chunk={drift_row_chunk_size}")
@@ -670,47 +652,17 @@ target_model = AutoModelForCausalLM.from_pretrained(
 target_model.eval()
 
 config=AutoConfig.from_pretrained(model_dir)
-if args.draft_backend == 'eagle3':
-    configured_layers = None
-    if args.eagle_feature_layers.strip():
-        configured_layers = [int(item) for item in args.eagle_feature_layers.split(',')]
-    model = Eagle3FastGRPOAdapter(
-        target_model=target_model,
-        draft_config=args.draft_config,
-        draft_checkpoint=adapter_path,
-        vocab_mapping=args.vocab_mapping,
-        initialization_mode=args.draft_initialization_mode,
-        feature_layers=configured_layers,
-        ttt_length=args.eagle_ttt_length,
-        lk_loss_type=args.eagle_lk_loss_type or None,
-        kl_scale=args.eagle_kl_scale,
-        kl_decay=args.eagle_kl_decay,
-        opd_rank=args.opd_rank if method=='opd_reflex' else None,
-    )
-else:
-    # The legacy implementation is not a dependency of the EAGLE-3 backend.
-    from helper.modeling_draft import Model
-
-    config.rope_scaling=None
-    config.num_hidden_layers=1
-    if model_torch_dtype != "auto":
-        config.torch_dtype = model_torch_dtype
-    model=Model(config,target_model=target_model)
+config.rope_scaling=None
+config.num_hidden_layers=1
+config.torch_dtype=target_model.dtype
+model=Model(config,target_model=target_model).cuda()
+if args.draft_initialization_mode == 'pretrained':
     model.load_model(adapter_path)
+if method == 'opd_reflex':
+    model.enable_opd(args.opd_rank)
 print(adapter_path)
-model=model.cuda()
 model._training_method=method
 tokenizer = AutoTokenizer.from_pretrained(model_dir,padding_side="left")
-
-if args.draft_backend == 'eagle3':
-    if len(tokenizer) > int(model.draft_model.vocab_size):
-        raise ValueError(
-            f'tokenizer size {len(tokenizer)} exceeds EAGLE-3 target vocabulary '
-            f'{model.draft_model.vocab_size}'
-        )
-    if model.draft_model.embed_tokens.weight.shape[0] != model.target_model.get_input_embeddings().weight.shape[0]:
-        raise ValueError('EAGLE-3 and target embedding vocabularies are not identical')
-
 
 if config.model_type == 'llama':
     tokenizer.pad_token = "<|end_of_text|>" 
@@ -744,7 +696,7 @@ for param in model.lm_head.parameters():
     param.requires_grad=False
 for param in model.embed_tokens.parameters():
     param.requires_grad=False
-if hasattr(model, 'opd_projector'):
+if getattr(model, 'opd_projector', None) is not None:
     model.opd_projector.requires_grad_(
         method == 'opd_reflex' and _as_bool(args.opd_train_projector) and is_train_draft
     )
@@ -830,531 +782,37 @@ def compute_model_token_logps(causal_lm, input_ids, attention_mask, chunk_size):
     )
 
 
-def compute_target_loss_and_backward(
-    model,
-    input_ids,
-    attention_mask,
-    mask,
-    reward,
-    epsilon,
-    beta,
-    grpo_iteration,
-    old_logps=None,
-    ref_logps=None,
-    chunk_size=256,
-    loss_scale=1.0,
-):
-    """Compute the GRPO loss and backpropagate without full-vocabulary logits."""
-    device = input_ids.device
-    token_mask = mask[:, :-1].to(device=device, dtype=torch.float32)
-    denom = token_mask.sum(-1).clamp_min(1.0)
-    reward = reward.to(device=device, dtype=torch.float32)
-    seq_len = token_mask.shape[1]
-
+def compute_target_loss_and_backward(model, input_ids, attention_mask, mask, reward,
+        epsilon, beta, grpo_iteration, old_logps=None, ref_logps=None,
+        chunk_size=256, loss_scale=1.):
     if grpo_iteration == 0:
         model.target_model.disable_adapter_layers()
-        with torch.no_grad():
-            ref_logps_gpu = compute_model_token_logps(
-                model.target_model,
-                input_ids,
-                attention_mask,
-                chunk_size,
-            ).detach()
-        model.target_model.enable_adapter_layers()
-        ref_logps_for_loss = ref_logps_gpu
-        old_logps_for_loss = None
-    else:
-        if old_logps is None or ref_logps is None:
-            raise ValueError(
-                "old_logps and ref_logps are required when grpo_iteration > 0"
-            )
-        old_logps_for_loss = old_logps.to(device, non_blocking=True)
-        ref_logps_for_loss = ref_logps.to(device, non_blocking=True)
-
-    model.target_model.enable_adapter_layers()
-    base_model = _get_base_causal_lm(model.target_model)
-    device_type = "cuda" if device.type == "cuda" else device.type
-    with torch.amp.autocast(
-        device_type,
-        dtype=_autocast_dtype(base_model),
-        enabled=(device.type == "cuda"),
-    ):
-        outputs = base_model.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            use_cache=False,
-            return_dict=True,
-        )
-        hidden_states = (
-            outputs.last_hidden_state
-            if hasattr(outputs, "last_hidden_state")
-            else outputs[0]
-        )
-
-    policy_hidden = hidden_states[:, :-1, :]
-    labels = input_ids[:, 1:].to(device)
-    old_chunks_to_store = []
-    loss_value = 0.0
-    abs_loss1_value = 0.0
-    loss2_value = 0.0
-
-    for start in range(0, seq_len, chunk_size):
-        end = min(start + chunk_size, seq_len)
-        logits = base_model.lm_head(policy_hidden[:, start:end, :]).float()
-        cur_labels = labels[:, start:end]
-        logps = torch.gather(
-            logits, dim=-1, index=cur_labels.unsqueeze(-1)
-        ).squeeze(-1) - torch.logsumexp(logits, dim=-1)
-        cur_mask = token_mask[:, start:end]
-
-        if grpo_iteration == 0:
-            cur_old_logps = logps.detach()
-            old_chunks_to_store.append(cur_old_logps.cpu())
-        else:
-            cur_old_logps = old_logps_for_loss[:, start:end]
-
-        cur_ref_logps = ref_logps_for_loss[:, start:end]
-        coef1 = torch.exp(logps - cur_old_logps)
-        coef2 = torch.clamp(coef1, 1 - epsilon, 1 + epsilon)
-        loss1 = torch.min(coef1 * reward, coef2 * reward)
-
-        coef3 = cur_ref_logps - logps
-        kl = torch.exp(coef3) - coef3 - 1
-        token_loss = -(loss1 - beta * kl)
-        chunk_loss = ((token_loss * cur_mask).sum(-1) / denom).sum()
-        scaled_loss = chunk_loss * loss_scale
-        scaled_loss.backward(retain_graph=(end < seq_len))
-
-        with torch.no_grad():
-            loss_value += float(chunk_loss.detach().cpu())
-            abs_loss1_value += float(
-                torch.abs((loss1 * cur_mask).sum(-1) / denom).sum().detach().cpu()
-            )
-            loss2_value += float(
-                ((kl * cur_mask).sum(-1) / denom).sum().detach().cpu()
-            )
-
-        del (
-            logits,
-            logps,
-            coef1,
-            coef2,
-            loss1,
-            coef3,
-            kl,
-            token_loss,
-            chunk_loss,
-            scaled_loss,
-        )
-
-    if grpo_iteration == 0:
-        if old_chunks_to_store:
-            old_logps_out = torch.cat(old_chunks_to_store, dim=1)
-        else:
-            old_logps_out = torch.empty((input_ids.shape[0], 0))
-        ref_logps_out = ref_logps_for_loss.detach().cpu()
-    else:
-        old_logps_out = old_logps
-        ref_logps_out = ref_logps
-
-    del hidden_states, policy_hidden
-    if grpo_iteration == 0:
-        del ref_logps_gpu, ref_logps_for_loss
-    else:
-        del old_logps_for_loss, ref_logps_for_loss
-
-    return (
-        loss_value,
-        abs_loss1_value,
-        loss2_value,
-        old_logps_out,
-        ref_logps_out,
-    )
-
-
-def training_draft_model(model,outputs,prompt_mask,token_budget=None):
-    if getattr(model, 'is_eagle3_specforge', False):
-        return training_eagle3_specforge(
-            model, outputs, prompt_mask, token_budget=token_budget,
-            mode=args.draft_train_mode,
-            max_batch_size=args.draft_train_max_batch_size,
-            max_tokens=args.draft_train_max_tokens,
-            max_padding_ratio=args.draft_train_max_padding_ratio,
-            profile=_as_bool(args.draft_train_profile),
-            accumulation_steps=draft_accumulation_steps,
-        )
-    
-
-    all_draft_input_states = outputs['all_draft_input_states']
-    all_draft_input_ids = outputs['all_draft_input_ids']
-    all_prompt_length = [prompt_mask[idx // repeated_generate_nums].sum().item() for idx in range(len(all_draft_input_states))]
-    
-    prompt_mask=prompt_mask.cpu()
-    device=model.target_model.device
-    
-    sorted_pairs = sorted(
-        zip(all_draft_input_ids, all_draft_input_states, all_prompt_length),
-        key=lambda x: len(x[0]),
-        reverse=False  
-    )
-
-    all_draft_input_ids_sorted, all_draft_input_states_sorted, all_prompt_length_sorted = zip(*sorted_pairs)
-
-    all_draft_input_ids = list(all_draft_input_ids_sorted)
-    all_draft_input_states = list(all_draft_input_states_sorted)
-    all_prompt_length = list(all_prompt_length_sorted)
-    
-    l1_loss=torch.nn.SmoothL1Loss(reduction='none')
-    total_loss1,total_loss2=0,0
-    drift_tv_sum = 0.0
-    drift_kl_sum = 0.0
-    drift_count = 0
-    
-    draft_input_states_list=[]
-    draft_input_ids_list=[]
-    prompt_length_list=[]
-    
-    cur_max_length=0
-    hidden_size=all_draft_input_states[0].shape[-1]
-    
-    for idx , (draft_input_states,draft_input_ids,prompt_length) in enumerate(zip(all_draft_input_states,all_draft_input_ids,all_prompt_length)):
-        
-        if ((draft_input_ids.shape[-1]*(len(draft_input_states_list)+1)<=max_training_token*2 and
-            (draft_input_ids.shape[-1]-cur_max_length)*len(draft_input_states_list)<=max_training_padding_gap) or
-            len(draft_input_states_list)==0):
-            
-                draft_input_states_list.append(draft_input_states)
-                draft_input_ids_list.append(draft_input_ids)
-                prompt_length_list.append(prompt_length)
-                
-                cur_max_length=max(cur_max_length, draft_input_ids.shape[-1])
-            
-        else:
-            
-            cur_batch=len(draft_input_states_list)
-
-            loss_mask=[[] for _ in range(cur_batch)]
-            attention_mask=[[] for _ in range(cur_batch)]
-            
-            for idx_seq in range(cur_batch):
-                cur_len=draft_input_ids_list[idx_seq].shape[-1]
-                loss_mask[idx_seq]=[0]*prompt_length_list[idx_seq]+[1]*(cur_len-prompt_length_list[idx_seq])
-                attention_mask[idx_seq]=[1]*cur_len
-
-            for idx_seq in range(cur_batch):
-                cur_len=draft_input_ids_list[idx_seq].shape[-1]
-                padding_len=cur_max_length-cur_len
-                
-                if padding_len>0:
-                    draft_input_states_list[idx_seq]=torch.concat(
-                        [draft_input_states_list[idx_seq],
-                        torch.zeros((padding_len, hidden_size), dtype=draft_input_states_list[idx_seq].dtype, device=device)],
-                        dim=-2)
-                    
-                    draft_input_ids_list[idx_seq]=torch.concat(
-                        [draft_input_ids_list[idx_seq],
-                        torch.zeros(padding_len, dtype=draft_input_ids_list[idx_seq].dtype, device=device)],
-                        dim=-1)
-                    
-                    loss_mask[idx_seq]=loss_mask[idx_seq]+[0]*padding_len
-                    attention_mask[idx_seq]=attention_mask[idx_seq]+[0]*padding_len
-            
-            draft_input_states=torch.stack(draft_input_states_list,dim=0)
-            draft_input_ids=torch.stack(draft_input_ids_list,dim=0)
-            loss_mask=torch.tensor(loss_mask,device=device)
-            attention_mask=torch.tensor(attention_mask,device=device)
-
-            with torch.amp.autocast(str(model.target_model.device),
-                        dtype=torch.bfloat16 if model.dtype==torch.bfloat16 else torch.float16):
-                draft_outputs=model(hidden_states=draft_input_states,input_ids=draft_input_ids,
-                                attention_mask=attention_mask,use_cache=False)
-                
-            next_feature_states=draft_outputs['next_feature_states']
-            draft_hidden_states=draft_outputs['hidden_states'].to(model.target_model.dtype)
-            draft_logits=model.lm_head(draft_hidden_states)
-            
+        try:
             with torch.no_grad():
-                target_hidden_states=draft_input_states
-                target_logits_raw=model.target_model.lm_head(target_hidden_states.to(model.target_model.dtype))[:,1:,:]
-
-            draft_logits_raw=draft_logits[:,:-1,:]
-            drift_tv, drift_kl, cur_drift_count = sparse_union_metrics(
-                draft_logits_raw.detach(),
-                target_logits_raw.detach(),
-                loss_mask[...,:-1].bool(),
-                topk=drift_topk,
-                temperature=drift_temperature,
-                row_chunk_size=drift_row_chunk_size,
-            )
-            drift_tv_sum += drift_tv * cur_drift_count
-            drift_kl_sum += drift_kl * cur_drift_count
-            drift_count += cur_drift_count
-            target_logits=target_logits_raw.float().softmax(dim=-1).detach()
-                
-            loss1=l1_loss(next_feature_states[:,:-1,:].float(),draft_input_states[:,1:,:].float())
-
-            loss1=torch.mean(loss1,dim=-1)*loss_mask[...,:-1] 
-            loss1=torch.sum(loss1, dim=-1) / torch.sum(loss_mask[...,:-1], dim=-1)
-            loss1=loss1.sum(-1)
-            loss1=loss1*2.0
-            
-            draft_logits=draft_logits_raw.float().softmax(dim=-1)
-
-            plogp=target_logits*torch.log(draft_logits)
-            loss2=torch.sum(plogp,dim=-1)*loss_mask[...,:-1]
-            loss2=torch.sum(loss2, dim=-1) / torch.sum(loss_mask[...,:-1], dim=-1)
-            loss2= - loss2.sum(-1)
-
-            loss2=loss2*0.1
-            
-            loss=loss1+loss2
-                
-            total_loss1+=loss1.item()
-            total_loss2+=loss2.item()
-            
-            if torch.isnan(loss).any() or torch.isinf(loss).any():
-                
-                loss = loss.detach()
-                del loss
-                torch.cuda.empty_cache()
-            else:
-
-                loss=loss/len(all_draft_input_states)
-                loss=loss/draft_accumulation_steps
-                loss.backward()
-                
-            draft_input_states_list=[all_draft_input_states[idx]]
-            draft_input_ids_list=[all_draft_input_ids[idx]]
-            prompt_length_list=[all_prompt_length[idx]]
-            cur_max_length=all_draft_input_ids[idx].shape[-1]
-            
-    cur_batch=len(draft_input_states_list)
-
-    loss_mask=[[] for _ in range(cur_batch)]
-    attention_mask=[[] for _ in range(cur_batch)]
-    
-    cur_max_length=0
-    for idx_seq in range(cur_batch):
-        cur_len=draft_input_ids_list[idx_seq].shape[-1]
-        loss_mask[idx_seq]=[0]*prompt_length_list[idx_seq]+[1]*(cur_len-prompt_length_list[idx_seq])
-        attention_mask[idx_seq]=[1]*cur_len
-        
-        cur_max_length=max(cur_max_length, cur_len)
-        
-    for idx_seq in range(cur_batch):
-        cur_len=draft_input_ids_list[idx_seq].shape[-1]
-        padding_len=cur_max_length-cur_len
-        
-        if padding_len>0:
-            draft_input_states_list[idx_seq]=torch.concat(
-                [draft_input_states_list[idx_seq],
-                torch.zeros((padding_len, hidden_size), dtype=draft_input_states_list[idx_seq].dtype, device=device)],
-                dim=-2)
-            
-            draft_input_ids_list[idx_seq]=torch.concat(
-                [draft_input_ids_list[idx_seq],
-                torch.zeros(padding_len, dtype=draft_input_ids_list[idx_seq].dtype, device=device)],
-                dim=-1)
-            
-            loss_mask[idx_seq]=loss_mask[idx_seq]+[0]*padding_len
-            attention_mask[idx_seq]=attention_mask[idx_seq]+[0]*padding_len
-    
-    draft_input_states=torch.stack(draft_input_states_list,dim=0)
-    draft_input_ids=torch.stack(draft_input_ids_list,dim=0)
-    loss_mask=torch.tensor(loss_mask,device=device)
-    attention_mask=torch.tensor(attention_mask,device=device)
-    
-    with torch.amp.autocast(str(model.target_model.device),
-                dtype=torch.bfloat16 if model.dtype==torch.bfloat16 else torch.float16):
-        draft_outputs=model(hidden_states=draft_input_states,input_ids=draft_input_ids,
-                        attention_mask=attention_mask,use_cache=False)
-        
-    next_feature_states=draft_outputs['next_feature_states']
-    draft_hidden_states=draft_outputs['hidden_states'].to(model.target_model.dtype)
-    draft_logits=model.lm_head(draft_hidden_states)
-    
-    with torch.no_grad():
-        target_hidden_states=draft_input_states
-        target_logits_raw=model.target_model.lm_head(target_hidden_states.to(model.target_model.dtype))[:,1:,:]
-
-    draft_logits_raw=draft_logits[:,:-1,:]
-    drift_tv, drift_kl, cur_drift_count = sparse_union_metrics(
-        draft_logits_raw.detach(),
-        target_logits_raw.detach(),
-        loss_mask[...,:-1].bool(),
-        topk=drift_topk,
-        temperature=drift_temperature,
-        row_chunk_size=drift_row_chunk_size,
-    )
-    drift_tv_sum += drift_tv * cur_drift_count
-    drift_kl_sum += drift_kl * cur_drift_count
-    drift_count += cur_drift_count
-    target_logits=target_logits_raw.float().softmax(dim=-1).detach()
-        
-    loss1=l1_loss(next_feature_states[:,:-1,:].float(),draft_input_states[:,1:,:].float())
-
-    loss1=torch.mean(loss1,dim=-1)*loss_mask[...,:-1] 
-    loss1=torch.sum(loss1, dim=-1) / torch.sum(loss_mask[...,:-1], dim=-1)
-    loss1=loss1.sum(-1)
-    loss1=loss1*2.0
-    
-    draft_logits=draft_logits_raw.float().softmax(dim=-1)
-
-    plogp=target_logits*torch.log(draft_logits)
-    loss2=torch.sum(plogp,dim=-1)*loss_mask[...,:-1]
-    loss2=torch.sum(loss2, dim=-1) / torch.sum(loss_mask[...,:-1], dim=-1)
-    loss2= - loss2.sum(-1)
-
-    loss2=loss2*0.1
-    
-    loss=loss1+loss2
-        
-    total_loss1+=loss1.item()
-    total_loss2+=loss2.item()
-    
-    if torch.isnan(loss).any() or torch.isinf(loss).any():
-        
-        loss = loss.detach()
-        del loss
-        torch.cuda.empty_cache()
+                reference=model.target_model(input_ids=input_ids, attention_mask=attention_mask).logits
+        finally:
+            model.target_model.enable_adapter_layers()
     else:
+        reference=ref_logps.to(input_ids.device)
+    logits=model.target_model(input_ids=input_ids, attention_mask=attention_mask).logits
+    old=None if old_logps is None else old_logps.to(input_ids.device)
+    loss, loss1, loss2, old, ref=compute_target_loss(logits,reference,old,input_ids,
+        mask,reward,epsilon,beta,grpo_iteration)
+    (loss*loss_scale).backward()
+    return float(loss.detach()),float(loss1.detach()),float(loss2.detach()),old.cpu(),ref.cpu()
 
-        loss=loss/len(all_draft_input_states)
-        loss.backward()
-            
-        
-    total_loss1/=len(all_draft_input_states)
-    total_loss2/=len(all_draft_input_states)
-    
-    mean_drift_tv = drift_tv_sum / max(drift_count, 1)
-    mean_drift_kl = drift_kl_sum / max(drift_count, 1)
-    return total_loss1,total_loss2,mean_drift_tv,mean_drift_kl,drift_count
+def training_draft_model(model, outputs, prompt_mask, token_budget=None):
+    # torch.inference_mode rollout storage must become normal training tensors.
+    training_outputs = dict(outputs)
+    for name in ('all_draft_input_states', 'all_draft_input_ids'):
+        training_outputs[name] = [x.clone() if x.is_inference() else x for x in outputs[name]]
+    loss1, loss2 = upstream_train_draft(model, training_outputs, prompt_mask,
+        repeated_generate_nums=repeated_generate_nums,
+        max_training_token=max_training_token if token_budget is None else token_budget,
+        max_training_padding_gap=max_training_padding_gap,
+        draft_accumulation_steps=draft_accumulation_steps)
+    return loss1, loss2, 0., 0., 0
 
-
-def training_eagle3_specforge(model, outputs, prompt_mask, token_budget=None,
-                              mode='batched', max_batch_size=8, max_tokens=2048,
-                              max_padding_ratio=1.25, profile=False, accumulation_steps=1):
-    """Persistent upstream-equivalent FastGRPO objective on the real EAGLE3 model.
-
-    Inputs are SpecForge 3H features; feature supervision is final target H.
-    Shared by both methods; no OPD A/B objective or SpecForge TTT/LK loss here.
-    """
-    from helper.eagle3_online_objective import persistent_loss
-    feature_rows = outputs['all_draft_input_states']
-    target_rows = outputs.get('all_target_hidden_states')
-    token_rows = outputs['all_draft_input_ids']
-    if target_rows is None:
-        raise RuntimeError('EAGLE-3 rollout is missing final target hidden states')
-    if not (len(feature_rows) == len(target_rows) == len(token_rows)):
-        raise RuntimeError('misaligned EAGLE-3 rollout feature tensors')
-    if mode not in ('batched', 'per_response'):
-        raise ValueError('draft train mode must be batched or per_response')
-    if max_batch_size < 1 or max_tokens < 1 or max_padding_ratio < 1:
-        raise ValueError('draft microbatch limits must be positive and padding ratio >= 1')
-    if accumulation_steps<1:raise ValueError('draft accumulation steps must be positive')
-    nrows = len(feature_rows)
-    if nrows == 0:
-        return 0, 0, 0, 0, 0
-    profile_start = time.perf_counter() if profile else None
-    if prompt_mask.shape[0] * repeated_generate_nums < nrows:
-        raise ValueError('prompt mask has fewer rows than the rollout')
-    # A single device-to-host transfer before packing; no per-response sync.
-    prompt_lengths = prompt_mask.sum(dim=1).repeat_interleave(repeated_generate_nums)[:nrows].tolist()
-    lengths = [int(row.shape[-1]) for row in token_rows]
-    allowed = []
-    remaining = None if token_budget is None else max(0, int(token_budget))
-    for seq_len, prompt_len in zip(lengths, prompt_lengths):
-        count = max(0, seq_len - min(int(prompt_len), seq_len) - 1)
-        if remaining is not None:
-            count = min(count, remaining)
-            remaining -= count
-        allowed.append(count)
-    valid_tokens = sum(allowed)
-    if not valid_tokens:
-        return 0, 0, 0, 0, 0
-    # Shortest-first bucketing is deterministic and reduces both padding and
-    # compact-teacher temporary memory. A singleton is always legal.
-    ordered = [i for i in range(nrows) if allowed[i] > 0]
-    if mode == 'batched':
-        ordered.sort(key=lambda i: (lengths[i], i))
-    packs = []
-    pack = []
-    pack_sum = 0
-    for i in ordered:
-        prospective_max = lengths[i]
-        prospective_count = len(pack) + 1
-        prospective_sum = pack_sum + lengths[i]
-        if pack and (prospective_count > (1 if mode == 'per_response' else max_batch_size)
-                     or prospective_max * prospective_count > max_tokens
-                     or prospective_max * prospective_count > max_padding_ratio * prospective_sum):
-            packs.append(pack)
-            pack, pack_sum = [], 0
-        pack.append(i)
-        pack_sum += lengths[i]
-    if pack:
-        packs.append(pack)
-    target_head = _get_base_causal_lm(model.target_model).lm_head
-    loss_total = torch.zeros((), device=model.device, dtype=torch.float32)
-    distribution_total = torch.zeros_like(loss_total)
-    timing = ({'packs': len(packs), 'responses': len(ordered),
-               'bucketing_cpu_ms': (time.perf_counter() - profile_start) * 1000,
-               'packing_cpu_ms': 0.0} if profile else None)
-    cuda_events = []
-    for pack in packs:
-        packing_start = time.perf_counter() if profile else None
-        seq_len = max(lengths[i] for i in pack)
-        row_lengths = torch.tensor([lengths[i] for i in pack], device=model.device)
-        row_prompts = torch.tensor([min(int(prompt_lengths[i]), lengths[i]) for i in pack], device=model.device)
-        row_allowed = torch.tensor([allowed[i] for i in pack], device=model.device)
-        positions = torch.arange(seq_len, device=model.device).unsqueeze(0)
-        attention_mask = (positions < row_lengths[:, None]).long()
-        loss_mask = ((positions >= row_prompts[:, None]) &
-                     (positions < row_prompts[:, None] + row_allowed[:, None]) &
-                     (positions < row_lengths[:, None] - 1)).unsqueeze(-1).float()
-        # inference_mode tensors cannot be saved by autograd. Convert each row
-        # before padding; this changes neither values nor teacher supervision.
-        ids = torch.nn.utils.rnn.pad_sequence(
-            [rollout_tensor_for_training(token_rows[i]) for i in pack],
-            batch_first=True, padding_value=0)
-        features = torch.nn.utils.rnn.pad_sequence(
-            [rollout_tensor_for_training(feature_rows[i].to(model.dtype)) for i in pack],
-            batch_first=True, padding_value=0)
-        target_hidden = torch.nn.utils.rnn.pad_sequence(
-            [rollout_tensor_for_training(target_rows[i].to(model.dtype)) for i in pack],
-            batch_first=True, padding_value=0)
-        if profile:
-            timing['packing_cpu_ms'] += (time.perf_counter() - packing_start) * 1000
-        if profile and torch.cuda.is_available() and model.device.type == 'cuda':
-            forward_start = torch.cuda.Event(enable_timing=True)
-            forward_start.record()
-        feature_losses, distribution_losses = persistent_loss(
-            model,ids,features,target_hidden,attention_mask,loss_mask.squeeze(-1),target_head)
-        feature_loss=feature_losses.sum()
-        distribution_loss=distribution_losses.sum()
-        loss=feature_loss+distribution_loss
-        if profile and torch.cuda.is_available() and model.device.type == 'cuda':
-            forward_end = torch.cuda.Event(enable_timing=True)
-            forward_end.record()
-            cuda_events.append(('total_forward_ms', forward_start, forward_end))
-            backward_start = torch.cuda.Event(enable_timing=True)
-            backward_start.record()
-        (loss / nrows / accumulation_steps).backward()
-        if profile and torch.cuda.is_available() and model.device.type == 'cuda':
-            backward_end = torch.cuda.Event(enable_timing=True)
-            backward_end.record()
-            cuda_events.append(('backward_ms', backward_start, backward_end))
-        loss_total += feature_loss.detach()
-        distribution_total += distribution_loss.detach()
-    total_feature, total_distribution = torch.stack((loss_total, distribution_total)).cpu().tolist()
-    if profile:
-        for label, start, end in cuda_events:
-            timing[label] = timing.get(label, 0.0) + start.elapsed_time(end)
-        model.last_draft_train_profile = timing
-    denom = nrows
-    # Legacy arity; now the two upstream weighted draft loss components.
-    return total_feature / denom, total_distribution / denom, 0.0, 0.0, valid_tokens
-
-        
 optimizer_target = torch.optim.AdamW(model.target_model.parameters(), lr=target_lr)
 optimizer_draft = draft_optimizer(model.draft_model,draft_lr,args.opd_projector_lr if method=='opd_reflex' else None)
 
@@ -1500,10 +958,6 @@ run_config_log = {
     "drift_temperature": float(drift_temperature),
     "drift_normalization": "mean_over_valid_response_token_rows",
     "draft_lr_multiplier": float(draft_lr_multiplier),
-    "draft_train_mode": args.draft_train_mode,
-    "draft_train_max_batch_size": int(args.draft_train_max_batch_size),
-    "draft_train_max_tokens": int(args.draft_train_max_tokens),
-    "draft_train_max_padding_ratio": float(args.draft_train_max_padding_ratio),
     "effective_draft_lrs": effective_draft_lrs,
     "fastgrpo_ablation": bool(fastgrpo_ablation),
     "step_metric_definition": "distinct inherited GRPO labels; all updates with the same label are accumulated",
@@ -1706,6 +1160,7 @@ dataloader=DataLoader(
     batch_size=batch_size,
     shuffle=False,
     sampler=train_sampler,
+    generator=torch.Generator().manual_seed(trace_seed),
     drop_last=False,
 )
 
@@ -1746,11 +1201,12 @@ for epoch in epoch_bar:
     if train_sampler is not None:
         train_sampler.set_epoch(epoch)
     
-    batch_data['ignore_due_correct']=0
-    batch_data['ignore_due_incorrect']=0
-    batch_data['length_stdev'] = []
-    batch_data['length_range'] = []
-    batch_data['length_cv'] = []
+    if not (epoch == start_epoch and start_batch > 0):
+        batch_data['ignore_due_correct']=0
+        batch_data['ignore_due_incorrect']=0
+        batch_data['length_stdev'] = []
+        batch_data['length_range'] = []
+        batch_data['length_cv'] = []
     
     batch_bar = tqdm(
         dataloader,
@@ -2262,8 +1718,7 @@ for epoch in epoch_bar:
                         'draft_state_dict': analysis_base_draft,
                         'optimizer_state_dict': analysis_base_optimizer,
                         'scheduler_state_dict': None,
-                        'feature_layers': list(model.feature_layers),
-                        'specforge': model.checkpoint_metadata(),
+                        'architecture': 'FastGRPO',
                     }, boundary_dir / 'phi_base.pt')
 
                     branch_states = {}
@@ -2661,10 +2116,6 @@ summary = {
     "draft_sparse_kl": float(final_metrics['draft_sparse_kl']),
     "draft_sparse_count": int(final_metrics['draft_sparse_count']),
     "draft_lr_multiplier": float(draft_lr_multiplier),
-    "draft_train_mode": args.draft_train_mode,
-    "draft_train_max_batch_size": int(args.draft_train_max_batch_size),
-    "draft_train_max_tokens": int(args.draft_train_max_tokens),
-    "draft_train_max_padding_ratio": float(args.draft_train_max_padding_ratio),
     "effective_draft_lrs": effective_draft_lrs,
     "fastgrpo_ablation": bool(fastgrpo_ablation),
     "method": method,

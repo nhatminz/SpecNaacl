@@ -12,14 +12,14 @@ from helper.opd_profiles import inspect_draft,execution_key,fingerprint,discover
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
-    for name in ('draft-config','draft-checkpoint','vocab-mapping','profile-dir'):p.add_argument('--'+name,required=True)
+    for name in ('target-config','draft-checkpoint','profile-dir'):p.add_argument('--'+name,required=True)
     p.add_argument('--profile',default='');p.add_argument('--rank',type=int,required=True)
     p.add_argument('--dtype',required=True);p.add_argument('--topk',type=int,default=16)
     p.add_argument('--auto-tune',choices=['0','1'],default='0')
     p.add_argument('--batch-size',type=int,default=8);p.add_argument('--responses',type=int,default=8)
     p.add_argument('--max-draft-k',type=int,default=8);p.add_argument('--iterations',type=int,default=30)
     a=p.parse_args()
-    detected=inspect_draft(a.draft_config,a.draft_checkpoint,a.vocab_mapping,rank=a.rank,dtype=a.dtype,topk=a.topk)
+    detected=inspect_draft(a.target_config,a.draft_checkpoint,rank=a.rank,dtype=a.dtype,topk=a.topk)
     key=execution_key(fingerprint(),detected['vocab'],detected['rank'],detected['dtype'],detected['topk'])
     path,payload=discover_profile(a.profile_dir,key,a.profile)
     if path is None and a.auto_tune=='1':

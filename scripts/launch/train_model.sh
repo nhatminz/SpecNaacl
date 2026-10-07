@@ -58,8 +58,7 @@ esac
 
 PRETRAIN_MODEL_ROOT="${PRETRAIN_MODEL_ROOT:-$OUTPUT_ROOT/pretrain/$MODEL_KEY}"
 DRAFT_CHECKPOINT="${DRAFT_CHECKPOINT:-$PRETRAIN_MODEL_ROOT/latest_checkpoint}"
-DRAFT_CONFIG="${DRAFT_CONFIG:-$PRETRAIN_MODEL_ROOT/latest_draft_config.json}"
-VOCAB_MAPPING="${VOCAB_MAPPING:-$PRETRAIN_MODEL_ROOT/latest_vocab_mapping.pt}"
+TARGET_CONFIG="$MODEL/config.json"
 DRAFT_INITIALIZATION_MODE="${DRAFT_INITIALIZATION_MODE:-pretrained}"
 export OPD_PROPOSAL_PROFILE_DIR="${OPD_PROPOSAL_PROFILE_DIR:-$OUTPUT_ROOT/benchmarks/opd_proposals}"
 
@@ -71,9 +70,16 @@ RUN_NAME="${RUN_NAME:-${MODEL_KEY}__${DATASET}__method-${METHOD}__seed${TRAIN_SU
 RUN_DIR="${RUN_DIR:-$TRAIN_MODEL_ROOT/$RUN_NAME}"
 if [[ "$RESUME" == "auto" && -z "$REQUESTED_RUN_DIR" && -e "$TRAIN_MODEL_ROOT/active_run" ]]; then
   active_run="$(readlink -f "$TRAIN_MODEL_ROOT/active_run")"
-  if [[ "$(basename "$active_run")" == *"method-${METHOD}"* && -f "$active_run/checkpoints/resume/latest.pt" && ! -f "$active_run/summary.json" ]]; then
-    RUN_DIR="$active_run"
-    RUN_NAME="$(basename "$RUN_DIR")"
+  if [[ "$(basename "$active_run")" == *"method-${METHOD}"* && -f "$active_run/checkpoints/resume/latest.pt" ]]; then
+    if "$PYTHON_BIN" - "$active_run/summary.json" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+sys.exit(0 if not path.exists() or json.loads(path.read_text()).get('stopped_by_max_grpo_steps', False) else 1)
+PY
+    then
+      RUN_DIR="$active_run"
+      RUN_NAME="$(basename "$RUN_DIR")"
+    fi
   fi
 fi
 LOG_DIR="$RUN_DIR/logs"
@@ -94,10 +100,7 @@ cmd=(
   --method "$METHOD"
   --model_dir "$MODEL"
   --adapter_path "$DRAFT_CHECKPOINT"
-  --draft_backend eagle3
-  --draft_config "$DRAFT_CONFIG"
   --draft_initialization_mode "$DRAFT_INITIALIZATION_MODE"
-  --vocab_mapping "$VOCAB_MAPPING"
   --dtype "$MODEL_DTYPE"
   --attn_implementation "$ATTENTION_IMPLEMENTATION"
   --load_lora_path "$TARGET_ADAPTER"
@@ -115,10 +118,6 @@ cmd=(
   --draft_accumulation_steps "$DRAFT_ACCUMULATION_STEPS"
   --target_lr "$TARGET_LR"
   --draft_lr "$DRAFT_LR"
-  --draft_train_mode "$DRAFT_TRAIN_MODE"
-  --draft_train_max_batch_size "$DRAFT_TRAIN_MAX_BATCH_SIZE"
-  --draft_train_max_tokens "$DRAFT_TRAIN_MAX_TOKENS"
-  --draft_train_max_padding_ratio "$DRAFT_TRAIN_MAX_PADDING_RATIO"
   --draft_train_profile "$DRAFT_TRAIN_PROFILE"
   --is_train_draft "$IS_TRAIN_DRAFT"
   --temperature "$TEMPERATURE"
@@ -141,13 +140,6 @@ cmd=(
   --statistical_time "$STATISTICAL_TIME"
   --num_workers "$NUM_WORKERS"
   --persistent_workers "$PERSISTENT_WORKERS"
-  --opd_rank "$OPD_RANK" --opd_topk "$OPD_TOPK"
-  --opd_fast_lr "$OPD_FAST_LR"
-  --opd_visited_weight "$OPD_VISITED_WEIGHT" --opd_frontier_weight "$OPD_FRONTIER_WEIGHT"
-  --opd_update_stream "$OPD_UPDATE_STREAM" --opd_backend "$OPD_BACKEND"
-  --opd_profile "$OPD_PROFILE" --opd_diagnostics "$OPD_DIAGNOSTICS"
-  --opd_train_projector "$OPD_TRAIN_PROJECTOR"
-  --kv_gather_strategy "${KV_GATHER_STRATEGY:-stacked}"
   --log_interval "$LOG_INTERVAL"
   --rollout_log_flush_interval "$ROLLOUT_LOG_FLUSH_INTERVAL"
   --log_file "$LOG_DIR/metrics.jsonl"
@@ -162,6 +154,17 @@ cmd=(
   --resume_checkpoint "$RESUME_CHECKPOINT"
   --seed "$TRAIN_SUBSET_SEED"
 )
+if [[ "$METHOD" == opd_reflex ]]; then
+  cmd+=(
+  --opd_rank "$OPD_RANK" --opd_topk "$OPD_TOPK"
+  --opd_fast_lr "$OPD_FAST_LR"
+  --opd_visited_weight "$OPD_VISITED_WEIGHT" --opd_frontier_weight "$OPD_FRONTIER_WEIGHT"
+  --opd_update_stream "$OPD_UPDATE_STREAM" --opd_backend "$OPD_BACKEND"
+  --opd_profile "$OPD_PROFILE" --opd_diagnostics "$OPD_DIAGNOSTICS"
+  --opd_train_projector "$OPD_TRAIN_PROJECTOR"
+  --kv_gather_strategy "${KV_GATHER_STRATEGY:-stacked}"
+  )
+fi
 if [[ -n "$OPD_PROJECTOR_LR" && "$METHOD" == opd_reflex ]]; then
   cmd+=(--opd_projector_lr "$OPD_PROJECTOR_LR")
 fi
@@ -173,12 +176,10 @@ printf 'Command  :'; printf ' %q' "${cmd[@]}"; printf '\n'
 if [[ "${DRY_RUN:-false}" == "true" ]]; then return 0 2>/dev/null || exit 0; fi
 
 "$PYTHON_BIN" "$PROJECT_DIR/scripts/validate_environment.py" --python-only
-"$PYTHON_BIN" "$PROJECT_DIR/scripts/check_training_sources.py" --backend eagle3
+"$PYTHON_BIN" "$PROJECT_DIR/scripts/check_training_sources.py" --backend fastgrpo
 
 [[ -f "$MODEL/config.json" ]] || { echo "ERROR: model config not found: $MODEL/config.json" >&2; exit 2; }
 [[ -f "$DATASET_PATH" ]] || { echo "ERROR: dataset not found: $DATASET_PATH" >&2; exit 2; }
-[[ -f "$DRAFT_CONFIG" ]] || { echo "ERROR: EAGLE-3 config not found: $DRAFT_CONFIG" >&2; exit 2; }
-[[ -f "$VOCAB_MAPPING" ]] || { echo "ERROR: vocabulary mapping not found: $VOCAB_MAPPING" >&2; exit 2; }
 if [[ "$DRAFT_INITIALIZATION_MODE" == "pretrained" && ! -e "$DRAFT_CHECKPOINT" ]]; then
   echo "ERROR: draft checkpoint not found: $DRAFT_CHECKPOINT" >&2; exit 2
 fi
@@ -186,13 +187,13 @@ if [[ -n "$RESUME_CHECKPOINT" && ! -f "$RESUME_CHECKPOINT" ]]; then
   echo "ERROR: resume checkpoint not found: $RESUME_CHECKPOINT" >&2; exit 2
 fi
 
-export PYTHONPATH="$PROJECT_DIR:$PROJECT_DIR/third_party/SpecForge${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$PROJECT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 "$PYTHON_BIN" "$PROJECT_DIR/scripts/validate_environment.py" \
   --requirements "$PROJECT_DIR/requirements.txt" --require-cuda
 
 if [[ "$METHOD" == opd_reflex && "$OPD_PROPOSAL_MODE" == auto && "$DRAFT_INITIALIZATION_MODE" == pretrained ]];then
   OPD_PROPOSAL_PROFILE="$("$PYTHON_BIN" "$PROJECT_DIR/scripts/resolve_opd_profile.py" \
-    --draft-config "$DRAFT_CONFIG" --draft-checkpoint "$DRAFT_CHECKPOINT" --vocab-mapping "$VOCAB_MAPPING" \
+    --target-config "$TARGET_CONFIG" --draft-checkpoint "$DRAFT_CHECKPOINT" \
     --profile-dir "$OPD_PROPOSAL_PROFILE_DIR" --profile "$OPD_PROPOSAL_PROFILE" \
     --rank "$OPD_RANK" --dtype "$MODEL_DTYPE" --topk "$OPD_TOPK" \
     --auto-tune "$OPD_AUTO_TUNE_IF_MISSING" --batch-size "$BATCH_SIZE" \
@@ -206,8 +207,8 @@ mkdir -p "$TRAIN_MODEL_ROOT"
 ln -sfn "$RUN_DIR" "$TRAIN_MODEL_ROOT/active_run"
 "$PYTHON_BIN" "$PROJECT_DIR/scripts/write_run_metadata.py" --run-dir "$RUN_DIR" --kind train \
   --item "run_name=$RUN_NAME" --item "model=$MODEL" --item "dataset=$DATASET_PATH" \
-  --item "draft_checkpoint=$DRAFT_CHECKPOINT" --item "draft_config=$DRAFT_CONFIG" \
-  --item "vocab_mapping=$VOCAB_MAPPING" --item "target_adapter=$TARGET_ADAPTER" \
+  --item "draft_checkpoint=$DRAFT_CHECKPOINT" --item "draft_architecture=FastGRPO" \
+  --item "target_adapter=$TARGET_ADAPTER" \
   --item "target_lr=$TARGET_LR" --item "draft_lr=$DRAFT_LR" \
   --item "persistent_draft_objective=fastgrpo_smoothl1_2_ce_0.1" \
   --item "batch_size=$BATCH_SIZE" --item "accumulation_steps=$ACCUMULATION_STEPS" \

@@ -1,9 +1,9 @@
-"""Inference-only OPD kernels. Shared B, compact vocabulary, no model/autograd/RNG.
+"""Inference-only OPD kernels. Shared B, full target vocabulary, no model/autograd/RNG.
 
 Proposal scans inactive raw logits and ONLY S active adapter rows, then merges
 exact global top-k. No [contexts,V,r] correction or probability cache exists.
 Feedback reads the existing post-sampling teacher probabilities once in the
-compact domain; never another target softmax/sort or transformer forward.
+selected states; never another target softmax/sort or transformer forward.
 """
 import torch
 import triton
@@ -309,7 +309,7 @@ def _selected_head(SELECTED,SELECTED_COUNT,H,HEAD,BIAS,U,B,D_IDS,D_Q,T_IDS,NORM,
                 row=tl.load(HEAD+token*HIDDEN+h,h<HIDDEN,other=0).to(HEAD_DTYPE).to(tl.float32)
                 raw=tl.sum(x*row,axis=0)
                 if HAS_BIAS:raw=raw+tl.load(BIAS+token).to(HEAD_DTYPE).to(tl.float32)
-                # Dense SpecForge head returns the model dtype before FP32 softmax.
+                # Shared FastGRPO head returns the model dtype before FP32 softmax.
                 raw=raw.to(HEAD_DTYPE).to(tl.float32)
                 u=tl.load(U+(batch*CACHE+context)*R+r,r<R,other=0)
                 adapter=tl.load(B+token*R+r,r<R,other=0)
@@ -470,14 +470,14 @@ def _teacher_sorted(P,IDS,INVERSE,SELECTED,COUNT,OUT_P,OUT_IDS,MASS,WIDTH,K:tl.c
             _capture_draft_coordinates(state,D_TARGET,D_MAP,D_IDS,D_CONTEXTS,D_ROW_MAP,D_OUT,
                 D_ROWS,D_CACHE,D_TS0,D_TS1,D_TS2,K,triton.next_power_of_2(K),D_GREEDY,D_HAS_ROW_MAP)
         # Read sampler prefix; extend ONLY through positive boundary ties.
-        # Sort integer keys locally to preserve compact-ID teacher tie semantics.
-        boundary=tl.load(P+state*WIDTH+tl.minimum(K,WIDTH)-1)
+        # Sort integer keys locally to preserve token-ID teacher tie semantics.
+        boundary=tl.load(P+state*WIDTH+tl.minimum(K,WIDTH)-1).to(tl.float32)
         retained=tl.full((BLOCK,),0,tl.uint64)
         offset=tl.full((),0,tl.int32)
         more=tl.full((),True,tl.int1)
         while more:
             pos=offset+lane
-            value=tl.load(P+state*WIDTH+pos,pos<WIDTH,other=0.)
+            value=tl.load(P+state*WIDTH+pos,pos<WIDTH,other=0.).to(tl.float32)
             target=tl.load(IDS+state*WIDTH+pos,pos<WIDTH,other=0)
             compact=tl.load(INVERSE+target)
             bits=value.to(tl.uint32,bitcast=True).to(tl.uint64)
@@ -486,7 +486,7 @@ def _teacher_sorted(P,IDS,INVERSE,SELECTED,COUNT,OUT_P,OUT_IDS,MASS,WIDTH,K:tl.c
             retained,discarded=tl.split(tl.trans(tl.reshape(merged,(2,BLOCK))))
             retained=tl.where(lane<K,retained,0)
             offset+=BLOCK
-            next_value=tl.load(P+state*WIDTH+offset,offset<WIDTH,other=0.)
+            next_value=tl.load(P+state*WIDTH+offset,offset<WIDTH,other=0.).to(tl.float32)
             more=(offset<WIDTH)&(next_value>0)&(next_value>=boundary)
         probability=(retained>>32).to(tl.uint32).to(tl.float32,bitcast=True)
         compact=V-(retained&4294967295).to(tl.int64)

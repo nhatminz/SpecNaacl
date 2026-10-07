@@ -21,12 +21,11 @@ def payload(key):
 
 def draft_fixture(root,name,v=41,hidden=16,rank=None,dtype=torch.bfloat16):
     path=root/name;path.mkdir(parents=True)
-    (path/'latest_draft_config.json').write_text(json.dumps(dict(vocab_size=v+5,draft_vocab_size=v,hidden_size=hidden)))
-    state={'lm_head.weight':torch.zeros(v,hidden,dtype=dtype)}
+    (path/'latest_target_config.json').write_text(json.dumps(dict(vocab_size=v,hidden_size=hidden)))
+    state={'fs.up_proj.weight':torch.zeros(hidden*2,hidden,dtype=dtype),
+           'states_last_norm.weight':torch.ones(hidden,dtype=dtype)}
     if rank is not None:state['opd_projector']=torch.zeros(hidden,rank)
-    torch.save(dict(draft_state_dict=state),path/'latest_checkpoint')
-    t2d=torch.zeros(v+5,dtype=torch.bool);t2d[:v]=True
-    torch.save(dict(d2t=torch.zeros(v,dtype=torch.long),t2d=t2d),path/'latest_vocab_mapping.pt')
+    torch.save(dict(draft_model=state),path/'latest_checkpoint')
     return path
 
 
@@ -78,8 +77,8 @@ def test_startup_resolver_finds_shared_profile_without_auto_tuning(tmp_path,monk
     root=draft_fixture(tmp_path,'model');profiles=tmp_path/'profiles';profiles.mkdir()
     key=execution_key(fingerprint(),41,8,'bf16')
     profile=profiles/profile_filename(key);profile.write_text(json.dumps(payload(key)))
-    monkeypatch.setattr('sys.argv',['resolve','--draft-config',str(root/'latest_draft_config.json'),
-        '--draft-checkpoint',str(root/'latest_checkpoint'),'--vocab-mapping',str(root/'latest_vocab_mapping.pt'),
+    monkeypatch.setattr('sys.argv',['resolve','--target-config',str(root/'latest_target_config.json'),
+        '--draft-checkpoint',str(root/'latest_checkpoint'),
         '--profile-dir',str(profiles),'--rank','8','--dtype','bf16'])
     main();captured=capsys.readouterr()
     assert captured.out.strip()==str(profile.resolve())
@@ -96,7 +95,7 @@ def test_runtime_does_not_reuse_old_profile_after_execution_shape_changes(tmp_pa
         (tmp_path/profile_filename(key)).write_text(json.dumps(payload(key)))
     s,model,mapping=state('cuda',v=41)
     for v,dtype in ((41,torch.bfloat16),(47,torch.bfloat16)):
-        model.draft_head=torch.nn.Linear(32,v,bias=False,dtype=dtype,device='cuda')
+        model.lm_head=torch.nn.Linear(32,v,bias=False,dtype=dtype,device='cuda')
         mapping=torch.arange(v,device='cuda')
         s.start(model,3,mapping,32,max_contexts=8,max_nodes=24,max_path=5,max_proposal_contexts=4)
         assert s.tuning['execution_key']['vocab']==v and s.tuning['execution_key']['dtype']==str(dtype)
@@ -113,15 +112,15 @@ def test_valid_profile_does_not_use_legacy_global_fallback(monkeypatch):
     assert s.selected_dense_implementation(7,1)=='fused'
 
 
-def test_detects_real_checkpoint_mapping_dtype_rank_and_rejects_disagreement(tmp_path):
+def test_detects_real_checkpoint_full_vocab_dtype_rank_and_rejects_disagreement(tmp_path):
     root=draft_fixture(tmp_path,'saved',rank=4,dtype=torch.float16)
-    args=[root/'latest_draft_config.json',root/'latest_checkpoint',root/'latest_vocab_mapping.pt']
+    args=[root/'latest_target_config.json',root/'latest_checkpoint']
     detected=inspect_draft(*args)
     assert (detected['vocab'],detected['rank'],detected['dtype'])==(41,4,'torch.float16')
     assert inspect_draft(*args,dtype='bf16')['dtype']=='torch.bfloat16' # runtime cast override
-    with pytest.raises(ValueError,match='learned checkpoint'):inspect_draft(*args,rank=8)
-    mapping=torch.load(args[2],weights_only=True);mapping['d2t'][0]=999;torch.save(mapping,args[2])
-    with pytest.raises(ValueError,match='inconsistent'):inspect_draft(*args)
+    with pytest.raises(ValueError,match='projector rank'):inspect_draft(*args,rank=8)
+    (root/'latest_target_config.json').write_text(json.dumps(dict(vocab_size=41,hidden_size=17)))
+    with pytest.raises(ValueError,match='hidden size mismatch'):inspect_draft(*args)
 
 
 def test_multi_model_dedup_hidden_independent_and_reuse_without_retune(tmp_path):
@@ -150,13 +149,11 @@ def test_different_vocab_and_rank_produce_different_config_groups(tmp_path):
     assert result['unique_configs']==3 and len(calls)==3
 
 
-def test_exported_safetensors_checkpoint_header_and_directory_projector(tmp_path):
-    from safetensors.torch import save_file
-    root=draft_fixture(tmp_path,'exported',rank=None)
+def test_directory_checkpoint_reads_fastgrpo_weights(tmp_path):
+    root=draft_fixture(tmp_path,'exported',rank=4)
     weights=root/'weights';weights.mkdir()
-    save_file({'lm_head.weight':torch.zeros(41,16,dtype=torch.bfloat16)},str(weights/'model.safetensors'))
-    torch.save(torch.zeros(16,4),weights/'opd_projector.pt')
-    result=inspect_draft(root/'latest_draft_config.json',weights,root/'latest_vocab_mapping.pt')
+    (root/'latest_checkpoint').rename(weights/'draft.pth')
+    result=inspect_draft(root/'latest_target_config.json',weights)
     assert result['vocab']==41 and result['rank']==4 and result['dtype']=='torch.bfloat16'
 
 

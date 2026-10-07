@@ -23,11 +23,11 @@ IMPORT_NAMES = {
 # Interpreter admission is a lower bound, not a patch-release allowlist.
 # The dependency pins/imports and CUDA checks below remain separate: accepting
 # a newer interpreter does not guarantee wheels/runtime support for that version.
-MIN_PYTHON_VERSION = (3, 12, 0)
+MIN_PYTHON_VERSION = (3, 10, 0)
 
 # Narrow patch compatibility exception, not an unbounded dependency range.
 # requirements.txt still specifies exactly one reproducible installation pin.
-COMPATIBLE_PATCH_VERSIONS = {"peft": frozenset({"0.21.1", "0.21.2"})}
+COMPATIBLE_PATCH_VERSIONS = {}
 REQUIRED_APIS = {
     "peft": (
         "get_peft_config", "get_peft_model", "LoraConfig", "TaskType", "PeftType",
@@ -116,15 +116,6 @@ def main():
     if args.require_cuda:
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is required but torch.cuda.is_available() is false")
-        major, minor = torch.cuda.get_device_capability()
-        if (major, minor) < (10, 0):
-            raise RuntimeError(
-                f"B200-class compute capability >=10.0 required; found {major}.{minor}"
-            )
-
-    backend = importlib.import_module("specforge.offline_capture.sglang_backend")
-    if not hasattr(backend, "OfflineSGLangCaptureBackend"):
-        raise RuntimeError("SpecForge SGLang offline capture API is unavailable")
     print(
         "environment validation passed: "
         f"python={sys.version.split()[0]} torch={torch.__version__} "
