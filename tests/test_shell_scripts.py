@@ -26,7 +26,7 @@ def test_paired_model_launchers_only_differ_by_method_and_keep_paths_hyperparame
         for flag,value in (('--target_lr','1e-5'),('--draft_lr','1e-5'),('--batch_size','8'),
                            ('--accumulation_steps','4'),('--repeated_generate_nums','8'),
                            ('--opd_rank','8'),('--opd_topk','16'),('--opd_fast_lr','0.01'),
-                           ('--opd_update_stream','0'),('--opd_profile','0'),('--opd_diagnostics','0'),
+                           ('--opd_update_stream','1'),('--opd_profile','0'),('--opd_diagnostics','0'),
                            ('--train_option','simplelr_abel_level3to5'),('--log_interval','1'),
                            ('--attn_implementation','sdpa')):
             assert flags[flag]==value
@@ -54,6 +54,11 @@ def test_opd_hyperparameter_overrides_reach_cli(tmp_path):
                        ('--opd_fast_lr','0.05'),('--opd_update_stream','1'),('--opd_rank','16'),('--opd_topk','32')):
         assert args[args.index(flag)+1]==value
     assert '--nproc_per_node=2' in args
+
+
+def test_stream_zero_still_overrides_new_async_default():
+    args=command('train_qwen25_3b.sh',OPD_UPDATE_STREAM='0')
+    assert args[args.index('--opd_update_stream')+1]=='0'
 
 
 @pytest.mark.parametrize('key',MODEL_KEYS)

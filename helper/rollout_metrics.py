@@ -7,7 +7,7 @@ OPD_FIELDS=('kl','selected_states','visited_states','frontier_states',
     'target_mass_in_draft_top16','target_compact_mass','active_rows_mean','active_rows_max',
     'sparse_rounds','dense_rounds','fused_rounds','gemm_rounds')
 KV_FIELDS=('iter_host_syncs','iter_host_syncs_per_round','iter_kv_cache_bytes',
-           'iter_kv_full_reallocations','iter_kv_full_history_copies','iter_kv_history_copy_bytes')
+           'iter_kv_full_reallocations','iter_kv_full_history_copies','iter_kv_history_copy_bytes','iter_kv_rows_moved','iter_kv_pool_allocations')
 FIELDS=('global_iter','epoch','batch_iter','method','grpo_step','used_items','eligible_prompts','total_prompts',
     'iter_aal','cumulative_aal','iter_generation_time_s','cumulative_generation_time_s','cumulative_wall_time_s',
     'iter_rollout_tokens','cumulative_rollout_tokens','iter_verification_rounds','cumulative_verification_rounds',
@@ -84,6 +84,8 @@ class RolloutMetricsWriter:
             row['iter_host_syncs']=o.get('opd_host_syncs',0)
             row['iter_host_syncs_per_round']=o.get('opd_host_syncs_per_round',0)
             row['iter_kv_cache_bytes']=sum(o.get('opd_'+side+'_kv_cache_bytes',0) for side in ('target','draft'))
+            row['iter_kv_rows_moved']=max(o.get('opd_'+side+'_kv_rows_moved',0) for side in ('target','draft'))
+            row['iter_kv_pool_allocations']=sum(o.get('opd_'+side+'_pool_allocations',0) for side in ('target','draft'))
             for field,name in (('iter_kv_full_reallocations','full_kv_reallocations'),('iter_kv_full_history_copies','full_history_copies'),('iter_kv_history_copy_bytes','full_history_copy_bytes')):
                 row[field]=sum(o.get('opd_'+side+'_'+name,0) for side in ('target','draft'))
             for name in ('selected_states','visited_states','frontier_states','active_rows_max'):

@@ -36,6 +36,7 @@ def test_old_iteration_csv_resume_migrates_header_and_logs_exact_kv_counters(tmp
         opd_target_kv_cache_bytes=100,opd_draft_kv_cache_bytes=30,
         opd_target_full_kv_reallocations=1,opd_draft_full_kv_reallocations=2,
         opd_target_full_history_copies=4,opd_draft_full_history_copies=5,
+        opd_target_kv_rows_moved=3,opd_draft_kv_rows_moved=3,
         opd_target_full_history_copy_bytes=80,opd_draft_full_history_copy_bytes=90),
         grpo_step=1,used_items=8,wall_time_s=2)
     writer.close()
@@ -44,7 +45,7 @@ def test_old_iteration_csv_resume_migrates_header_and_logs_exact_kv_counters(tmp
     assert [row['global_iter'] for row in rows]==['1','2']
     assert list(rows[1])==list(FIELDS) and rows[0]['iter_host_syncs']==''
     assert float(rows[1]['iter_aal'])==3
-    for field,value in zip(KV_FIELDS,[2,1,130,3,9,170]):
+    for field,value in zip(KV_FIELDS,[2,1,130,3,9,170,3,0]):
         assert float(rows[1][field])==value
 
 

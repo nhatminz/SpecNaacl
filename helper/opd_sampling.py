@@ -3,8 +3,11 @@ import torch
 from helper.sampling import sample_from_probs
 
 
-def sample_target_with_metadata(logits,*,do_sample,temperature,top_p,top_k,eos_token_id,metadata_builder=None):
-    if not do_sample:return logits.argmax(-1),None,None
+def sample_target_with_metadata(logits,*,do_sample,temperature,top_p,top_k,eos_token_id,metadata_builder=None,return_probs=True):
+    if not do_sample:
+        tokens=logits.argmax(-1)
+        metadata=metadata_builder(tokens,None,None) if metadata_builder is not None else None
+        return tokens,None,metadata
     if temperature<=0:raise ValueError('sampling temperature must be positive')
     vocabulary=logits.shape[-1]
     flat=logits.reshape(-1,vocabulary).float()/float(temperature)
@@ -33,4 +36,4 @@ def sample_target_with_metadata(logits,*,do_sample,temperature,top_p,top_k,eos_t
     # Consume the existing sort into independently owned small buffers while
     # its lifetime is confined to this sampler. Never return an [N,V] view.
     small_metadata=metadata_builder(tokens,probs,metadata) if metadata_builder is not None else None
-    return tokens,probs,small_metadata
+    return tokens,probs if return_probs else None,small_metadata

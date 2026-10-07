@@ -1,3 +1,94 @@
+# Last three OPD bottlenecks — minimal moves / persistent KV / compact teacher (2026-10-07)
+
+Current commands/details: [OPD_MEMORY_LAST_THREE.md](OPD_MEMORY_LAST_THREE.md).
+Scope restricted to the requested3 memory bottlenecks and production stream default.
+
+Implemented:
+
+- Tail-to-hole disjoint swap-remove plan from the EXISTING host scheduling packet.
+  One in-place K/V copy kernel/layer touches moved_rows*live_history, no survivor-wide
+  gather. Tail finish = zero KV copy/launch. Both target and EAGLE caches use the
+  same plan; owners/responses/lengths/masks/positions/committed features/history
+  remap consistently. Generic arbitrary-permutation cache API remains for prefill
+  repetition/tests; finished rollout no longer uses it.
+- Preserve native target sampling order: target head INPUT hidden states are
+  gathered to canonical original-response order only when swap actually changes
+  order. No full logits/probs permutation or extra head/transformer forward.
+  Small tree/path metadata remap around the UNCHANGED verifier (one trace).
+  Canonical feedback queue reads physical draft caches through a row map, retaining
+  prior reduction/gradient ordering. This compatibility work is necessary to avoid
+  RNG changes from physical batch-row reordering, not a new decoding algorithm.
+- `model._opd_target_kv_pool` / `_opd_draft_kv_pool` persist capacities across
+  DataLoader iterations. Logical length/B reset at begin/end, stats reset per iter,
+  no stale history exposed. Only actual token/batch high-water overflow grows.
+  `OPD_KV_MAX_RETAINED_TOKENS=0` retains high water; optional positive cap drops
+  oversized pools at rollout boundary. No empty_cache/sync just for logging.
+  Persistent pools stay allocated during GRPO training; cap can trade reuse for
+  lower retained VRAM if needed. No unlimited growth with fixed bounded workload.
+- TargetTop16/mass + p_target_at_DraftTop16 captured while sampler probabilities
+  and existing sort are alive. Raw Draft p lookup FUSED into sorted/full-greedy/
+  compact-teacher-merge kernels, no standalone lookup launch/second sort/softmax.
+  Async feedback receives only small independent preallocated metadata buffers,
+  no [N,V] target probabilities or record_stream on them. Union/KL/grad_B/grad_A
+  preserve previous normalization/math. Legacy full-prob APIs retained only for
+  before/after oracle and parity tests, not production generation.
+- Production `OPD_FAST_LR=0.01`, `OPD_UPDATE_STREAM=1` in common env, launcher,
+  Python CLI/direct rollout default and all14 paired wrappers. Overrides retained.
+  Async snapshot one round stale; NO wait merely for exact dispatch count.
+- Per-iteration CSV / frozen benchmark log moved rows, history copy bytes, growth
+  reallocations AND initial pool allocations, memory, host packets/round, AAL and
+  verification rounds. Rows counted logically (not multiplied by target/draft or
+  layers); bytes sum K+V payload across all layers, including necessary prefill
+  replication and geometric grow. Tail-finish zero-copy is a per-finish delta.
+- Opt-in `--include-previous-opd` runs frozen prior rollout (stable survivor order,
+  per-rollout KV and full-prob async feedback) beside current and historical OFF.
+  Same policy/draft/A/data/seed/tree/proposal config, separate warmup for each;
+  recommendations choose CURRENT configs only. Frozen oracle is imported only by
+  tests/explicit benchmark, never by training. Whole-kernel fingerprint changed;
+  existing tuner/discovery algorithms untouched, regenerate compatible profiles.
+
+Validation:
+
+- Full suite: **491 passed, 3 skipped, 3 failed**. All new tests pass. The three
+  failures are pre-existing references to missing requirements-bootstrap.txt,
+  requirements-external.txt and scripts/build_offline_wheelhouse.sh. No tests
+  hidden/disabled and no claim that the complete suite is green.
+- Tail-only/first-hole/multiple-hole/all-finished CPU/CUDA cache equality and
+  copied-byte counts; stable KV pool pointers, grow/reuse/reset/retention cap.
+  Compact metadata full/subset mapping, greedy/sample, KL/counters/grad_B/grad_A
+  parity against full-prob reference within current tolerances. Weakrefs prove
+  full probability tensor dies at sampler return before async feedback.
+- Frozen previous vs current complete fixture rollout: tokens, CUDA RNG, history
+  tensors, acceptance counters and forward counts match. Native HF Qwen2 + actual
+  vendored SpecForge EAGLE3 also passes previous/dynamic/persistent/reuse runs for
+  stream0/1. Actual benchmark-driver GPU smoke runs historical/previous/current
+  with those tiny real models; only external loading/tokenization/data are test
+  fixtures, GPU forwards/sampler/verifier/OPD/measurement/aggregation are REAL.
+- Actual RTX3090 tiny fixture per iter: finish rows copied **49 → 5**, history
+  copy bytes **64736 → 8672**, pool allocations iter0/1/2 **2/2/2 → 2/0/0**;
+  AAL1.212 and one host packet/round unchanged. This is correctness/instrumentation
+  evidence, NOT B200 production throughput or production memory evidence.
+- Compile/shell syntax/source/CLI checks and local isolated `pip check` pass.
+  Tests use RTX3090, Torch2.5.1+cu124/Triton3.1/native HF5.12.1 with the documented
+  TEST-PROCESS-ONLY Dynamo alias for vendored SpecForge. No dependency changes.
+
+**Not measured here:** B200 production before/after generation tokens/s, peak
+VRAM, AAL/rounds. B200 and server model/data/checkpoints unavailable. User-provided
+1837.201 tokens/s and +0.00980 AAL for LR0.01/stream1 are prior sweep evidence only,
+used to set requested default, not fabricated/rebranded as our after result.
+The documented same-config B200 before/after command exports all requested metrics.
+
+Changed files: `helper/{opd_static_cache,opd_kv_kernels,opd_sampling,opd_reflex,
+opd_reflex_kernels,specualtive_generate,rollout_metrics}.py`;
+`scripts/{launch/train_model.sh,benchmark_opd_reflex.py}`; shared B200 env,
+`grpo_speculative.py` stream default only; all14 paired train wrappers;
+tests/fixtures + frozen `tests/oracles/opd_rollout_before_memory.py`;
+`OPD_MEMORY_LAST_THREE.md`, run guide/autotuning-doc cross-reference and this report.
+Historical FastGRPO, shared target sampler, verifier, proposal autotuner/dispatcher
+files, target/draft loss/update schedule, dependencies and sibling repos unchanged.
+
+---
+
 # Generalized OPD autotuning — execution key / six-model dedup (2026-10-07)
 
 Current procedure: [OPD_AUTOTUNING.md](OPD_AUTOTUNING.md), also integrated into

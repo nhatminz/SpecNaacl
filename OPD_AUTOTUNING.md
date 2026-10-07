@@ -1,5 +1,9 @@
 # OPD proposal autotuning (execution-keyed, multi-model)
 
+Memory lifecycle/metadata revision và default stream1:
+[OPD_MEMORY_LAST_THREE.md](OPD_MEMORY_LAST_THREE.md). Autotuner/dispatcher algorithm
+không đổi trong memory revision; conservative kernel fingerprint cần regenerate.
+
 Production default: `OPD_PROPOSAL_MODE=auto`, `OPD_DENSE_IMPLEMENTATION=auto`.
 Historical FastGRPO, OPD objective, B update, target sampling/RNG, verifier and
 online draft training remain unchanged. No extra model forward is used for tuning

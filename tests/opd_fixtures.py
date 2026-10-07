@@ -7,15 +7,16 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 import math
 import time
+import os
 import torch
 from helper.opd_reflex import OPDReflex,OPD_COUNTER_NAMES
 from helper.method_config import resolve_method
 from helper.rollout_history import RolloutHistory
 from helper.opd_history import ContiguousRolloutHistory
-from helper.tree_verification import pack_tree,trace_verified_path,select_confidence_nodes
+from helper.tree_verification import pack_tree,trace_verified_path,select_confidence_nodes,PackedTree,VerifiedPath
 from helper.sampling import build_sampling_probs,sample_from_probs,sample_target_from_logits
 from helper.opd_sampling import sample_target_with_metadata
-from helper.opd_static_cache import OPDStaticCache
+from helper.opd_static_cache import OPDStaticCache,persistent_cache,swap_remove_plan
 from helper.opd_attention import AttentionWorkspace
 from helper.opd_scheduling import schedule,compact_suffix_inplace
 
@@ -95,7 +96,7 @@ class CountModel(TinyModel):
         return super().__call__(*args,**kwargs)
     def compact_to_target_ids(self,device=None):return self.mapping
 
-def load_rollout(device='cpu',history_type=None):
+def load_rollout(device='cpu',history_type=None,source_path=None):
     historical_history=history_type or RolloutHistory
     opd_history=history_type or ContiguousRolloutHistory
     if not hasattr(opd_history,'finalize'):
@@ -105,20 +106,29 @@ def load_rollout(device='cpu',history_type=None):
                 super().__init__(*args,**kwargs)
                 self.results={}
                 self.count=next(iter(args[0].values())).shape[0]*kwargs.get('repeats',1)
-            def append(self,rows,chunks,owners=None):super().append(rows,chunks)
+            def append(self,rows,chunks,owners=None):
+                if hasattr(self,'active') and self.active!=rows:
+                    # Test concat oracle formerly assumed stable physical rows.
+                    # Preserve each response's history under swap-remove order.
+                    assert set(self.active)==set(rows)
+                    order=[self.active.index(original) for original in rows]
+                    for name,tensor in self.tensors.items():self.tensors[name]=tensor[order]
+                    self.active=list(rows)
+                super().append(rows,chunks)
             def mark_finished(self,row):self.results[row]=super().finish(row)
             def finalize(self):
                 for row in range(self.count):
                     if row not in self.results:self.mark_finished(row)
                 return [self.results[row] for row in range(self.count)]
         opd_history=HistoryAdapter
-    path=Path(__file__).resolve().parents[1]/'helper/specualtive_generate.py'
+    path=Path(source_path) if source_path is not None else Path(__file__).resolve().parents[1]/'helper/specualtive_generate.py'
     tree=ast.parse(path.read_text())
     for n in ast.walk(tree):
         if isinstance(n,ast.FunctionDef) and n.name=='get_attention_mask':
             n.args.defaults[1]=ast.Constant(device)
     fns=[n for n in tree.body if isinstance(n,ast.FunctionDef)]
-    scope=dict(torch=torch,time=time,math=math,deepcopy=deepcopy,DynamicCache=Cache,
+    scope=dict(torch=torch,time=time,math=math,os=os,deepcopy=deepcopy,DynamicCache=Cache,
+               persistent_cache=persistent_cache,swap_remove_plan=swap_remove_plan,PackedTree=PackedTree,VerifiedPath=VerifiedPath,
                AttentionWorkspace=AttentionWorkspace,OPDStaticCache=OPDStaticCache,OPDReflex=OPDReflex,resolve_method=resolve_method,RolloutHistory=opd_history,
                OPD_COUNTER_NAMES=OPD_COUNTER_NAMES,historical_generate=load_historical(device,historical_history),
                schedule=schedule,compact_suffix_inplace=compact_suffix_inplace,

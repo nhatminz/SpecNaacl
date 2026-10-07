@@ -1,9 +1,9 @@
 """Growable flat HF KV cache: suffix append, geometric growth, row remap.
 
 Attention sees a valid prefix. Only geometric growth replaces its pool.
-Repeat/select use shared reusable live-prefix scratch on CUDA (token tiles on
-CPU), then write into the SAME pool. Never copy unpopulated capacity or allocate
-another full-capacity pool per finished row. Remapping still copies live history.
+Finished rows use disjoint tail-to-hole copies; unchanged survivors are untouched.
+Generic repeat/select still uses scratch for arbitrary aliasing permutations.
+Pools persist across rollouts; logical history resets without exposing stale KV.
 """
 import torch
 import weakref
@@ -85,8 +85,9 @@ class StaticAppendLayer(CacheLayerMixin):
         shape = (rows, self.key_pool.shape[1], capacity, self.key_pool.shape[-1])
         old_keys, old_values = self.keys, self.values
         keys, values = self.key_pool.new_empty(shape), self.value_pool.new_empty(shape)
-        keys[:self.batch_size, :, :self.length].copy_(old_keys)
-        values[:self.batch_size, :, :self.length].copy_(old_values)
+        if self.length:
+            keys[:self.batch_size, :, :self.length].copy_(old_keys)
+            values[:self.batch_size, :, :self.length].copy_(old_values)
         self.stats['pool_allocations'] += 1
         self.stats['full_kv_reallocations'] += 1
         if self.length:
@@ -153,6 +154,25 @@ class StaticAppendLayer(CacheLayerMixin):
             indices = torch.arange(self.batch_size,device=self.key_pool.device).repeat_interleave(repeats)
             self.batch_select_indices(indices)
 
+    def swap_remove(self,new_batch,sources,destinations):
+        # Sources are disjoint live tail rows; destinations are holes below
+        # new_batch. No gather scratch/barrier or survivor-wide copy required.
+        count=sources.numel()
+        if count and self.length:
+            if self.key_pool.is_cuda:
+                from helper.opd_kv_kernels import move_tail_rows
+                move_tail_rows(self.key_pool,self.value_pool,sources,destinations,self.length)
+            else:
+                for source,destination in zip(sources,destinations):
+                    self.key_pool[destination,:,:self.length].copy_(self.key_pool[source,:,:self.length])
+                    self.value_pool[destination,:,:self.length].copy_(self.value_pool[source,:,:self.length])
+        moved=count*self.key_pool.shape[1]*self.length*self.key_pool.shape[-1]*(self.key_pool.element_size()+self.value_pool.element_size())
+        self.stats['row_compactions']+=1
+        self.stats['row_compaction_bytes']+=moved
+        self.stats['full_history_copy_bytes']+=moved
+        if moved:self.stats['full_history_copies']+=1
+        self.batch_size=new_batch
+
 
 class OPDStaticCache(Cache):
     def __init__(self, capacity=256, *, batch_capacity=0, chunk_size=256):
@@ -162,6 +182,19 @@ class OPDStaticCache(Cache):
         else: self.layers = []
         self.capacity, self.batch_capacity, self.chunk_size = capacity,batch_capacity,chunk_size
         self._scratch = {}
+        self.kv_rows_moved=0
+
+    def begin_rollout(self,batch,batch_capacity):
+        self.batch_capacity=max(self.batch_capacity,batch_capacity)
+        self.kv_rows_moved=0
+        for layer in self.layers:
+            layer.length=0;layer.batch_size=batch
+            for key in layer.stats:layer.stats[key]=0
+
+    def end_rollout(self,max_retained_tokens=0):
+        for layer in self.layers:layer.length=layer.batch_size=0
+        if max_retained_tokens and any(layer.capacity>max_retained_tokens for layer in self.layers):
+            self.layers.clear();self._scratch.clear()
 
     def scratch(self,pool,shape):
         rows=shape[0]
@@ -187,6 +220,12 @@ class OPDStaticCache(Cache):
         for layer in self.layers: layer.batch_repeat_interleave(repeats)
     def batch_select_indices(self,indices):
         for layer in self.layers: layer.batch_select_indices(indices)
+        # Generic selection copies every output row; prefill repeat calls layer
+        # methods directly and is intentionally excluded from finish-row counts.
+        self.kv_rows_moved+=indices.numel()
+    def swap_remove(self,new_batch,sources,destinations):
+        for layer in self.layers:layer.swap_remove(new_batch,sources,destinations)
+        self.kv_rows_moved+=sources.numel()
     def __getitem__(self,index): return self.layers[index].keys,self.layers[index].values
     def __iter__(self):
         for layer in self.layers: yield layer.keys,layer.values
@@ -198,4 +237,26 @@ class OPDStaticCache(Cache):
         totals = {key:sum(layer.stats[key] for layer in self.layers) for key in names}
         totals['kv_cache_bytes'] = sum(pool.numel()*pool.element_size() for layer in self.layers for pool in (layer.key_pool,layer.value_pool) if pool is not None)
         totals['kv_compaction_workspace_bytes'] = sum(x.numel()*x.element_size() for x in self._scratch.values())
+        totals['kv_rows_moved']=self.kv_rows_moved
+        totals['kv_history_copy_bytes']=totals['full_history_copy_bytes']
         return totals
+
+
+def swap_remove_plan(finished):
+    """Host metadata already provided by the sole scheduling packet."""
+    new_batch=len(finished)-sum(bool(x) for x in finished)
+    holes=[i for i in range(new_batch) if finished[i]]
+    tail=[i for i in range(len(finished)-1,new_batch-1,-1) if not finished[i]]
+    keep=list(range(new_batch))
+    for destination,source in zip(holes,tail):keep[destination]=source
+    return keep,tail,holes
+
+
+def persistent_cache(model,name,batch,responses,device,dtype):
+    cache=getattr(model,name,None)
+    signature=(str(device),dtype)
+    if cache is None or getattr(cache,'runtime_signature',None)!=signature:
+        cache=OPDStaticCache(256,batch_capacity=batch*responses)
+        cache.runtime_signature=signature;setattr(model,name,cache)
+    cache.begin_rollout(batch,batch*responses)
+    return cache

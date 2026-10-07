@@ -17,9 +17,15 @@ export OPD_PROPOSAL_PROFILE="${OPD_PROPOSAL_PROFILE:-}"
 export OPD_PROPOSAL_MODE="${OPD_PROPOSAL_MODE:-auto}"
 export OPD_DENSE_IMPLEMENTATION="${OPD_DENSE_IMPLEMENTATION:-auto}"
 export OPD_AUTO_TUNE_IF_MISSING="${OPD_AUTO_TUNE_IF_MISSING:-0}"
+export OPD_UPDATE_STREAM="${OPD_UPDATE_STREAM:-1}"
+export OPD_FAST_LR="${OPD_FAST_LR:-${FAST_LR:-0.01}}"
+export OPD_KV_MAX_RETAINED_TOKENS="${OPD_KV_MAX_RETAINED_TOKENS:-0}"
 if [[ ! "$ROLLOUT_LOG_FLUSH_INTERVAL" =~ ^0*[1-9][0-9]*$ ]]; then
   echo "ERROR: ROLLOUT_LOG_FLUSH_INTERVAL must be a positive integer; got: $ROLLOUT_LOG_FLUSH_INTERVAL" >&2
   exit 2
+fi
+if [[ ! "$OPD_KV_MAX_RETAINED_TOKENS" =~ ^[0-9]+$ ]];then
+  echo "ERROR: OPD_KV_MAX_RETAINED_TOKENS must be a nonnegative integer" >&2;exit 2
 fi
 : "${MODEL:?MODEL is required}"
 case "$METHOD" in
@@ -218,6 +224,7 @@ ln -sfn "$RUN_DIR" "$TRAIN_MODEL_ROOT/active_run"
   --item "opd_dense_implementation=$OPD_DENSE_IMPLEMENTATION" \
   --item "opd_proposal_profile=$OPD_PROPOSAL_PROFILE" \
   --item "opd_proposal_profile_dir=$OPD_PROPOSAL_PROFILE_DIR" \
+  --item "opd_kv_max_retained_tokens=$OPD_KV_MAX_RETAINED_TOKENS" \
   --item "kv_gather_strategy=${KV_GATHER_STRATEGY:-stacked}" \
   --item "nproc_per_node=$NPROC_PER_NODE"
 

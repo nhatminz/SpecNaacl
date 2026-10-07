@@ -245,6 +245,7 @@ class OPDReflex:
                 self.selected_ids=alloc(n,torch.int32);self.selected_count=alloc(1,torch.int32)
                 self.teacher_p=alloc(n*k);self.teacher_ids=alloc(n*k,torch.long);self.teacher_mass=alloc(n)
                 self.teacher_q=alloc(n*k);self.union_ids=alloc(n*2*k,torch.long);self.union_g=alloc(n*2*k)
+                self.teacher_draft_p=alloc(n*k)
                 self.state_stats=alloc(n*10);self.round_weight=alloc(1)
                 self.teacher_tiles=[alloc(n*t*(k if i>=2 else 1),torch.long if i==3 else torch.float32) for i in range(4)] if self.backend=='triton' else []
                 self.counters=alloc(len(OPD_COUNTER_NAMES),torch.float64)
@@ -255,6 +256,7 @@ class OPDReflex:
         self.bitmap.zero_();self.active_count.zero_();self.dispatch_snapshot.zero_()
         self.host_active_count=0
         self.host_sync_count=0
+        self.feedback_row_map=None
         self.host_fused_rounds=self.host_gemm_rounds=0
         if self.enabled:self.B_fast.zero_();self.counters.zero_()
         self._ever_updated=False;self._events.clear()
@@ -286,6 +288,23 @@ class OPDReflex:
             return self._opd_kernels.prepare_teacher(self,tree,path,target,sampling_metadata=sorted_metadata)
         # Subsets use selected compact extraction in feedback; no sorted retention.
         return None
+
+    def prepare_compact_teacher(self,tree,path,target,sorted_metadata=None,greedy=False):
+        if self.backend=='triton':
+            return self._opd_kernels.prepare_compact_teacher(self,tree,path,target,greedy,sorted_metadata)
+        b,q=tree.parents.shape;k=self.topk
+        batch=torch.arange(b)[:,None].expand(b,q)
+        if self.feedback_row_map is not None:batch=self.feedback_row_map[batch]
+        context=tree.feedback_contexts.clamp_min(0)
+        di=self.ids_cache[batch,context]
+        p=(self.mapping[None,None,:]==target[...,None]).float() if greedy else target[...,self.mapping]
+        mass=p.sum(-1);good=torch.isfinite(mass)&(mass>0)
+        normalized=p/torch.where(good,mass,1.)[...,None]
+        ti=torch.argsort(normalized,descending=True,stable=True)[...,:k]
+        tp=normalized.gather(-1,ti)
+        ti=torch.where(tp>0,ti,-1)
+        raw=p.gather(-1,di)
+        return tp.reshape(-1,k),ti.reshape(-1,k),mass.flatten(),raw.reshape(-1,k)
 
     @torch.no_grad()
     def propose(self,logits,hidden,k,mapping,*,root=False,context_offset=0,head_inputs=None):
@@ -346,27 +365,39 @@ class OPDReflex:
     def feedback(self,tree,path,target,*,greedy=False,sampling_metadata=None):
         if not self.enabled:return
         if self.backend=='triton':self._opd_kernels.feedback(self,tree,path,target,greedy,sampling_metadata)
-        else:self._feedback_reference(tree,path,target,greedy)
+        else:self._feedback_reference(tree,path,target,greedy,sampling_metadata)
         if self.fast_lr>0:self._ever_updated=True
 
-    def _feedback_reference(self,tree,path,target,greedy):
+    def _feedback_reference(self,tree,path,target,greedy,sampling_metadata=None):
         # CPU oracle only: dense reconstructed q and gradient permitted HERE.
         b,q=tree.parents.shape;k=self.topk
         weights,kind=select_states_reference(tree,path,self.visited_weight,self.frontier_weight)
         batch=torch.arange(b)[:,None].expand(b,q);context=tree.feedback_contexts.clamp_min(0)
+        if self.feedback_row_map is not None:batch=self.feedback_row_map[batch]
         head_inputs=self.head_cache[batch,context];u=self.u_cache[batch,context]
         raw=torch.nn.functional.linear(head_inputs,self.head.weight,self.head.bias).float()
         corrected=raw+u.matmul(self.B_fast.t())
         norm=self.norm_cache[batch,context]
         draft=((corrected-norm[...,0,None]).exp()/norm[...,1,None])
-        if greedy:teacher=(self.mapping[None,None,:]==target[...,None]).float()
-        else:teacher=target[...,self.mapping].float()
-        mass=teacher.sum(-1);good=torch.isfinite(mass)&(mass>0)
-        teacher=teacher/torch.where(good,mass,1.)[...,None]
-        w=torch.where(good,weights,0.).reshape(-1)
         di=self.ids_cache[batch,context].reshape(-1,k)
-        ti=torch.argsort(teacher,dim=-1,descending=True,stable=True)[...,:k].reshape(-1,k)
-        ti=torch.where(teacher.reshape(-1,self.vocab).gather(-1,ti)>0,ti,-1)
+        if sampling_metadata is not None and len(sampling_metadata)==4:
+            tp,ti,mass,pd=sampling_metadata
+            mass=mass.view(b,q);good=torch.isfinite(mass)&(mass>0)
+            # Dense oracle ONLY: reconstruct union coordinates, not teacher
+            # outside the union. Tail=1-sum(union) retains the same objective.
+            teacher=torch.zeros_like(draft).reshape(-1,self.vocab)
+            teacher.scatter_(1,di,pd/torch.where(good,mass,1.).reshape(-1,1))
+            rows=torch.arange(b*q)[:,None].expand(-1,k)
+            positive=ti>=0;teacher[rows[positive],ti[positive]]=tp[positive]
+            teacher=teacher.view(b,q,self.vocab)
+        else:
+            if greedy:teacher=(self.mapping[None,None,:]==target[...,None]).float()
+            else:teacher=target[...,self.mapping].float()
+            mass=teacher.sum(-1);good=torch.isfinite(mass)&(mass>0)
+            teacher=teacher/torch.where(good,mass,1.)[...,None]
+            ti=torch.argsort(teacher,dim=-1,descending=True,stable=True)[...,:k].reshape(-1,k)
+            ti=torch.where(teacher.reshape(-1,self.vocab).gather(-1,ti)>0,ti,-1)
+        w=torch.where(good,weights,0.).reshape(-1)
         ids,valid,p,qq,pt,qt,kl=union_reference(teacher.reshape(-1,self.vocab),draft.reshape(-1,self.vocab),ti,di)
         # Cached top-k q avoids selected-row output-head reconstruction drift.
         qq[:,:k]=self.q_cache[batch,context].reshape(-1,k)

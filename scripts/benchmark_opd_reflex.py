@@ -36,6 +36,7 @@ def parse_args(argv=None):
     p.add_argument('--diagnostics',action='store_true',help='Opt-in end-rollout B norm; excluded by default')
     p.add_argument('--gpu-utilization',action='store_true',help='Benchmark-only 0.5s nvidia-smi sampling; may perturb host timing')
     p.add_argument('--dry-run',action='store_true')
+    p.add_argument('--include-previous-opd',action='store_true',help='Also run frozen pre-memory-optimization rollout with same policy/draft/proposal settings')
     a=p.parse_args(argv)
     a.lr_values=[float(x) for x in a.fast_lrs.split(',')];a.stream_values=[int(x) for x in a.streams.split(',')]
     a.seed_values=[int(x) for x in a.seeds.split(',')]
@@ -56,7 +57,7 @@ def collator(tokenizer,max_prompt_length):
 
 def release_runtime_cache(model):
     # Benchmark boundaries only. Don't charge a previous mode's retained pools.
-    for name in ('_opd_runtime_cache','_opd_tree_mask_workspace','_opd_attention_workspace','_opd_padding_workspace','_opd_kv_scratch'):
+    for name in ('_opd_runtime_cache','_opd_tree_mask_workspace','_opd_attention_workspace','_opd_padding_workspace','_opd_kv_scratch','_opd_target_kv_pool','_opd_draft_kv_pool'):
         if hasattr(model,name):delattr(model,name)
 
 
@@ -89,11 +90,19 @@ def summarize(rows):
     for mode in ('fused','gemm'):result['opd_'+mode+'_rounds']=result['opd_proposal_mode_'+mode+'_rounds']
     host_syncs=sum(r.get('opd_host_syncs',0) for r in rows)
     batches=sum(r.get('batch_verification_rounds',0) for r in rows)
-    result['host_syncs_per_round']=host_syncs/batches if batches and rows[0].get('method')=='opd_reflex' else None
+    result['host_syncs_per_round']=host_syncs/batches if batches and rows[0].get('method','').startswith('opd_reflex') else None
     result['kv_cache_bytes']=max(r.get('observed_kv_cache_bytes',0) for r in rows)
-    for field in ('full_kv_reallocations','full_history_copies','full_history_copy_bytes','row_compactions','row_compaction_bytes'):
+    for field in ('full_kv_reallocations','full_history_copies','full_history_copy_bytes','row_compactions','row_compaction_bytes','kv_rows_moved','kv_history_copy_bytes','pool_allocations'):
         result[field]=(sum(r.get('opd_target_'+field,0)+r.get('opd_draft_'+field,0) for r in rows)
-                       if rows[0].get('method')=='opd_reflex' else None)
+                       if rows[0].get('method','').startswith('opd_reflex') else None)
+    if rows[0].get('method','').startswith('opd_reflex'):
+        result['kv_rows_moved']=sum(max(r.get('opd_target_kv_rows_moved',0),r.get('opd_draft_kv_rows_moved',0)) for r in rows)
+        result['kv_reallocations_per_iter']=result['full_kv_reallocations']/len(rows)
+        result['kv_pool_allocations_per_iter']=result['pool_allocations']/len(rows)
+        result['kv_history_copy_bytes_per_iter']=result['kv_history_copy_bytes']/len(rows)
+        result['kv_rows_moved_per_iter']=result['kv_rows_moved']/len(rows)
+    else:
+        result.update(kv_reallocations_per_iter=None,kv_pool_allocations_per_iter=None,kv_history_copy_bytes_per_iter=None,kv_rows_moved_per_iter=None)
     measured_compactions=[r['kv_compaction_profile_ms'] for r in rows
                           if r.get('kv_compaction_profile_ms') is not None]
     result['kv_compaction_profile_ms']=sum(measured_compactions) if measured_compactions else None
@@ -107,6 +116,12 @@ def benchmark(args):
     from helper.eagle3_specforge import Eagle3FastGRPOAdapter
     from helper.get_QAs import get_QAs_from_path
     from helper.specualtive_generate import speculative_generate
+    previous_generate=None
+    if args.include_previous_opd:
+        import importlib.util
+        spec=importlib.util.spec_from_file_location('_opd_previous_rollout',ROOT/'tests/oracles/opd_rollout_before_memory.py')
+        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        previous_generate=module.speculative_generate
     from helper.opd_reflex import OPD_COUNTER_NAMES
     from scripts.gpu_utilization import GPUUtilization
     if not torch.cuda.is_available():raise RuntimeError('real CUDA + configured pretrained checkpoints required')
@@ -156,10 +171,12 @@ def benchmark(args):
     def run(method,lr,stream,batch,seed):
         torch.manual_seed(seed);before=count.copy()
         observed_kv.update(target=0,draft=0)
-        out=speculative_generate(model,batch['input_ids'],batch['attention_mask'],tokenizer,
-            method=method,opd_fast_lr=lr,opd_update_stream=bool(stream),**base)
+        generator=previous_generate if method=='opd_reflex_previous' else speculative_generate
+        out=generator(model,batch['input_ids'],batch['attention_mask'],tokenizer,
+            method='opd_reflex' if method=='opd_reflex_previous' else method,opd_fast_lr=lr,opd_update_stream=bool(stream),**base)
         return out,{k:count[k]-before[k] for k in count}
-    configurations=[('fastgrpo',0.,0)]+[('opd_reflex',lr,s) for lr in args.lr_values for s in args.stream_values]
+    configurations=[('fastgrpo',0.,0)]+[(method,lr,s) for lr in args.lr_values for s in args.stream_values
+        for method in (('opd_reflex_previous','opd_reflex') if args.include_previous_opd else ('opd_reflex',))]
     reports=[];response_file=Path(args.output)/'responses.jsonl'
     try:
         off,c0=run('fastgrpo',0.,0,batches[0],args.seed_values[0])
@@ -207,7 +224,7 @@ def benchmark(args):
                         row['profile_sections_ms']=profile['opd_profile_sections_ms']
                         sections=profile.get('opd_profile_sections_ms') or {}
                         row['kv_compaction_profile_ms']=(sum(sections.get(key,0) for key in ('kv_batch_compaction_ms','kv_suffix_compaction_ms'))
-                            if method=='opd_reflex' else None)
+                            if method.startswith('opd_reflex') else None)
                     with response_file.open('a') as f:
                         for response,(tokens,a,n) in enumerate(zip(output['generated_token_ids'],output['response_accepted_length_sum'],output['response_verification_rounds'])):
                             f.write(json.dumps(dict(method=method,fast_lr=lr,update_stream=stream,seed=actual_seed,
@@ -222,10 +239,14 @@ def benchmark(args):
         for result in reports:
             result['delta_aal']=result['aal']-baseline['aal']
             result['relative_generation_overhead_percent']=100*(result['generation_wall_s']/baseline['generation_wall_s']-1)
+            prior=next((x for x in reports if x['method']=='opd_reflex_previous' and x['fast_lr']==result['fast_lr'] and x['update_stream']==result['update_stream']),None)
+            result['delta_aal_vs_previous_opd']=result['aal']-prior['aal'] if prior and result['method']=='opd_reflex' else None
+            result['tokens_per_s_ratio_vs_previous_opd']=result['tokens_per_s']/prior['tokens_per_s'] if prior and result['method']=='opd_reflex' else None
         # Keep all results, including negative AAL/cost > benefit. Throughput wins
         # are not automatically called AAL improvements or production defaults.
-        best=max(reports[1:],key=lambda x:x['tokens_per_s'])
-        goal_candidates=[x for x in reports[1:] if x['delta_aal']>0 and x['tokens_per_s']>=baseline['tokens_per_s']]
+        current=[x for x in reports if x['method']=='opd_reflex']
+        best=max(current,key=lambda x:x['tokens_per_s'])
+        goal_candidates=[x for x in current if x['delta_aal']>0 and x['tokens_per_s']>=baseline['tokens_per_s']]
         recommendation=max(goal_candidates,key=lambda x:x['tokens_per_s']) if goal_candidates else None
         payload=dict(gpu=torch.cuda.get_device_name(),torch=torch.__version__,config=vars(args),
             proposal_mode=os.environ.get('OPD_PROPOSAL_MODE','auto'),

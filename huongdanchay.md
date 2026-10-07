@@ -4,6 +4,9 @@ Dùng venv SpecNaacl đã được kiểm tra; KHÔNG dùng venv TLT (khác Torc
 Paths model/data/pretrained draft giữ nguyên. Không cần pretrain lại. Pipeline
 không tải model/dataset từ Internet; giữ nguyên dependencies trong ENVIRONMENT.md.
 
+Current memory revision và benchmark trước/sau:
+[OPD_MEMORY_LAST_THREE.md](OPD_MEMORY_LAST_THREE.md).
+
 ```bash
 cd /workspace/storage-shared/nlp/minhpn19/SpecNaacl
 source .venv/bin/activate
@@ -21,7 +24,7 @@ export OPD_RANK=8
 export OPD_TOPK=16
 export OPD_VISITED_WEIGHT=1.0
 export OPD_FRONTIER_WEIGHT=1.0
-export OPD_UPDATE_STREAM=0   # UNTUNED: đo cả0/1, không giả định async nhanh hơn
+export OPD_UPDATE_STREAM=1   # B200/Qwen2.5-3B observed fastest; vẫn override được
 export OPD_TRAIN_PROJECTOR=1 # A học tại draft optimizer boundary, không reset
 export OPD_PROJECTOR_LR=1e-5 # để trống để kế thừa draft LR; resume giữ optimizer moments
 export ROLLOUT_LOG_FLUSH_INTERVAL=1 # buffer CSV; tăng lên 8 nếu shared storage chậm
@@ -29,6 +32,7 @@ export OPD_PROPOSAL_MODE=auto
 export OPD_DENSE_IMPLEMENTATION=auto
 export OPD_PROFILE=0
 export OPD_DIAGNOSTICS=0
+export OPD_KV_MAX_RETAINED_TOKENS=0 # keep high-water KV pools; optional retention cap
 ```
 
 Dataset default:

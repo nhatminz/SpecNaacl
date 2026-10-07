@@ -201,11 +201,15 @@ def test_real_hf_eagle_rollout_mask_cache_sampler_feedback_integration(tiny_adap
         adapter.register_forward_pre_hook(lambda *a:calls.__setitem__('draft',calls['draft']+1))]
     try:
         results=[]
-        for static in (False,True):
-            adapter.supports_opd_static_kv=static
+        import importlib.util
+        spec=importlib.util.spec_from_file_location('_previous_opd_integration',ROOT/'tests/oracles/opd_rollout_before_memory.py')
+        previous=importlib.util.module_from_spec(spec);spec.loader.exec_module(previous)
+        for mode in ('previous','dynamic','persistent','reuse'):
+            adapter.supports_opd_static_kv=mode!='dynamic'
             calls.update(target=0,draft=0)
             torch.manual_seed(71)
-            output=speculative_generate(adapter,torch.tensor([[1,2,3],[3,4,5]],device='cuda'),
+            generate=previous.speculative_generate if mode=='previous' else speculative_generate
+            output=generate(adapter,torch.tensor([[1,2,3],[3,4,5]],device='cuda'),
                 torch.ones(2,3,dtype=torch.long,device='cuda'),SimpleNamespace(eos_token_id=31),
                 do_sample=True,repeated_generate_nums=2,max_length=24,verification_capacity=24,
                 max_draft_k=2,max_draft_token_length=2,min_draft_token_length=2,max_verification_num=8,
@@ -214,14 +218,65 @@ def test_real_hf_eagle_rollout_mask_cache_sampler_feedback_integration(tiny_adap
             assert calls['draft']==2*output['batch_verification_rounds']
             assert len(output['generated_token_ids'])==4
             assert output['opd_host_syncs_per_round']==1
+            if mode=='reuse':
+                for side in ('target','draft'):
+                    assert output['opd_'+side+'_full_kv_reallocations']==0
+                    assert getattr(adapter,'_opd_'+side+'_kv_pool').get_seq_length()==0
             results.append((output,torch.cuda.get_rng_state()))
-        legacy,growable=(x[0] for x in results)
-        assert torch.equal(results[0][1],results[1][1])
-        for key in ('generated_token_ids','total_acc_length','total_decoded_token_num',
-                    'response_accepted_length_sum','response_verification_rounds'):
-            assert legacy[key]==growable[key]
-        for key in ('all_draft_input_states','all_target_hidden_states','all_draft_input_ids'):
-            for before,after in zip(legacy[key],growable[key]):
-                torch.testing.assert_close(before,after,rtol=0,atol=0)
+        legacy=results[0][0]
+        for growable,rng in results[1:]:
+            assert torch.equal(results[0][1],rng)
+            for key in ('generated_token_ids','total_acc_length','total_decoded_token_num',
+                        'response_accepted_length_sum','response_verification_rounds'):
+                assert legacy[key]==growable[key]
+            for key in ('all_draft_input_states','all_target_hidden_states','all_draft_input_ids'):
+                for before,after in zip(legacy[key],growable[key]):
+                    torch.testing.assert_close(before,after,rtol=0,atol=0)
     finally:
         for hook in hooks:hook.remove()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(),reason='native HF + EAGLE benchmark driver smoke')
+def test_before_after_benchmark_driver_smoke_with_real_tiny_models(tiny_adapter,tmp_path,monkeypatch):
+    import sys
+    from types import SimpleNamespace,ModuleType
+    import transformers
+    from helper import eagle3_specforge
+    from helper.opd_reflex import initialize_projector
+    from scripts import benchmark_opd_reflex as bench
+    config=transformers.Qwen2Config(vocab_size=32,hidden_size=16,intermediate_size=32,
+        num_hidden_layers=2,num_attention_heads=4,num_key_value_heads=2,head_dim=4)
+    config._attn_implementation='sdpa'
+    target=transformers.Qwen2ForCausalLM(config).cuda().to(torch.bfloat16).eval()
+    target._fastgrpo_eagle3_capture_layers=[0,0,1]
+    adapter=tiny_adapter.cuda().to(torch.bfloat16);adapter.dtype=torch.bfloat16
+    adapter.target_model=target
+    adapter.lm_head=eagle3_specforge._TargetVocabHead(adapter.draft_model)
+    adapter.draft_model.d2t.zero_()
+    adapter.draft_model.register_parameter('opd_projector',torch.nn.Parameter(initialize_projector(16,8).cuda()))
+    adapter.draft_model.register_buffer('opd_projector_grad_sum',torch.zeros(16,8,device='cuda'))
+    adapter.draft_model.register_buffer('opd_projector_grad_weight',torch.zeros(1,device='cuda'))
+    tokenizer=SimpleNamespace(eos_token_id=31,pad_token_id=0,pad_token='<pad>')
+    monkeypatch.setattr(transformers.AutoModelForCausalLM,'from_pretrained',lambda *a,**k:target)
+    monkeypatch.setattr(transformers.AutoTokenizer,'from_pretrained',lambda *a,**k:tokenizer)
+    monkeypatch.setattr(eagle3_specforge,'Eagle3FastGRPOAdapter',lambda *a,**k:adapter)
+    # ONLY external loading/collation mocked; model forwards, KV, native sampler,
+    # tree/verifier, OPD kernels, CUDA timing and report aggregation are REAL.
+    data=ModuleType('helper.get_QAs');data.get_QAs_from_path=lambda *a:[{'prompt':'tiny fixture'}]
+    monkeypatch.setitem(sys.modules,'helper.get_QAs',data)
+    monkeypatch.setattr(bench,'collator',lambda *a:lambda rows:dict(input_ids=torch.tensor([[1,2,3]]),attention_mask=torch.ones(1,3,dtype=torch.long)))
+    args=bench.parse_args(['--target-model','tiny-fixture','--draft-checkpoint','tiny-fixture',
+        '--draft-config','tiny-fixture','--vocab-mapping','tiny-fixture','--dataset-path','tiny-fixture',
+        '--output',str(tmp_path),'--batch-size','1','--responses','2','--iterations','1','--warmup','1',
+        '--max-length','12','--max-prompt-length','3','--max-draft-k','2','--max-draft-length','2',
+        '--min-draft-length','2','--verification-capacity','24','--max-verification-num','8',
+        '--fast-lrs','0.01','--streams','1','--seeds','71','--include-previous-opd'])
+    result=bench.benchmark(args)
+    assert [r['method'] for r in result['reports']]==['fastgrpo','opd_reflex_previous','opd_reflex']
+    before,after=result['reports'][1:]
+    assert before['aal']==after['aal']
+    assert after['host_syncs_per_round']==1
+    assert after['kv_pool_allocations_per_iter']==0
+    assert after['kv_reallocations_per_iter']==0
+    assert after['tokens_per_s']>0 and after['peak_allocated_bytes']>0
+    assert result['fastest_observed']['method']=='opd_reflex'

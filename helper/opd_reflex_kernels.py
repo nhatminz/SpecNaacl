@@ -238,7 +238,7 @@ def _teacher_scan(TARGET,MAP,SELECTED,COUNT,MAX,SUM,VALUES,IDS,TS0,TS1,TS2,
             score=tl.where(v==token,-float('inf'),score);live=live&(v!=token)
 
 
-def teacher(target,mapping,weights,topk,pools,outputs,greedy=False,selection=None):
+def teacher(target,mapping,weights,topk,pools,outputs,greedy=False,selection=None,capture=None):
     b,q=weights.shape;v=mapping.numel();tiles=triton.cdiv(v,256);n=b*q;k=min(topk,v)
     maxima,sums,values,ids=[p[:n*tiles*(k if i>=2 else 1)] for i,p in enumerate(pools)]
     probs,indices,norm=outputs
@@ -252,18 +252,23 @@ def teacher(target,mapping,weights,topk,pools,outputs,greedy=False,selection=Non
     # _proposal_merge exponentiates score values; teacher top-k instead needs
     # literal probability ranking and division by compact mass.
     _teacher_merge[(n,)](weights,sums,values,ids,probs,indices,norm,n,v,k,tiles,
-        triton.next_power_of_2(tiles),triton.next_power_of_2(tiles*k),num_warps=4)
+        triton.next_power_of_2(tiles),triton.next_power_of_2(tiles*k),**(capture or {}),num_warps=4)
 
 
-@triton.jit(do_not_specialize=["N"])
+@triton.jit(do_not_specialize=["N","D_ROWS","D_CACHE","D_TS0","D_TS1","D_TS2"])
 def _teacher_merge(W,SUM,VALUES,IDS,P,OUT_IDS,MASS,N,V:tl.constexpr,K:tl.constexpr,
-                   TILES:tl.constexpr,BT:tl.constexpr,BK:tl.constexpr):
+                   TILES:tl.constexpr,BT:tl.constexpr,BK:tl.constexpr,
+                   CAPTURE:tl.constexpr=False,D_TARGET=None,D_MAP=None,D_IDS=None,D_CONTEXTS=None,D_ROW_MAP=None,D_OUT=None,
+                   D_ROWS=0,D_CACHE=0,D_TS0=0,D_TS1=0,D_TS2=0,D_GREEDY:tl.constexpr=False,D_HAS_ROW_MAP:tl.constexpr=False):
     state=tl.program_id(0).to(tl.int64);t=tl.arange(0,BT);candidate=tl.arange(0,BK)
     selected=tl.load(W+state)>0
     if selected:
         mass=tl.sum(tl.load(SUM+state*TILES+t,(t<TILES)&selected,other=0),axis=0)
         valid_mass=(mass>0)&(mass<float('inf'))
         tl.store(MASS+state,mass)
+        if CAPTURE:
+            _capture_draft_coordinates(state,D_TARGET,D_MAP,D_IDS,D_CONTEXTS,D_ROW_MAP,D_OUT,
+                D_ROWS,D_CACHE,D_TS0,D_TS1,D_TS2,K,triton.next_power_of_2(K),D_GREEDY,D_HAS_ROW_MAP)
         value=tl.load(VALUES+state*TILES*K+candidate,(candidate<TILES*K)&selected,other=-float('inf'))
         ids=tl.load(IDS+state*TILES*K+candidate,(candidate<TILES*K)&selected,other=V)
         for j in range(K):
@@ -280,36 +285,37 @@ def _teacher_merge(W,SUM,VALUES,IDS,P,OUT_IDS,MASS,N,V:tl.constexpr,K:tl.constex
 
 
 @triton.jit(do_not_specialize=["ROWS","CACHE"])
-def _selected_head(SELECTED,SELECTED_COUNT,H,HEAD,BIAS,U,B,D_IDS,D_Q,T_IDS,NORM,W,MASS,CONTEXTS,OUT,
+def _selected_head(SELECTED,SELECTED_COUNT,H,HEAD,BIAS,U,B,D_IDS,D_Q,T_IDS,NORM,W,MASS,CONTEXTS,OUT,ROW_MAP,
                    HEAD_DTYPE:tl.constexpr,ROWS,CACHE,
                    HIDDEN:tl.constexpr,R:tl.constexpr,K:tl.constexpr,
-                   HAS_BIAS:tl.constexpr,BH:tl.constexpr,BR:tl.constexpr,BK:tl.constexpr):
+                   HAS_BIAS:tl.constexpr,BH:tl.constexpr,BR:tl.constexpr,BK:tl.constexpr,HAS_ROW_MAP:tl.constexpr):
     j=tl.program_id(0)
     worker=tl.program_id(1);stride=tl.num_programs(1)
     count=tl.load(SELECTED_COUNT)
     for ordinal in range(worker,count,stride):
         state=tl.load(SELECTED+ordinal).to(tl.int64)
+        batch=tl.load(ROW_MAP+state//ROWS).to(tl.int64) if HAS_ROW_MAP else state//ROWS
         weight=tl.load(W+state);context=tl.load(CONTEXTS+state)
         token=tl.load(T_IDS+state*K+j)
-        k=tl.arange(0,BK);cached_ids=tl.load(D_IDS+(state//ROWS*CACHE+tl.maximum(context,0))*K+k,k<K,other=-1)
+        k=tl.arange(0,BK);cached_ids=tl.load(D_IDS+(batch*CACHE+tl.maximum(context,0))*K+k,k<K,other=-1)
         matches=cached_ids==token;found=tl.sum(matches.to(tl.int32),axis=0)>0
         mass=tl.load(MASS+state)
         if (weight>0)&(context>=0)&(mass>0)&(mass<float('inf'))&(token>=0):
             if found:
-                q=tl.sum(tl.where(matches,tl.load(D_Q+(state//ROWS*CACHE+context)*K+k,k<K,other=0),0.),axis=0)
+                q=tl.sum(tl.where(matches,tl.load(D_Q+(batch*CACHE+context)*K+k,k<K,other=0),0.),axis=0)
             else:
                 h,r=tl.arange(0,BH),tl.arange(0,BR)
-                x=tl.load(H+(state//ROWS*CACHE+context)*HIDDEN+h,h<HIDDEN,other=0).to(HEAD_DTYPE).to(tl.float32)
+                x=tl.load(H+(batch*CACHE+context)*HIDDEN+h,h<HIDDEN,other=0).to(HEAD_DTYPE).to(tl.float32)
                 row=tl.load(HEAD+token*HIDDEN+h,h<HIDDEN,other=0).to(HEAD_DTYPE).to(tl.float32)
                 raw=tl.sum(x*row,axis=0)
                 if HAS_BIAS:raw=raw+tl.load(BIAS+token).to(HEAD_DTYPE).to(tl.float32)
                 # Dense SpecForge head returns the model dtype before FP32 softmax.
                 raw=raw.to(HEAD_DTYPE).to(tl.float32)
-                u=tl.load(U+(state//ROWS*CACHE+context)*R+r,r<R,other=0)
+                u=tl.load(U+(batch*CACHE+context)*R+r,r<R,other=0)
                 adapter=tl.load(B+token*R+r,r<R,other=0)
                 z=raw+tl.sum(adapter*u,axis=0)
-                maximum=tl.load(NORM+(state//ROWS*CACHE+context)*2)
-                total=tl.load(NORM+(state//ROWS*CACHE+context)*2+1)
+                maximum=tl.load(NORM+(batch*CACHE+context)*2)
+                total=tl.load(NORM+(batch*CACHE+context)*2+1)
                 q=tl.div_rn(tl.exp(z-maximum),total)
         else:q=0.
         tl.store(OUT+state*K+j,q)
@@ -317,14 +323,16 @@ def _selected_head(SELECTED,SELECTED_COUNT,H,HEAD,BIAS,U,B,D_IDS,D_Q,T_IDS,NORM,
 
 @triton.jit(do_not_specialize=["TS0","TS1","TS2","ROWS","CACHE"])
 def _union(SELECTED,SELECTED_COUNT,TARGET,MAP,W,KIND,CONTEXTS,D_IDS,D_Q,T_IDS,T_P,T_Q,MASS,
-            OUT_IDS,OUT_G,STATS,TS0,TS1,TS2,ROWS,CACHE,
-            V:tl.constexpr,K:tl.constexpr,FIELDS:tl.constexpr,BU:tl.constexpr,GREEDY:tl.constexpr):
+            OUT_IDS,OUT_G,STATS,DRAFT_P,ROW_MAP,TS0,TS1,TS2,ROWS,CACHE,
+            V:tl.constexpr,K:tl.constexpr,FIELDS:tl.constexpr,BU:tl.constexpr,GREEDY:tl.constexpr,
+            COMPACT:tl.constexpr,HAS_ROW_MAP:tl.constexpr):
     worker=tl.program_id(0);stride=tl.num_programs(0)
     count=tl.load(SELECTED_COUNT)
     for ordinal in range(worker,count,stride):
         state=tl.load(SELECTED+ordinal).to(tl.int64)
+        batch=tl.load(ROW_MAP+state//ROWS).to(tl.int64) if HAS_ROW_MAP else state//ROWS
         j=tl.arange(0,BU);first=j<K
-        context=tl.maximum(tl.load(CONTEXTS+state),0);cache=state//ROWS*CACHE+context
+        context=tl.maximum(tl.load(CONTEXTS+state),0);cache=batch*CACHE+context
         kk=j%K
         d_ids=tl.load(D_IDS+cache*K+kk,j<2*K,other=-1)
         token=tl.where(first,d_ids,tl.load(T_IDS+state*K+kk,j<2*K,other=-1))
@@ -336,11 +344,17 @@ def _union(SELECTED,SELECTED_COUNT,TARGET,MAP,W,KIND,CONTEXTS,D_IDS,D_Q,T_IDS,T_
         good=(mass>0)&(mass<float('inf'))
         target_positive=(token>=0)&(tl.load(T_P+state*K+kk,j<2*K,other=0)>0)
         valid=(j<2*K)&(first|(~overlap&target_positive))&(weight>0)&good
-        target_id=tl.load(MAP+tl.maximum(token,0),j<2*K,other=0)
-        if GREEDY:
-            p=(target_id==tl.load(TARGET+state//ROWS*TS0+state%ROWS*TS1)).to(tl.float32)
-        else:p=tl.load(TARGET+state//ROWS*TS0+state%ROWS*TS1+target_id*TS2,valid,other=0).to(tl.float32)
-        p=tl.where(valid,tl.div_rn(p,tl.where(good,mass,1.)),0.)
+        if COMPACT:
+            raw=tl.load(DRAFT_P+state*K+kk,first&valid,other=0.)
+            normalized=tl.div_rn(raw,tl.where(good,mass,1.))
+            p=tl.where(first,normalized,tl.load(T_P+state*K+kk,valid,other=0.))
+            p=tl.where(valid,p,0.)
+        else:
+            target_id=tl.load(MAP+tl.maximum(token,0),j<2*K,other=0)
+            if GREEDY:
+                p=(target_id==tl.load(TARGET+state//ROWS*TS0+state%ROWS*TS1)).to(tl.float32)
+            else:p=tl.load(TARGET+state//ROWS*TS0+state%ROWS*TS1+target_id*TS2,valid,other=0).to(tl.float32)
+            p=tl.where(valid,tl.div_rn(p,tl.where(good,mass,1.)),0.)
         q=tl.where(first,tl.load(D_Q+cache*K+kk,j<2*K,other=0),tl.load(T_Q+state*K+kk,j<2*K,other=0))
         q=tl.where(valid,q,0.)
         p_tail=tl.maximum(1.-tl.sum(p,axis=0),0.);q_tail=tl.maximum(1.-tl.sum(q,axis=0),0.)
@@ -377,17 +391,19 @@ def _reduce(STATS,ROUND_WEIGHT,COUNTERS,N,FIELDS:tl.constexpr,BN:tl.constexpr):
 
 @triton.jit(do_not_specialize=["ROWS","CACHE"])
 def _update(SELECTED,SELECTED_COUNT,IDS,G,U,CONTEXTS,ROUND_WEIGHT,B,BITS,ACTIVE,COUNT,
+             ROW_MAP,
              ROWS,CACHE,K:tl.constexpr,R:tl.constexpr,
-             LR:tl.constexpr,BU:tl.constexpr,BR:tl.constexpr):
+             LR:tl.constexpr,BU:tl.constexpr,BR:tl.constexpr,HAS_ROW_MAP:tl.constexpr):
     worker=tl.program_id(0);stride=tl.num_programs(0)
     count=tl.load(SELECTED_COUNT)
     for ordinal in range(worker,count,stride):
         state=tl.load(SELECTED+ordinal).to(tl.int64)
+        batch=tl.load(ROW_MAP+state//ROWS).to(tl.int64) if HAS_ROW_MAP else state//ROWS
         j,r=tl.arange(0,BU),tl.arange(0,BR)
         token=tl.load(IDS+state*2*K+j,j<2*K,other=-1)
         g=tl.load(G+state*2*K+j,j<2*K,other=0)
         context=tl.maximum(tl.load(CONTEXTS+state),0)
-        u=tl.load(U+(state//ROWS*CACHE+context)*R+r,r<R,other=0)
+        u=tl.load(U+(batch*CACHE+context)*R+r,r<R,other=0)
         denominator=tl.load(ROUND_WEIGHT)
         delta=-LR*tl.div_rn(g[:,None]*u[None,:],tl.where(denominator>0,denominator,1.))
         valid=(j<2*K)&(token>=0)&(denominator>0)
@@ -412,19 +428,21 @@ def _round_end(B,BITS,ACTIVE,COUNT,WEIGHT,COUNTERS,R:tl.constexpr,
 
 @triton.jit(do_not_specialize=["ROWS","CACHE"])
 def _projector_terms(SELECTED,SELECTED_COUNT,IDS,G,HEAD,B,CONTEXTS,H_OUT,V_OUT,
+                      ROW_MAP,
                       ROWS,CACHE,K:tl.constexpr,HIDDEN:tl.constexpr,
-                      R:tl.constexpr,BU:tl.constexpr,BH:tl.constexpr,BR:tl.constexpr):
+                      R:tl.constexpr,BU:tl.constexpr,BH:tl.constexpr,BR:tl.constexpr,HAS_ROW_MAP:tl.constexpr):
     worker=tl.program_id(0);stride=tl.num_programs(0)
     count=tl.load(SELECTED_COUNT)
     for ordinal in range(worker,count,stride):
         state=tl.load(SELECTED+ordinal).to(tl.int64)
+        batch=tl.load(ROW_MAP+state//ROWS).to(tl.int64) if HAS_ROW_MAP else state//ROWS
         j,r,h=tl.arange(0,BU),tl.arange(0,BR),tl.arange(0,BH)
         ids=tl.load(IDS+state*2*K+j,j<2*K,other=-1)
         g=tl.load(G+state*2*K+j,j<2*K,other=0)
         b=tl.load(B+tl.maximum(ids[:,None],0)*R+r[None,:],(ids[:,None]>=0)&(j[:,None]<2*K)&(r[None,:]<R),other=0)
         v=tl.sum(g[:,None]*b,axis=0)
         context=tl.maximum(tl.load(CONTEXTS+state),0)
-        head=tl.load(HEAD+(state//ROWS*CACHE+context)*HIDDEN+h,h<HIDDEN,other=0).to(tl.float32)
+        head=tl.load(HEAD+(batch*CACHE+context)*HIDDEN+h,h<HIDDEN,other=0).to(tl.float32)
         tl.store(H_OUT+ordinal*HIDDEN+h,head,h<HIDDEN)
         tl.store(V_OUT+ordinal*R+r,v,r<R)
 
@@ -440,12 +458,17 @@ def _projector_reduce(H,V,COUNT,OUT,HIDDEN:tl.constexpr,R:tl.constexpr,BH:tl.con
     tl.store(OUT+h[:,None]*R+r[None,:],acc,(h[:,None]<HIDDEN)&(r[None,:]<R))
 
 
-@triton.jit(do_not_specialize=['WIDTH'])
-def _teacher_sorted(P,IDS,INVERSE,SELECTED,COUNT,OUT_P,OUT_IDS,MASS,WIDTH,K:tl.constexpr,BLOCK:tl.constexpr,V:tl.constexpr):
+@triton.jit(do_not_specialize=['WIDTH','D_ROWS','D_CACHE','D_TS0','D_TS1','D_TS2'])
+def _teacher_sorted(P,IDS,INVERSE,SELECTED,COUNT,OUT_P,OUT_IDS,MASS,WIDTH,K:tl.constexpr,BLOCK:tl.constexpr,V:tl.constexpr,
+                    CAPTURE:tl.constexpr=False,D_TARGET=None,D_MAP=None,D_IDS=None,D_CONTEXTS=None,D_ROW_MAP=None,D_OUT=None,
+                    D_ROWS=0,D_CACHE=0,D_TS0=0,D_TS1=0,D_TS2=0,D_GREEDY:tl.constexpr=False,D_HAS_ROW_MAP:tl.constexpr=False):
     lane=tl.arange(0,BLOCK)
     for ordinal in range(tl.program_id(0),tl.load(COUNT),tl.num_programs(0)):
         state=tl.load(SELECTED+ordinal).to(tl.int64)
         tl.store(MASS+state,1.)
+        if CAPTURE:
+            _capture_draft_coordinates(state,D_TARGET,D_MAP,D_IDS,D_CONTEXTS,D_ROW_MAP,D_OUT,
+                D_ROWS,D_CACHE,D_TS0,D_TS1,D_TS2,K,triton.next_power_of_2(K),D_GREEDY,D_HAS_ROW_MAP)
         # Read sampler prefix; extend ONLY through positive boundary ties.
         # Sort integer keys locally to preserve compact-ID teacher tie semantics.
         boundary=tl.load(P+state*WIDTH+tl.minimum(K,WIDTH)-1)
@@ -471,8 +494,10 @@ def _teacher_sorted(P,IDS,INVERSE,SELECTED,COUNT,OUT_P,OUT_IDS,MASS,WIDTH,K:tl.c
         tl.store(OUT_IDS+state*K+lane,tl.where(probability>0,compact,-1),lane<K)
 
 
-@triton.jit(do_not_specialize=['ROWS','TS0','TS1'])
-def _teacher_full_greedy(TARGET,INVERSE,SELECTED,COUNT,P,IDS,MASS,ROWS,TS0,TS1,K:tl.constexpr,BK:tl.constexpr):
+@triton.jit(do_not_specialize=['ROWS','TS0','TS1','D_ROWS','D_CACHE','D_TS0','D_TS1','D_TS2'])
+def _teacher_full_greedy(TARGET,INVERSE,SELECTED,COUNT,P,IDS,MASS,ROWS,TS0,TS1,K:tl.constexpr,BK:tl.constexpr,
+                         CAPTURE:tl.constexpr=False,D_TARGET=None,D_MAP=None,D_IDS=None,D_CONTEXTS=None,D_ROW_MAP=None,D_OUT=None,
+                         D_ROWS=0,D_CACHE=0,D_TS0=0,D_TS1=0,D_TS2=0,D_GREEDY:tl.constexpr=False,D_HAS_ROW_MAP:tl.constexpr=False):
     lane=tl.arange(0,BK)
     for ordinal in range(tl.program_id(0),tl.load(COUNT),tl.num_programs(0)):
         state=tl.load(SELECTED+ordinal).to(tl.int64)
@@ -481,9 +506,12 @@ def _teacher_full_greedy(TARGET,INVERSE,SELECTED,COUNT,P,IDS,MASS,ROWS,TS0,TS1,K
         tl.store(P+state*K+lane,tl.where(lane==0,1.,0.),lane<K)
         tl.store(IDS+state*K+lane,tl.where(lane==0,compact,-1),lane<K)
         tl.store(MASS+state,1.)
+        if CAPTURE:
+            _capture_draft_coordinates(state,D_TARGET,D_MAP,D_IDS,D_CONTEXTS,D_ROW_MAP,D_OUT,
+                D_ROWS,D_CACHE,D_TS0,D_TS1,D_TS2,K,triton.next_power_of_2(K),D_GREEDY,D_HAS_ROW_MAP)
 
 
-def prepare_teacher(state,tree,path,target,greedy=False,sampling_metadata=None):
+def prepare_teacher(state,tree,path,target,greedy=False,sampling_metadata=None,capture=None):
     b,q=tree.parents.shape;n=b*q;k=state.topk;rank=state.rank
     weights=state.selected_weights[:n].view(b,q);kind=state.selected_kind[:n].view(b,q)
     ticket=state.begin('opd_state_select_ms')
@@ -493,45 +521,76 @@ def prepare_teacher(state,tree,path,target,greedy=False,sampling_metadata=None):
     if greedy and state.full_vocab_inverse is not None:
         _compact_selected[(1,)](weights,state.selected_ids,state.selected_count,n,triton.next_power_of_2(n),num_warps=4)
         _teacher_full_greedy[(min(n,32),)](target,state.full_vocab_inverse,state.selected_ids,state.selected_count,
-            probs,ids,mass,q,*target.stride(),k,triton.next_power_of_2(k),num_warps=4)
+            probs,ids,mass,q,*target.stride(),k,triton.next_power_of_2(k),**(capture or {}),num_warps=4)
     elif sampling_metadata is not None and state.full_vocab_inverse is not None:
         sorted_p,sorted_ids=sampling_metadata
         _compact_selected[(1,)](weights,state.selected_ids,state.selected_count,n,triton.next_power_of_2(n),num_warps=4)
         _teacher_sorted[(min(n,32),)](sorted_p,sorted_ids,state.full_vocab_inverse,state.selected_ids,state.selected_count,
-            probs,ids,mass,sorted_p.shape[-1],k,max(32,triton.next_power_of_2(k)),state.vocab,num_warps=4)
+            probs,ids,mass,sorted_p.shape[-1],k,max(32,triton.next_power_of_2(k)),state.vocab,**(capture or {}),num_warps=4)
     else:
         teacher(target,state.mapping,weights,k,state.teacher_tiles,(probs,ids,mass),greedy,
-                selection=(state.selected_ids,state.selected_count))
+                selection=(state.selected_ids,state.selected_count),capture=capture)
     state.end(ticket)
     return probs,ids,mass
+
+
+@triton.jit(do_not_specialize=['ROWS','CACHE','TS0','TS1','TS2'])
+def _capture_draft_coordinates(state,TARGET,MAP,D_IDS,CONTEXTS,ROW_MAP,OUT,
+                        ROWS,CACHE,TS0,TS1,TS2,K:tl.constexpr,BK:tl.constexpr,
+                        GREEDY:tl.constexpr,HAS_ROW_MAP:tl.constexpr):
+    lane=tl.arange(0,BK)
+    batch=tl.load(ROW_MAP+state//ROWS).to(tl.int64) if HAS_ROW_MAP else state//ROWS
+    context=tl.maximum(tl.load(CONTEXTS+state),0)
+    ids=tl.load(D_IDS+(batch*CACHE+context)*K+lane,lane<K,other=0)
+    token=tl.load(MAP+ids,lane<K,other=0)
+    if GREEDY:p=(token==tl.load(TARGET+state//ROWS*TS0+state%ROWS*TS1)).to(tl.float32)
+    else:p=tl.load(TARGET+state//ROWS*TS0+state%ROWS*TS1+token*TS2,lane<K,other=0)
+    # Raw FP32 p is divided by the same mass in union as before.
+    tl.store(OUT+state*K+lane,p,lane<K)
+
+
+def prepare_compact_teacher(state,tree,path,target,greedy=False,sampling_metadata=None):
+    b,q=tree.parents.shape;n=b*q;k=state.topk
+    raw=state.teacher_draft_p[:n*k].view(n,k)
+    row_map=state.feedback_row_map
+    capture=dict(CAPTURE=True,D_TARGET=target,D_MAP=state.mapping,D_IDS=state.ids_cache,
+        D_CONTEXTS=tree.feedback_contexts,D_ROW_MAP=row_map,D_OUT=raw,D_ROWS=q,D_CACHE=state.cache_contexts,
+        D_TS0=target.stride(0),D_TS1=target.stride(1),D_TS2=0 if greedy else target.stride(2),
+        D_GREEDY=greedy,D_HAS_ROW_MAP=row_map is not None)
+    probs,ids,mass=prepare_teacher(state,tree,path,target,greedy,sampling_metadata,capture)
+    return probs,ids,mass,raw
 
 
 def feedback(state,tree,path,target,greedy=False,sampling_metadata=None):
     b,q=tree.parents.shape;n=b*q;k=state.topk;rank=state.rank
     weights=state.selected_weights[:n].view(b,q);kind=state.selected_kind[:n].view(b,q)
-    if sampling_metadata is not None and len(sampling_metadata)==3:
-        probs,ids,mass=sampling_metadata
+    compact=sampling_metadata is not None and len(sampling_metadata)==4
+    row_map=state.feedback_row_map
+    if sampling_metadata is not None and len(sampling_metadata) in (3,4):
+        probs,ids,mass=sampling_metadata[:3]
     else:
         probs,ids,mass=prepare_teacher(state,tree,path,target,greedy,sampling_metadata)
     ticket=state.begin('opd_union_loss_ms')
     head=state.head.weight;bias=state.head.bias if state.head.bias is not None else head
     _selected_head[(k,min(n,32))](state.selected_ids,state.selected_count,state.head_cache,head,bias,state.u_cache,state.B_fast,state.ids_cache,state.q_cache,
-        ids,state.norm_cache,weights,mass,tree.feedback_contexts,state.teacher_q,
+        ids,state.norm_cache,weights,mass,tree.feedback_contexts,state.teacher_q,row_map,
         triton.language.bfloat16 if state.logits_dtype==torch.bfloat16 else (triton.language.float16 if state.logits_dtype==torch.float16 else triton.language.float32),
         q,state.cache_contexts,head.shape[1],rank,k,state.head.bias is not None,triton.next_power_of_2(head.shape[1]),
-        triton.next_power_of_2(rank),triton.next_power_of_2(k),num_warps=4,enable_fp_fusion=False)
+        triton.next_power_of_2(rank),triton.next_power_of_2(k),row_map is not None,num_warps=4,enable_fp_fusion=False)
     state.state_stats[:n*10].zero_()
-    _union[(min(n,32),)](state.selected_ids,state.selected_count,target,state.mapping,weights,kind,tree.feedback_contexts,state.ids_cache,state.q_cache,ids,probs,
+    strides=(0,0,0) if compact else (*target.stride()[:2],0 if greedy else target.stride(2))
+    draft_p=sampling_metadata[3] if compact else state.teacher_draft_p
+    _union[(min(n,32),)](state.selected_ids,state.selected_count,draft_p if compact else target,state.mapping,weights,kind,tree.feedback_contexts,state.ids_cache,state.q_cache,ids,probs,
         state.teacher_q,mass,state.union_ids,state.union_g,state.state_stats,
-        target.stride(0),target.stride(1),0 if greedy else target.stride(2),q,state.cache_contexts,state.vocab,k,10,
-        triton.next_power_of_2(2*k),greedy,num_warps=4,enable_fp_fusion=False)
+        draft_p,row_map,*strides,q,state.cache_contexts,state.vocab,k,10,
+        triton.next_power_of_2(2*k),greedy,compact,row_map is not None,num_warps=4,enable_fp_fusion=False)
     _reduce[(10,)](state.state_stats,state.round_weight,state.counters,n,10,triton.next_power_of_2(n),num_warps=4)
     if state.train_projector and state._ever_updated:
         # B is STILL frozen B_t. No per-round backward/optimizer/DDP sync.
         h=state.head.weight.shape[1]
         _projector_terms[(min(n,32),)](state.selected_ids,state.selected_count,state.union_ids,state.union_g,state.head_cache,state.B_fast,tree.feedback_contexts,
-            state.projector_head,state.projector_v,q,state.cache_contexts,k,h,rank,
-            triton.next_power_of_2(2*k),triton.next_power_of_2(h),triton.next_power_of_2(rank),num_warps=4,enable_fp_fusion=False)
+            state.projector_head,state.projector_v,row_map,q,state.cache_contexts,k,h,rank,
+            triton.next_power_of_2(2*k),triton.next_power_of_2(h),triton.next_power_of_2(rank),row_map is not None,num_warps=4,enable_fp_fusion=False)
         _projector_reduce[(triton.cdiv(h,32),)](state.projector_head,state.projector_v,state.selected_count,
             state.projector_delta,h,rank,32,32,triton.next_power_of_2(rank),num_warps=4,enable_fp_fusion=False)
         state.model.opd_projector_grad_sum.add_(state.projector_delta)
@@ -539,8 +598,8 @@ def feedback(state,tree,path,target,greedy=False,sampling_metadata=None):
     state.end(ticket);ticket=state.begin('opd_update_ms')
     if state.fast_lr>0:
         _update[(min(n,32),)](state.selected_ids,state.selected_count,state.union_ids,state.union_g,state.u_cache,tree.feedback_contexts,state.round_weight,
-            state.B_fast,state.bitmap,state.active_ids,state.active_count,q,state.cache_contexts,k,rank,
-            state.fast_lr,triton.next_power_of_2(2*k),triton.next_power_of_2(rank),num_warps=4,enable_fp_fusion=False)
+            state.B_fast,state.bitmap,state.active_ids,state.active_count,row_map,q,state.cache_contexts,k,rank,
+            state.fast_lr,triton.next_power_of_2(2*k),triton.next_power_of_2(rank),row_map is not None,num_warps=4,enable_fp_fusion=False)
     _round_end[(1,)](state.B_fast,state.bitmap,state.active_ids,
         state.active_count,state.round_weight,state.counters,rank,state.fast_lr,128,triton.next_power_of_2(rank),num_warps=4)
     state.end(ticket)

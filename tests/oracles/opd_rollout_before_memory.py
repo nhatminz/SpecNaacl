@@ -1,10 +1,16 @@
+"""Frozen pre-minimal-move rollout for parity / opt-in before-after benchmarks ONLY.
+
+Captured from the checkout before this revision. Shared model/proposal/feedback
+algorithms are unchanged; this preserves previous KV/metadata lifetimes and
+stable survivor order. Never imported by production training.
+"""
 """Optimized OPD EAGLE3 rollout; OFF dispatches to frozen historical FastGRPO."""
 import torch
 import math
 import time
 from copy import deepcopy
 from transformers import DynamicCache
-from helper.tree_verification import pack_tree, trace_verified_path, select_confidence_nodes, PackedTree, VerifiedPath
+from helper.tree_verification import pack_tree, trace_verified_path, select_confidence_nodes
 from helper.opd_history import ContiguousRolloutHistory as RolloutHistory
 from helper.opd_reflex import OPDReflex
 from helper.method_config import resolve_method
@@ -13,8 +19,7 @@ from helper.opd_reflex import OPD_COUNTER_NAMES
 from helper.opd_scheduling import schedule,compact_suffix_inplace
 from helper.sampling import build_sampling_probs, sample_from_probs, sample_target_from_logits
 from helper.opd_sampling import sample_target_with_metadata
-from helper.opd_static_cache import OPDStaticCache,persistent_cache,swap_remove_plan
-import os
+from helper.opd_static_cache import OPDStaticCache
 from helper.opd_attention import AttentionWorkspace
 total_target_time = 0
 total_draft_time = 0
@@ -105,7 +110,7 @@ def get_adaptive_hyperparameters(bsz, verification_capacity, max_draft_token_len
     return (draft_token_length, draft_k, draft_total_token)
 
 @torch.inference_mode()
-def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=False, repeated_generate_nums=None, temperature=0.8, top_p=0.9, top_k=None, verification_capacity=160, max_draft_token_length=5, max_draft_k=8, max_verification_num=160, min_draft_token_length=3, draft_token_length_c=0.75, statistical_time=False, return_all_draft_input=False, max_length=2048, method='fastgrpo', opd_rank=8, opd_topk=16, opd_fast_lr=0.01, opd_visited_weight=1.0, opd_frontier_weight=1.0, opd_update_stream=True, opd_profile=False, opd_diagnostics=False, opd_backend='auto', opd_train_projector=False, kv_gather_strategy='stacked'):
+def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=False, repeated_generate_nums=None, temperature=0.8, top_p=0.9, top_k=None, verification_capacity=160, max_draft_token_length=5, max_draft_k=8, max_verification_num=160, min_draft_token_length=3, draft_token_length_c=0.75, statistical_time=False, return_all_draft_input=False, max_length=2048, method='fastgrpo', opd_rank=8, opd_topk=16, opd_fast_lr=0.01, opd_visited_weight=1.0, opd_frontier_weight=1.0, opd_update_stream=False, opd_profile=False, opd_diagnostics=False, opd_backend='auto', opd_train_projector=False, kv_gather_strategy='stacked'):
     (method, _) = resolve_method(method)
     if method=='fastgrpo':
         result=historical_generate(model,input_ids,attention_mask,tokenizer,
@@ -279,11 +284,9 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
         torch.cuda.synchronize()
     start_time = time.perf_counter()
     static_kv=getattr(model,'supports_opd_static_kv',False)
-    max_retained_tokens=int(os.environ.get('OPD_KV_MAX_RETAINED_TOKENS','0'))
-    if max_retained_tokens<0:raise ValueError('OPD_KV_MAX_RETAINED_TOKENS must be nonnegative')
     kv_capacity=256
     rollout_batch_capacity=input_ids.shape[0]*max(1,repeated_generate_nums or 1)
-    target_past_key_values = persistent_cache(model,'_opd_target_kv_pool',input_ids.shape[0],max(1,repeated_generate_nums or 1),model.target_model.device,model.target_model.dtype) if static_kv else DynamicCache()
+    target_past_key_values = OPDStaticCache(kv_capacity,batch_capacity=rollout_batch_capacity) if static_kv else DynamicCache()
     avg_acc_length = [0, 0]
     total_accepted_draft_tokens = 0
     total_proposed_draft_tokens = 0
@@ -351,7 +354,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
         draft_time_start = time.time()
     with torch.amp.autocast(str(model.target_model.device), dtype=torch.bfloat16 if model.dtype == torch.bfloat16 else torch.float16):
         draft_outputs = model(hidden_states=feature_states.to(model.dtype), input_ids=draft_input_ids, attention_mask=draft_attention_mask, position_ids=position_ids, use_cache=True,
-                              past_key_values=persistent_cache(model,'_opd_draft_kv_pool',input_ids.shape[0],max(1,repeated_generate_nums or 1),device,model.dtype) if static_kv else None)
+                              past_key_values=OPDStaticCache(kv_capacity,batch_capacity=rollout_batch_capacity) if static_kv else None)
     if statistical_time:
         torch.cuda.synchronize()
         total_draft_time += time.time() - draft_time_start
@@ -441,14 +444,10 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
         torch.cuda.synchronize()
         total_draft_time += time.time() - draft_time_start
     total_prefill_time = time.time() - prefill_time_start
-    canonical_to_physical=physical_to_canonical=None
-    feedback_path=None
     def compact_teacher_metadata(tokens,probs,sorted_metadata):
-        nonlocal path,feedback_path
-        feedback_path=trace_verified_path(feedback_tree,tokens,eos_token_id,kernels=opd._kernels,workspace=opd.path_workspace)
-        path=feedback_path if physical_to_canonical is None else VerifiedPath(
-            *[x.index_select(0,physical_to_canonical) for x in (feedback_path.tokens,feedback_path.packed_indices,feedback_path.feedback_contexts,feedback_path.lengths)])
-        return opd.prepare_compact_teacher(feedback_tree,feedback_path,probs if do_sample else tokens,sorted_metadata,greedy=not do_sample)
+        nonlocal path
+        path=trace_verified_path(tensor_tree,tokens,eos_token_id,kernels=opd._kernels,workspace=opd.path_workspace)
+        return opd.prepare_sampler_teacher(tensor_tree,path,probs,sorted_metadata)
     for token_num in range(1, max_length):
         past_kv_len = _cache_seq_length(target_past_key_values)
         kv_length = past_kv_len + draft_total_token + 1
@@ -482,38 +481,28 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
             target_past_key_values = target_outputs['past_key_values']
             feature_states_tree = target_outputs['last_hidden_state']
             target_hidden_states_tree = target_outputs['target_hidden_state']
-            # Native sampler must see original response order, even when KV
-            # physical rows swap-remove. Gather H-sized head INPUT, not [N,V]
-            # logits/probs. No additional head/transformer forward.
-            head_input=target_hidden_states_tree if canonical_to_physical is None else target_hidden_states_tree.index_select(0,canonical_to_physical)
-            target_outputs_logits = model.target_model.lm_head(head_input)
-            del head_input
-            feedback_tree=tensor_tree if canonical_to_physical is None else PackedTree(
-                *[x.index_select(0,canonical_to_physical) for x in (tensor_tree.parents,tensor_tree.tokens,tensor_tree.feedback_contexts)],tensor_tree.max_depth)
-            opd.feedback_row_map=canonical_to_physical
+            target_outputs_logits = model.target_model.lm_head(target_hidden_states_tree)
             path=None
-            (target_next_token_tree, target_sampling_probs, sampling_metadata) = sample_target_with_metadata(target_outputs_logits, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k, eos_token_id=eos_token_id,metadata_builder=compact_teacher_metadata,return_probs=False)
-            del target_outputs_logits
+            (target_next_token_tree, target_sampling_probs, sampling_metadata) = sample_target_with_metadata(target_outputs_logits, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k, eos_token_id=eos_token_id,metadata_builder=compact_teacher_metadata)
         if statistical_time:
             torch.cuda.synchronize()
             total_target_time += time.time() - target_time_start
         if path is None:
             path = trace_verified_path(tensor_tree, target_next_token_tree, eos_token_id, kernels=opd._kernels, workspace=opd.path_workspace)
         if enabled:
-            teacher = None # compact metadata owns every teacher coordinate needed
+            teacher = target_sampling_probs if do_sample else target_next_token_tree
             if update_stream is not None:
                 source_ready.record(torch.cuda.current_stream(device))
                 update_stream.wait_event(source_ready)
-                for shared in (feedback_tree.parents, feedback_tree.feedback_contexts):
+                for shared in (teacher, tensor_tree.parents, tensor_tree.feedback_contexts):
                     shared.record_stream(update_stream)
-                if canonical_to_physical is not None:canonical_to_physical.record_stream(update_stream)
                 if sampling_metadata is not None:
                     for shared in sampling_metadata:shared.record_stream(update_stream)
                 with torch.cuda.stream(update_stream):
-                    opd.feedback(feedback_tree, feedback_path, teacher, greedy=not do_sample,sampling_metadata=sampling_metadata)
+                    opd.feedback(tensor_tree, path, teacher, greedy=not do_sample,sampling_metadata=sampling_metadata)
                     update_done.record(update_stream)
             else:
-                opd.feedback(feedback_tree, feedback_path, teacher, greedy=not do_sample,sampling_metadata=sampling_metadata)
+                opd.feedback(tensor_tree, path, teacher, greedy=not do_sample,sampling_metadata=sampling_metadata)
             # record_stream above keeps asynchronous readers safe. Drop this
             # alias too, otherwise previous-round full probs survive until the
             # NEXT sampler has already allocated its full-vocabulary arrays.
@@ -531,7 +520,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
         pad_mask[owners[:,None],output_columns[None,:]]=newly_padded
         padding_positions_tensor[:,output_columns]=newly_padded
         max_recorded_pad_column=max(max_recorded_pad_column,past_kv_len+max_acc_length)
-        del target_sampling_probs, sampling_metadata
+        del target_sampling_probs, target_outputs_logits, sampling_metadata
         max_acc_length = max(acc_length)
         for (active_index, accepted_length) in enumerate(acc_length):
             if accepted_length > 0:
@@ -565,10 +554,8 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
             break
         if finished_indices:
             compaction_timer=opd.begin('kv_batch_compaction_ms')
-            keep_rows,move_sources,move_destinations=swap_remove_plan(end_sig)
+            keep_rows = [row for (row, finished) in enumerate(end_sig) if not finished]
             keep = torch.tensor(keep_rows, device=device, dtype=torch.long)
-            sources=torch.tensor(move_sources,device=device,dtype=torch.long)
-            destinations=torch.tensor(move_destinations,device=device,dtype=torch.long)
             for row in finished_indices:
                 original = residual_index[row]
                 history.mark_finished(original)
@@ -580,12 +567,12 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
             residual_index = [residual_index[row] for row in keep_rows]
             chosen_index = chosen_index.index_select(0, keep)
             if static_kv:
-                target_past_key_values.swap_remove(len(keep_rows),sources,destinations)
+                target_past_key_values.batch_select_indices(keep)
             else:
                 for layer in range(_cache_num_layers(target_past_key_values)):
                     (key, value) = _cache_get_layer(target_past_key_values, layer)
                     _cache_set_layer(target_past_key_values, layer, key.index_select(0, keep), value.index_select(0, keep))
-            if static_kv:draft_past_key_values.swap_remove(len(keep_rows),sources,destinations)
+            if static_kv:draft_past_key_values.batch_select_indices(keep)
             else:draft_past_key_values = [[key.index_select(0, keep), value.index_select(0, keep)] for (key, value) in draft_past_key_values]
             opd.end(compaction_timer)
             next_token = next_token.index_select(0, keep)
@@ -595,13 +582,6 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
             target_hidden_states = target_hidden_states.index_select(0, keep)
             last_valid_index = last_valid_index.index_select(0, keep)
             bsz = len(keep_rows)
-            order=sorted(range(bsz),key=residual_index.__getitem__)
-            if order==list(range(bsz)):canonical_to_physical=physical_to_canonical=None
-            else:
-                canonical_to_physical=torch.tensor(order,device=device,dtype=torch.long)
-                inverse=[0]*bsz
-                for canonical,physical in enumerate(order):inverse[physical]=canonical
-                physical_to_canonical=torch.tensor(inverse,device=device,dtype=torch.long)
             (draft_token_length, draft_k, draft_total_token) = get_adaptive_hyperparameters(bsz, verification_capacity, max_draft_token_length, max_draft_k, max_verification_num, min_draft_token_length, draft_token_length_c)
         extension = min(row[2] for row in scheduling_packet if row[1]==0)
         prefix_length = min(_cache_seq_length(target_past_key_values), past_kv_len + extension)
@@ -722,7 +702,5 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
     if static_kv:
         for prefix,cache in (('target',target_past_key_values),('draft',draft_past_key_values)):
             result.update({f'opd_{prefix}_{key}':value for key,value in cache.statistics().items()})
-            cache.end_rollout(max_retained_tokens)
     result['opd_attention_workspace_bytes']=attention_workspace.memory_bytes()+opd.attention_workspace.memory_bytes()
-    result['total_time_cost']=time.perf_counter()-start_time
     return result
