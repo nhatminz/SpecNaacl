@@ -1,3 +1,19 @@
+# Launcher fix — optional variables under set -u (2026-10-07)
+
+`scripts/launch/train_model.sh` now sets optional defaults after sourcing configs,
+before their first use: rollout flush interval1, optional projector LR/profile
+empty, proposal/dense implementations auto. Older/custom configs leaving those
+variables unset no longer trigger an unbound-variable error. Explicit overrides
+are preserved. Invalid/nonpositive flush intervals fail clearly before training.
+
+Validation: launcher/source-import tests **46 passed**, including all14 model/method
+launchers with the five options deliberately unset, override preservation and
+invalid-value errors. Shell syntax, Qwen3-1.7B dry-run and diff checks pass.
+No model/data paths, training algorithms, sampling, dependencies or GPU kernels
+changed in this launcher-only fix. No server GPU training was launched.
+
+---
+
 # OPD memory completion — growable KV / mask reuse / compact metadata (2026-10-07)
 
 Current code and commands: [OPD_OPTIMIZATION_20261007.md](OPD_OPTIMIZATION_20261007.md).

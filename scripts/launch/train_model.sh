@@ -8,6 +8,18 @@ COMMON_ENV="${COMMON_ENV:-$PROJECT_DIR/configs/_shared/b200_common.env}"
 MODEL_ENV="${MODEL_ENV:-$PROJECT_DIR/configs/$MODEL_KEY/b200.env}"
 source "$COMMON_ENV"
 source "$MODEL_ENV"
+# New optional settings must not rely on all server wrappers/configs having been
+# updated together. Keep defaults here too, before ANY expansion under set -u.
+# An explicit environment/config override always takes precedence.
+export ROLLOUT_LOG_FLUSH_INTERVAL="${ROLLOUT_LOG_FLUSH_INTERVAL:-1}"
+export OPD_PROJECTOR_LR="${OPD_PROJECTOR_LR:-}"
+export OPD_PROPOSAL_PROFILE="${OPD_PROPOSAL_PROFILE:-}"
+export OPD_PROPOSAL_MODE="${OPD_PROPOSAL_MODE:-auto}"
+export OPD_DENSE_IMPLEMENTATION="${OPD_DENSE_IMPLEMENTATION:-auto}"
+if [[ ! "$ROLLOUT_LOG_FLUSH_INTERVAL" =~ ^0*[1-9][0-9]*$ ]]; then
+  echo "ERROR: ROLLOUT_LOG_FLUSH_INTERVAL must be a positive integer; got: $ROLLOUT_LOG_FLUSH_INTERVAL" >&2
+  exit 2
+fi
 : "${MODEL:?MODEL is required}"
 case "$METHOD" in
   fastgrpo|opd_reflex) ;;

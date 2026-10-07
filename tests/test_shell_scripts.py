@@ -55,6 +55,41 @@ def test_opd_hyperparameter_overrides_reach_cli(tmp_path):
         assert args[args.index(flag)+1]==value
     assert '--nproc_per_node=2' in args
 
+
+@pytest.mark.parametrize('key',MODEL_KEYS)
+@pytest.mark.parametrize('suffix',['','_fastgrpo'])
+def test_launcher_defaults_new_options_even_if_sourced_config_leaves_them_unset(key,suffix,tmp_path):
+    # Reproduce an older/custom server config without new launcher variables.
+    # Clear them AFTER wrapper/common exports: the launcher must be self-contained.
+    stale=tmp_path/'stale_common.env'
+    stale.write_text('source '+shlex.quote(str(ROOT/'configs/_shared/b200_common.env'))+'\n'
+        'unset ROLLOUT_LOG_FLUSH_INTERVAL OPD_PROJECTOR_LR OPD_PROPOSAL_PROFILE '
+        'OPD_PROPOSAL_MODE OPD_DENSE_IMPLEMENTATION\n')
+    args=command(f'train_{key}{suffix}.sh',COMMON_ENV=str(stale),OUTPUT_ROOT=str(tmp_path/'outputs'))
+    assert args[args.index('--rollout_log_flush_interval')+1]=='1'
+    assert '--opd_projector_lr' not in args
+    assert args[args.index('--batch_size')+1]=='8'
+
+
+@pytest.mark.parametrize('suffix',['','_fastgrpo'])
+def test_launcher_preserves_logging_and_projector_overrides(suffix,tmp_path):
+    args=command(f'train_qwen3_1p7b{suffix}.sh',ROLLOUT_LOG_FLUSH_INTERVAL='7',
+                 OPD_PROJECTOR_LR='2e-5',OUTPUT_ROOT=str(tmp_path/'outputs'))
+    assert args[args.index('--rollout_log_flush_interval')+1]=='7'
+    if suffix:
+        assert '--opd_projector_lr' not in args
+    else:
+        assert args[args.index('--opd_projector_lr')+1]=='2e-5'
+
+
+@pytest.mark.parametrize('value',['0','-1','abc'])
+def test_invalid_rollout_flush_interval_fails_before_python_training(value):
+    result=subprocess.run([BASH,str(ROOT/'train_qwen3_1p7b.sh')],cwd=ROOT,
+        env=dict(os.environ,DRY_RUN='true',PYTHON_BIN=PYTHON,ROLLOUT_LOG_FLUSH_INTERVAL=value),
+        capture_output=True,text=True)
+    assert result.returncode==2
+    assert 'ROLLOUT_LOG_FLUSH_INTERVAL must be a positive integer' in result.stderr
+
 def test_real_sweep_dry_run_no_writes_and_quick_settings(tmp_path):
     destination=tmp_path/'not-created'
     out=subprocess.run([BASH,str(ROOT/'scripts/sweep_opd_reflex.sh')],cwd=ROOT,
