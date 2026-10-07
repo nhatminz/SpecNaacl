@@ -23,6 +23,8 @@ export OPD_VISITED_WEIGHT=1.0
 export OPD_FRONTIER_WEIGHT=1.0
 export OPD_UPDATE_STREAM=0   # UNTUNED: đo cả0/1, không giả định async nhanh hơn
 export OPD_TRAIN_PROJECTOR=1 # A học tại draft optimizer boundary, không reset
+export OPD_PROJECTOR_LR=1e-5 # để trống để kế thừa draft LR; resume giữ optimizer moments
+export ROLLOUT_LOG_FLUSH_INTERVAL=1 # buffer CSV; tăng lên 8 nếu shared storage chậm
 export OPD_PROPOSAL_MODE=auto
 export OPD_DENSE_IMPLEMENTATION=auto
 export OPD_PROFILE=0
@@ -92,15 +94,18 @@ rollout, không thêm target/draft transformer forward.
 ```bash
 export MODEL_KEY=qwen3_1p7b
 export DRAFT_CONFIG="$PWD/outputs/pretrain/$MODEL_KEY/latest_draft_config.json"
-export OPD_TUNE_VOCAB="$("$PYTHON_BIN" -c 'import json,os; print(json.load(open(os.environ["DRAFT_CONFIG"]))["draft_vocab_size"])')"
-export OPD_TUNE_HIDDEN="$("$PYTHON_BIN" -c 'import json,os; print(json.load(open(os.environ["DRAFT_CONFIG"]))["hidden_size"])')"
-export OPD_TUNE_OUTPUT="$PWD/outputs/benchmarks/opd_b200_$(date -u +%Y%m%dT%H%M%S_%N).json"
 CUDA_VISIBLE_DEVICES=0 bash scripts/tune_opd_proposals.sh
-export OPD_PROPOSAL_PROFILE="$OPD_TUNE_OUTPUT"
 ```
 
-Profile được lưu trong outputs/benchmarks/ (script in đúng tên file). Export
-OPD_PROPOSAL_PROFILE trỏ tới JSON thực đó rồi chạy:
+Script đọc V/H từ draft config thật, không có vocab mặc định 32768.
+Profile mặc định: `outputs/benchmarks/opd_proposals/$MODEL_KEY.json`; launcher
+train và sweep tự load nếu có. Profile kiểm tra GPU/Torch/Triton/CUDA/kernel hash
+và V/rank/dtype; batch/context mới dùng interpolation. KHÔNG dùng profile RTX3090
+cho B200. Khi đổi kernel/config, dùng `OPD_TUNE_OUTPUT` mới rồi export
+`OPD_PROPOSAL_PROFILE` tới file đó (script không ghi đè profile cũ).
+Nếu chưa có profile thì threshold V/8 chỉ là fallback chưa đo, không phải B200 optimum.
+
+Tiếp theo:
 
 ```bash
 export OPD_PROPOSAL_MODE=auto

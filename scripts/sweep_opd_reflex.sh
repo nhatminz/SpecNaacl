@@ -24,18 +24,22 @@ case "${DATASET,,}" in
  gsm8k) DATASET_PATH="${DATASET_PATH:-$DATA_ROOT/gsm8k/main/train-00000-of-00001.parquet}" ;;
  *) : "${DATASET_PATH:?set existing DATASET_PATH}" ;;
 esac
-PRETRAIN_MODEL_ROOT="${PRETRAIN_MODEL_ROOT:-$PROJECT_DIR/outputs/pretrain/$MODEL_KEY}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-$PROJECT_DIR/outputs}"
+PRETRAIN_MODEL_ROOT="${PRETRAIN_MODEL_ROOT:-$OUTPUT_ROOT/pretrain/$MODEL_KEY}"
 export DRAFT_CHECKPOINT="${DRAFT_CHECKPOINT:-$PRETRAIN_MODEL_ROOT/latest_checkpoint}"
 export DRAFT_CONFIG="${DRAFT_CONFIG:-$PRETRAIN_MODEL_ROOT/latest_draft_config.json}"
 export VOCAB_MAPPING="${VOCAB_MAPPING:-$PRETRAIN_MODEL_ROOT/latest_vocab_mapping.pt}"
-BENCH_OUTPUT="${BENCH_OUTPUT:-$PROJECT_DIR/outputs/benchmarks/opd_${MODEL_KEY}_$(date -u +%Y%m%dT%H%M%S_%N)}"
+if [[ -z "$OPD_PROPOSAL_PROFILE" && -f "$OUTPUT_ROOT/benchmarks/opd_proposals/$MODEL_KEY.json" ]]; then
+  export OPD_PROPOSAL_PROFILE="$OUTPUT_ROOT/benchmarks/opd_proposals/$MODEL_KEY.json"
+fi
+BENCH_OUTPUT="${BENCH_OUTPUT:-$OUTPUT_ROOT/benchmarks/opd_${MODEL_KEY}_$(date -u +%Y%m%dT%H%M%S_%N)}"
 cmd=("$PYTHON_BIN" "$PROJECT_DIR/scripts/benchmark_opd_reflex.py"
  --target-model "$MODEL" --target-adapter "$TARGET_ADAPTER"
  --draft-checkpoint "$DRAFT_CHECKPOINT" --draft-config "$DRAFT_CONFIG" --vocab-mapping "$VOCAB_MAPPING"
  --dataset-path "$DATASET_PATH" --output "$BENCH_OUTPUT"
  --batch-size "$BATCH_SIZE" --responses "$RESPONSES_PER_PROMPT"
  --max-length "$BENCH_MAX_LENGTH" --max-prompt-length "$BENCH_MAX_PROMPT_LENGTH"
- --temperature "$TEMPERATURE" --top-p "$TOP_P" --attn-implementation "$ATTENTION_IMPLEMENTATION"
+ --temperature "$TEMPERATURE" --top-p "$TOP_P" --attn-implementation "$ATTENTION_IMPLEMENTATION" --dtype "$MODEL_DTYPE"
  --verification-capacity "$VERIFICATION_CAPACITY" --max-verification-num "$MAX_VERIFICATION_NUM"
  --max-draft-k "$MAX_DRAFT_K" --max-draft-length "$MAX_DRAFT_TOKEN_LENGTH"
  --min-draft-length "$MIN_DRAFT_TOKEN_LENGTH" --draft-length-c "$DRAFT_TOKEN_LENGTH_C"

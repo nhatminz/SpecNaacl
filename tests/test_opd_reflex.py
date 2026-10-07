@@ -26,6 +26,7 @@ def state(device='cpu',v=257,h=32,enabled=True,lr=.01,topk=16):
     return s,model,mapping
 
 def seed(s,tokens,weights):
+    s.host_active_count=len(tokens)
     s.B_fast.zero_();s.B_fast[tokens]=weights;s.active_count.fill_(len(tokens))
     s.active_ids[:len(tokens)]=tokens;s.bitmap.zero_()
     for token in tokens.cpu().tolist():s.bitmap[token//32]|=torch.tensor(1<<(token%32),device=s.bitmap.device,dtype=torch.int64).to(torch.int32)

@@ -12,6 +12,8 @@ from helper.historical_fastgrpo import speculative_generate as historical_genera
 from helper.opd_reflex import OPD_COUNTER_NAMES
 from helper.opd_scheduling import schedule,compact_suffix_inplace
 from helper.sampling import build_sampling_probs, sample_from_probs, sample_target_from_logits
+from helper.opd_sampling import sample_target_with_metadata
+from helper.opd_static_cache import OPDStaticCache
 total_target_time = 0
 total_draft_time = 0
 total_check_time = 0
@@ -128,16 +130,16 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
         device = model.device
         bsz = draft_hidden_states.shape[0]
         node_nums = draft_k + draft_k * draft_k * (draft_token_length - 1)
-        trees = []
-        full_parents = [torch.full((bsz, draft_k), -1, device=device, dtype=torch.long)]
-        full_contexts = torch.full((bsz, node_nums), -1, device=device, dtype=torch.long)
-        beam_node_ids = torch.arange(draft_k, device=device).expand(bsz, -1)
-        parents_list = []
-        total_input_ids = []
-        total_position_ids = []
-        confidences = []
-        draft_position_ids = past_position_ids_tensor.unsqueeze(-1).repeat(1, draft_k)
-        total_position_ids.append(draft_position_ids)
+        full_parents=opd.tree_buffers['parents'][:bsz,:node_nums]
+        full_parents[:,:draft_k].fill_(-1)
+        full_contexts=opd.tree_buffers['contexts'][:bsz,:node_nums];full_contexts.fill_(-1)
+        beam_node_ids=opd.tree_arange[:draft_k].expand(bsz,-1)
+        total_input_ids=opd.tree_buffers['tokens'][:bsz,:node_nums]
+        total_position_ids=opd.tree_buffers['positions'][:bsz,:node_nums]
+        confidences=opd.tree_buffers['confidence'][:bsz,:node_nums]
+        draft_position_ids = opd.tree_positions[:bsz,:draft_k]
+        draft_position_ids.copy_(past_position_ids_tensor[:,None])
+        total_position_ids[:,:draft_k].copy_(draft_position_ids)
         if enabled and hasattr(model, 'compute_compact_logits_with_inputs'):
             (compact_logits, head_inputs) = model.compute_compact_logits_with_inputs(draft_hidden_states)
         else:
@@ -153,19 +155,22 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
         draft_next_token = draft_next_token.view(bsz, -1)
         (bsz, _, hidden_size) = next_feature_states.shape
         next_feature_states = next_feature_states.expand(bsz, draft_k, hidden_size)
-        total_input_ids.append(draft_next_token)
-        confidences.append(draft_confidences)
-        attention_seen_indices = torch.arange(past_kv_len, past_kv_len + draft_k, device=device).unsqueeze(-1).unsqueeze(0).repeat(bsz, 1, 1)
+        total_input_ids[:,:draft_k].copy_(draft_next_token)
+        confidences[:,:draft_k].copy_(draft_confidences)
+        seen_pool,seen_scratch=opd.tree_seen
+        attention_seen_indices=seen_pool[:bsz,:draft_k,:1]
+        attention_seen_indices.copy_((opd.tree_arange[:draft_k]+past_kv_len)[None,:,None])
         for idx_token in range(1, draft_token_length):
-            draft_position_ids = draft_position_ids + 1
-            total_position_ids.append(draft_position_ids.repeat(1, draft_k))
+            node_start=draft_k+(idx_token-1)*draft_k*draft_k
+            node_end=node_start+draft_k*draft_k
+            draft_position_ids.add_(1)
+            total_position_ids[:,node_start:node_end].view(bsz,draft_k,draft_k).copy_(draft_position_ids[:,None,:])
             min_dtype = torch.finfo(dtype).min
             q_length = draft_k
-            draft_attention_mask = torch.zeros((q_length, past_kv_len + q_length), dtype=dtype, device=device)
+            draft_attention_mask = opd.draft_mask[:bsz*q_length*(past_kv_len+q_length)].view(bsz,1,q_length,past_kv_len+q_length)
+            draft_attention_mask.zero_()
             draft_attention_mask[..., init_kv_len:] = min_dtype
-            draft_attention_mask = draft_attention_mask.unsqueeze(0).unsqueeze(0).repeat(bsz, 1, 1, 1)
-            zeros = torch.zeros((bsz, 1, q_length, idx_token), dtype=dtype, device=device)
-            draft_attention_mask.scatter_(dim=-1, index=attention_seen_indices.unsqueeze(1), src=zeros)
+            draft_attention_mask.scatter_(dim=-1, index=attention_seen_indices.unsqueeze(1), value=0.)
             if isinstance(padding_positions, torch.Tensor):
                 padding_positions_tensor = padding_positions
             else:
@@ -190,38 +195,40 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
             draft_past_key_values_tree = draft_outputs['past_key_values']
             draft_hidden_states = draft_outputs['hidden_states']
             next_feature_states = draft_outputs['next_feature_states']
-            context_ids = 1 + (idx_token - 1) * draft_k + torch.arange(draft_k, device=device)
+            context_ids = opd.tree_arange[1+(idx_token-1)*draft_k:1+idx_token*draft_k]
             full_contexts.scatter_(1, beam_node_ids, context_ids.expand(bsz, -1))
-            full_parents.append(beam_node_ids.repeat_interleave(draft_k, dim=1))
+            full_parents[:,node_start:node_end].view(bsz,draft_k,draft_k).copy_(beam_node_ids[:,:,None])
             if enabled and hasattr(model, 'compute_compact_logits_with_inputs'):
                 (compact_logits, head_inputs) = model.compute_compact_logits_with_inputs(draft_hidden_states)
             else:
                 (compact_logits, head_inputs) = (model.compute_compact_logits(draft_hidden_states), draft_hidden_states)
             (next_token_values, _, draft_next_token) = opd.propose(compact_logits, draft_hidden_states, draft_k, compact_to_target, context_offset=1 + (idx_token - 1) * draft_k, head_inputs=head_inputs)
-            draft_confidences = draft_confidences.unsqueeze(-1) * next_token_values
-            (draft_top_k_token_values, draft_top_k_token_indices) = torch.topk(draft_confidences.view(bsz, -1), k=draft_k, dim=-1)
+            branches=opd.tree_branch_confidence.view(-1)[:bsz*draft_k*draft_k].view(bsz,draft_k,draft_k)
+            torch.mul(draft_confidences.unsqueeze(-1),next_token_values,out=branches)
+            draft_confidences=branches
+            draft_top_k_token_values=opd.tree_top_values[:bsz,:draft_k]
+            draft_top_k_token_indices=opd.tree_top_indices[:bsz,:draft_k]
+            torch.topk(draft_confidences.reshape(bsz,-1),k=draft_k,dim=-1,out=(draft_top_k_token_values,draft_top_k_token_indices))
             beam_node_ids = draft_k + draft_k * draft_k * (idx_token - 1) + draft_top_k_token_indices
             past_kv_len = draft_past_key_values_tree[0][0].shape[-2]
-            total_input_ids.append(draft_next_token.view(bsz, -1))
-            confidences.append(draft_confidences.view(bsz, -1))
+            total_input_ids[:,node_start:node_end].copy_(draft_next_token.view(bsz,-1))
+            confidences[:,node_start:node_end].copy_(draft_confidences.reshape(bsz,-1))
             draft_next_token = draft_next_token.view(bsz, -1).gather(index=draft_top_k_token_indices, dim=-1)
-            draft_confidences = draft_confidences.view(bsz, -1).gather(index=draft_top_k_token_indices, dim=-1)
+            draft_confidences = draft_top_k_token_values
             draft_top_k_token_indices_div_k = draft_top_k_token_indices // draft_k
             draft_top_k_token_indices_expanded = draft_top_k_token_indices_div_k.unsqueeze(-1).expand(bsz, draft_k, next_feature_states.shape[-1])
             next_feature_states = next_feature_states.gather(index=draft_top_k_token_indices_expanded, dim=-2)
             draft_top_k_token_indices_expanded = draft_top_k_token_indices_div_k.unsqueeze(-1).expand(bsz, draft_k, idx_token)
-            attention_seen_indices = attention_seen_indices.gather(index=draft_top_k_token_indices_expanded, dim=-2)
-            cur_attention_seen_indices = torch.arange(past_kv_len, past_kv_len + draft_k, device=device).unsqueeze(-1).unsqueeze(0).repeat(bsz, 1, 1)
-            attention_seen_indices = torch.concat([attention_seen_indices, cur_attention_seen_indices], dim=-1)
-            parents_list.append(draft_top_k_token_indices)
-        total_input_ids = torch.concat(total_input_ids, dim=-1)
-        total_position_ids = torch.concat(total_position_ids, dim=1)
-        confidences = torch.concat(confidences, dim=-1)
+            torch.gather(attention_seen_indices,-2,draft_top_k_token_indices_expanded,out=seen_scratch[:bsz,:draft_k,:idx_token])
+            seen_scratch[:bsz,:draft_k,idx_token].copy_(opd.tree_arange[:draft_k]+past_kv_len)
+            seen_pool,seen_scratch=seen_scratch,seen_pool
+            attention_seen_indices=seen_pool[:bsz,:draft_k,:idx_token+1]
         draft_total_token = min(int(draft_total_token), int(confidences.shape[-1]))
         chosen_index = select_confidence_nodes(
             confidences, draft_total_token, kernels=opd._kernels,
             workspace=opd.confidence_key_workspace)
-        tensor_tree = pack_tree(torch.cat(full_parents, dim=1), full_contexts, chosen_index, total_input_ids, draft_token_length)
+        tensor_tree = pack_tree(full_parents, full_contexts, chosen_index, total_input_ids, draft_token_length,workspace=opd.pack_workspace)
+        if hasattr(draft_past_key_values_tree,'crop'):draft_past_key_values_tree.crop(init_kv_len)
         return {'trees': [], 'trees_chosen_index': None, 'tensor_tree': tensor_tree, 'next_token_trees': total_input_ids.gather(1, chosen_index), 'target_position_ids': total_position_ids.gather(1, chosen_index)}
 
     def model_forward(model, input_ids, attention_mask, past_key_values, position_ids=None):
@@ -267,7 +274,9 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
     if statistical_time:
         torch.cuda.synchronize()
     start_time = time.perf_counter()
-    target_past_key_values = DynamicCache()
+    static_kv=getattr(model,'supports_opd_static_kv',False)
+    kv_capacity=input_ids.shape[-1]+max_length*(max_draft_token_length+1)+max_verification_num+max_draft_k*max_draft_token_length
+    target_past_key_values = OPDStaticCache(kv_capacity) if static_kv else DynamicCache()
     avg_acc_length = [0, 0]
     total_accepted_draft_tokens = 0
     total_proposed_draft_tokens = 0
@@ -331,7 +340,8 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
         torch.cuda.synchronize()
         draft_time_start = time.time()
     with torch.amp.autocast(str(model.target_model.device), dtype=torch.bfloat16 if model.dtype == torch.bfloat16 else torch.float16):
-        draft_outputs = model(hidden_states=feature_states.to(model.dtype), input_ids=draft_input_ids, attention_mask=draft_attention_mask, position_ids=position_ids, use_cache=True)
+        draft_outputs = model(hidden_states=feature_states.to(model.dtype), input_ids=draft_input_ids, attention_mask=draft_attention_mask, position_ids=position_ids, use_cache=True,
+                              past_key_values=OPDStaticCache(kv_capacity) if static_kv else None)
     if statistical_time:
         torch.cuda.synchronize()
         total_draft_time += time.time() - draft_time_start
@@ -341,11 +351,12 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
     if repeated_generate_nums is not None and repeated_generate_nums > 1:
         target_next_token = target_next_token.repeat_interleave(repeated_generate_nums, dim=0)
         target_past_key_values.batch_repeat_interleave(repeated_generate_nums)
-        new_past_key_values = []
-        for cur_past_key_values in draft_past_key_values:
-            cur_past_key_values = [cur_past_key_values[0].repeat_interleave(repeated_generate_nums, dim=0), cur_past_key_values[1].repeat_interleave(repeated_generate_nums, dim=0)]
-            new_past_key_values.append(cur_past_key_values)
-        draft_past_key_values = new_past_key_values
+        if static_kv:draft_past_key_values.batch_repeat_interleave(repeated_generate_nums)
+        else:
+            new_past_key_values = []
+            for cur_past_key_values in draft_past_key_values:
+                new_past_key_values.append([x.repeat_interleave(repeated_generate_nums,dim=0) for x in cur_past_key_values])
+            draft_past_key_values=new_past_key_values
         draft_hidden_states = draft_hidden_states.repeat_interleave(repeated_generate_nums, dim=0)
         next_feature_states = next_feature_states.repeat_interleave(repeated_generate_nums, dim=0)
         bsz *= repeated_generate_nums
@@ -391,6 +402,9 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
                      opd_profile,opd_diagnostics,enabled,opd_backend,opd_train_projector)
         cache[key]=opd
     opd.start(model, bsz, compact_to_target, draft_hidden_states.shape[-1], max_contexts=1 + max_draft_k * (max_draft_token_length - 1), max_nodes=max(verification_capacity+bsz,2*bsz), max_path=max_draft_token_length + 1, max_proposal_contexts=max_draft_k)
+    draft_mask_elements=bsz*max_draft_k*kv_capacity
+    if not hasattr(opd,'draft_mask') or opd.draft_mask.numel()<draft_mask_elements:
+        opd.draft_mask=torch.empty(draft_mask_elements,device=device,dtype=model.dtype)
     mask_rows_capacity = max(verification_capacity + bsz, 2 * bsz)
     mask_columns_capacity = input_ids.shape[-1] + max_length * (max_draft_token_length + 1) + max_verification_num
     workspace = getattr(model, '_opd_tree_mask_workspace', None)
@@ -454,7 +468,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
             feature_states_tree = target_outputs['last_hidden_state']
             target_hidden_states_tree = target_outputs['target_hidden_state']
             target_outputs_logits = model.target_model.lm_head(target_hidden_states_tree)
-            (target_next_token_tree, target_sampling_probs) = sample_target_from_logits(target_outputs_logits, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k, eos_token_id=eos_token_id)
+            (target_next_token_tree, target_sampling_probs, sampling_metadata) = sample_target_with_metadata(target_outputs_logits, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k, eos_token_id=eos_token_id)
         if statistical_time:
             torch.cuda.synchronize()
             total_target_time += time.time() - target_time_start
@@ -466,11 +480,13 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
                 update_stream.wait_event(source_ready)
                 for shared in (teacher, tensor_tree.parents, tensor_tree.feedback_contexts):
                     shared.record_stream(update_stream)
+                if sampling_metadata is not None:
+                    for shared in sampling_metadata:shared.record_stream(update_stream)
                 with torch.cuda.stream(update_stream):
-                    opd.feedback(tensor_tree, path, teacher, greedy=not do_sample)
+                    opd.feedback(tensor_tree, path, teacher, greedy=not do_sample,sampling_metadata=sampling_metadata)
                     update_done.record(update_stream)
             else:
-                opd.feedback(tensor_tree, path, teacher, greedy=not do_sample)
+                opd.feedback(tensor_tree, path, teacher, greedy=not do_sample,sampling_metadata=sampling_metadata)
         scheduling_packet,next_token,chosen_index,newly_padded,last_valid_index,max_acc_length=schedule(
             path,past_kv_len,eos_token_id,opd.padded_path_workspace,opd.scheduling_packet,opd._kernels,opd=opd)
         acc_length=[row[0] for row in scheduling_packet]
@@ -484,7 +500,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
         pad_mask[owners[:,None],output_columns[None,:]]=newly_padded
         padding_positions_tensor[:,output_columns]=newly_padded
         max_recorded_pad_column=max(max_recorded_pad_column,past_kv_len+max_acc_length)
-        del target_sampling_probs, target_outputs_logits
+        del target_sampling_probs, target_outputs_logits, sampling_metadata
         max_acc_length = max(acc_length)
         for (active_index, accepted_length) in enumerate(acc_length):
             if accepted_length > 0:
@@ -529,7 +545,8 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
             for layer in range(_cache_num_layers(target_past_key_values)):
                 (key, value) = _cache_get_layer(target_past_key_values, layer)
                 _cache_set_layer(target_past_key_values, layer, key.index_select(0, keep), value.index_select(0, keep))
-            draft_past_key_values = [[key.index_select(0, keep), value.index_select(0, keep)] for (key, value) in draft_past_key_values]
+            if static_kv:draft_past_key_values.batch_select_indices(keep)
+            else:draft_past_key_values = [[key.index_select(0, keep), value.index_select(0, keep)] for (key, value) in draft_past_key_values]
             next_token = next_token.index_select(0, keep)
             newly_padded=newly_padded.index_select(0,keep)
             target_next_token = target_next_token.index_select(0, keep)

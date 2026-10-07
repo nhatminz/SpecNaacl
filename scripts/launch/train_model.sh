@@ -42,6 +42,10 @@ DRAFT_CHECKPOINT="${DRAFT_CHECKPOINT:-$PRETRAIN_MODEL_ROOT/latest_checkpoint}"
 DRAFT_CONFIG="${DRAFT_CONFIG:-$PRETRAIN_MODEL_ROOT/latest_draft_config.json}"
 VOCAB_MAPPING="${VOCAB_MAPPING:-$PRETRAIN_MODEL_ROOT/latest_vocab_mapping.pt}"
 DRAFT_INITIALIZATION_MODE="${DRAFT_INITIALIZATION_MODE:-pretrained}"
+if [[ "$METHOD" == opd_reflex && -z "$OPD_PROPOSAL_PROFILE" ]]; then
+  default_profile="$OUTPUT_ROOT/benchmarks/opd_proposals/$MODEL_KEY.json"
+  if [[ -f "$default_profile" ]]; then export OPD_PROPOSAL_PROFILE="$default_profile"; fi
+fi
 
 TRAIN_MODEL_ROOT="${TRAIN_MODEL_ROOT:-$OUTPUT_ROOT/train/$MODEL_KEY}"
 REQUESTED_RUN_DIR="${RUN_DIR:-}"
@@ -129,6 +133,7 @@ cmd=(
   --opd_train_projector "$OPD_TRAIN_PROJECTOR"
   --kv_gather_strategy "${KV_GATHER_STRATEGY:-stacked}"
   --log_interval "$LOG_INTERVAL"
+  --rollout_log_flush_interval "$ROLLOUT_LOG_FLUSH_INTERVAL"
   --log_file "$LOG_DIR/metrics.jsonl"
   --timing_file "$LOG_DIR/timing.csv"
   --summary_file "$RUN_DIR/summary.json"
@@ -141,6 +146,9 @@ cmd=(
   --resume_checkpoint "$RESUME_CHECKPOINT"
   --seed "$TRAIN_SUBSET_SEED"
 )
+if [[ -n "$OPD_PROJECTOR_LR" && "$METHOD" == opd_reflex ]]; then
+  cmd+=(--opd_projector_lr "$OPD_PROJECTOR_LR")
+fi
 if (($#)); then cmd+=("$@"); fi
 
 printf 'Run name : %s\nRun dir  : %s\nModel    : %s\nDataset  : %s\nDraft    : %s\nMethod   : %s\nEngine   : %s\nGPUs     : %s\n' \
@@ -181,6 +189,7 @@ ln -sfn "$RUN_DIR" "$TRAIN_MODEL_ROOT/active_run"
   --item "resume_checkpoint=$RESUME_CHECKPOINT" --item "method=$METHOD" \
   --item "opd_rank=$OPD_RANK" --item "opd_topk=$OPD_TOPK" \
   --item "opd_fast_lr=$OPD_FAST_LR" --item "opd_update_stream=$OPD_UPDATE_STREAM" \
+  --item "opd_projector_lr=$OPD_PROJECTOR_LR" --item "rollout_log_flush_interval=$ROLLOUT_LOG_FLUSH_INTERVAL" \
   --item "opd_visited_weight=$OPD_VISITED_WEIGHT" --item "opd_frontier_weight=$OPD_FRONTIER_WEIGHT" \
   --item "opd_profile=$OPD_PROFILE" --item "opd_diagnostics=$OPD_DIAGNOSTICS" \
   --item "opd_backend=$OPD_BACKEND" \

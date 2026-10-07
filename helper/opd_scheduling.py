@@ -30,8 +30,8 @@ def schedule(path,past,eos,workspace,packet,kernels=None,opd=None):
 def compact_suffix_inplace(key,value,chosen,past,extension,model):
     """Gather only accepted non-prefix suffix, write back without copying past.
 
-    HF DynamicCache concatenates into normal contiguous tensors on its next
-    update; attention never sees a changed arithmetic layout. Prefix untouched.
+    OPDStaticCache appends directly into capacity storage on its next update.
+    The visible prefix remains a strided view of that storage; prefix untouched.
     Scratch is capacity reused, bounded by max accepted path, NOT history size.
     """
     width=chosen.shape[1];start=past+extension;end=past+width

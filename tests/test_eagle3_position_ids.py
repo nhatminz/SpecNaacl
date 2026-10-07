@@ -152,3 +152,28 @@ def test_float_positions_work_with_dynamo_rotary_compilation(tiny_adapter, monke
     reference = tiny_adapter(**inputs)
     actual = tiny_adapter(**dict(inputs, position_ids=inputs["position_ids"].float()))
     assert_outputs_identical(actual, reference)
+
+
+@pytest.mark.parametrize('dtype',[torch.float32,torch.bfloat16])
+@pytest.mark.parametrize('device',['cpu']+(['cuda'] if torch.cuda.is_available() else []))
+def test_eagle_static_cache_matches_legacy_prefill_append_and_rollback(tiny_adapter,dtype,device):
+    from helper.opd_static_cache import OPDStaticCache
+    adapter=tiny_adapter.to(device=device,dtype=dtype);adapter.dtype=dtype
+    with torch.no_grad():
+        inputs={k:v.to(device) for k,v in prefill_inputs(dtype).items()}
+        legacy=adapter(**inputs)
+        static=adapter(**inputs,past_key_values=OPDStaticCache(32))
+        assert_outputs_identical(static,legacy)
+        ptr=static['past_key_values'][0][0].untyped_storage().data_ptr()
+        for length in (2,1):
+            past=legacy['past_key_values'][0][0].shape[-2]
+            args=dict(hidden_states=legacy['next_feature_states'][:,-1:].expand(2,length,16),
+                input_ids=torch.ones(2,length,dtype=torch.long,device=device),
+                attention_mask=torch.zeros(2,1,length,past+length,dtype=dtype,device=device),
+                position_ids=torch.arange(past,past+length,device=device)[None,:])
+            legacy=adapter(**args,past_key_values=legacy['past_key_values'])
+            static=adapter(**args,past_key_values=static['past_key_values'])
+            assert_outputs_identical(static,legacy)
+            assert static['past_key_values'][0][0].untyped_storage().data_ptr()==ptr
+        static['past_key_values'].crop(4)
+        assert torch.equal(static['past_key_values'][0][0],legacy['past_key_values'][0][0][...,:4,:])

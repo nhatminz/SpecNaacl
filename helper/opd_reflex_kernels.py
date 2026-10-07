@@ -35,8 +35,8 @@ def feature(hidden,projector,out,head_inputs,state,offset):
 
 
 
-@triton.jit(do_not_specialize=["ZS0","ZS1","ZS2","C","THRESHOLD"])
-def _sparse_scores(Z,U,B,ACTIVE,COUNT,SCORES,COUNTERS,ZS0,ZS1,ZS2,
+@triton.jit(do_not_specialize=["ZS0","ZS1","ZS2","C","THRESHOLD","CAPACITY"])
+def _sparse_scores(Z,U,B,ACTIVE,COUNT,SCORES,SLOTS,CAPACITY,COUNTERS,ZS0,ZS1,ZS2,
                    C,V:tl.constexpr,R:tl.constexpr,THRESHOLD,
                    MODE:tl.constexpr,ROOT:tl.constexpr,BS:tl.constexpr):
     row=tl.program_id(0).to(tl.int64);count=tl.load(COUNT)
@@ -51,7 +51,8 @@ def _sparse_scores(Z,U,B,ACTIVE,COUNT,SCORES,COUNTERS,ZS0,ZS1,ZS2,
                 u=tl.load(U+row*R+r)
                 dot=dot+w*u
             raw=tl.load(Z+row//C*ZS0+row%C*ZS1+ids*ZS2,start+s<count,other=0).to(tl.float32)
-            tl.store(SCORES+row*V+ids,raw+dot,start+s<count)
+            tl.store(SCORES+row*CAPACITY+start+s,raw+dot,start+s<count)
+            if row==0:tl.store(SLOTS+ids,start+s,start+s<count)
         if ROOT:
             if row==0:tl.atomic_add(COUNTERS+13,1.)
 
@@ -79,10 +80,10 @@ def _dense_gemm(Z,U,B,COUNT,SCORES,COUNTERS,ZS0,ZS1,ZS2,
         if ROOT:
             if (tile==0)&(ct==0):tl.atomic_add(COUNTERS+14,1.)
 
-@triton.jit(do_not_specialize=["ZS0","ZS1","ZS2","C","ENABLED"])
-def _corrected_scan(Z,SCORES,BITS,MAX,SUM,VALUES,IDS,U,B,COUNTERS,ZS0,ZS1,ZS2,
+@triton.jit(do_not_specialize=["ZS0","ZS1","ZS2","C","ENABLED","CAPACITY"])
+def _corrected_scan(Z,SCORES,BITS,SLOTS,CAPACITY,MAX,SUM,VALUES,IDS,U,B,COUNTERS,ZS0,ZS1,ZS2,
                      C,V:tl.constexpr,K:tl.constexpr,TILES:tl.constexpr,
-                     BV:tl.constexpr,ENABLED,R:tl.constexpr,DENSE:tl.constexpr,ROOT:tl.constexpr):
+                     BV:tl.constexpr,ENABLED,R:tl.constexpr,DENSE:tl.constexpr,ROOT:tl.constexpr,SPARSE:tl.constexpr):
     tile,context,batch=tl.program_id(0),tl.program_id(1),tl.program_id(2).to(tl.int64)
     v=tile*BV+tl.arange(0,BV)
     raw=tl.load(Z+batch*ZS0+context*ZS1+v*ZS2,v<V,other=0).to(tl.float32)
@@ -99,7 +100,10 @@ def _corrected_scan(Z,SCORES,BITS,MAX,SUM,VALUES,IDS,U,B,COUNTERS,ZS0,ZS1,ZS2,
         else:
             bits=tl.load(BITS+v//32,v<V,other=0)
             active=(v<V)&(((bits>>(v%32))&1)!=0)
-            corrected=tl.load(SCORES+(batch*C+context)*V+v,active,other=0)
+            if SPARSE:
+                slots=tl.load(SLOTS+v,active,other=0)
+                corrected=tl.load(SCORES+(batch*C+context)*CAPACITY+slots,active,other=0)
+            else:corrected=tl.load(SCORES+(batch*C+context)*V+v,active,other=0)
             raw=tl.where(active,corrected,raw)
     z=tl.where(v<V,raw,-float('inf'));live=v<V
     maximum=tl.max(z,axis=0)
@@ -126,7 +130,7 @@ def prepare_scores(logits,u,state,root=False):
     b,c,v=logits.shape
     mode=0 if state.selected_proposal_backend(b,c)=='sparse' else 1
     if mode==0:
-        _sparse_scores[(b*c,)](logits,u,state.B_fast,state.active_ids,state.active_count,state.score_workspace,
+        _sparse_scores[(b*c,)](logits,u,state.B_fast,state.active_ids,state.active_count,state.sparse_scores,state.active_slots,state.sparse_capacity,
             state.counters,*logits.stride(),c,v,state.rank,0,mode,root,128,
             num_warps=4,enable_fp_fusion=False)
     else:
@@ -138,17 +142,19 @@ def propose(logits,u,state,k,workspace,outputs,enabled,root=False):
     b,c,v=logits.shape;tiles=triton.cdiv(v,256)
     maxima,sums,values,ids=[p[:b*c*tiles*(k if i>=2 else 1)] for i,p in enumerate(workspace)]
     out,indices,norm=outputs
+    sparse=state.selected_proposal_backend(b,c)=='sparse'
     dense=enabled and state.selected_proposal_backend(b,c)=='dense' and state.selected_dense_implementation(b,c)=='fused'
     if enabled:
+        state.prepare_proposal_workspace(b,c)
         ticket=state.begin('opd_proposal_extra_ms')
         if not dense:prepare_scores(logits,u,state,root)
         state.end(ticket)
     elif root and state.enabled:
         # Cold raw path has zero B. No correction preparation at all.
         state.counters[13:14].add_(1)
-    _corrected_scan[(tiles,c,b)](logits,state.score_workspace,state.bitmap,maxima,sums,values,ids,
+    _corrected_scan[(tiles,c,b)](logits,state.sparse_scores if sparse else state.score_workspace,state.bitmap,state.active_slots,state.sparse_capacity,maxima,sums,values,ids,
         u,state.B_fast,state.counters if state.enabled else None,
-        *logits.stride(),c,v,k,tiles,256,enabled,state.rank,dense,root,num_warps=4,enable_fp_fusion=False)
+        *logits.stride(),c,v,k,tiles,256,enabled,state.rank,dense,root,sparse,num_warps=4,enable_fp_fusion=False)
     _proposal_merge[(b*c,)](maxima,sums,values,ids,out,indices,norm,c,v,k,tiles,
         triton.next_power_of_2(tiles),triton.next_power_of_2(tiles*k),num_warps=4,enable_fp_fusion=False)
 
@@ -268,83 +274,91 @@ def _teacher_merge(W,SUM,VALUES,IDS,P,OUT_IDS,MASS,N,V:tl.constexpr,K:tl.constex
 
 
 @triton.jit(do_not_specialize=["ROWS","CACHE"])
-def _selected_head(H,HEAD,BIAS,U,B,D_IDS,D_Q,T_IDS,NORM,W,MASS,CONTEXTS,OUT,
+def _selected_head(SELECTED,SELECTED_COUNT,H,HEAD,BIAS,U,B,D_IDS,D_Q,T_IDS,NORM,W,MASS,CONTEXTS,OUT,
                    HEAD_DTYPE:tl.constexpr,ROWS,CACHE,
                    HIDDEN:tl.constexpr,R:tl.constexpr,K:tl.constexpr,
                    HAS_BIAS:tl.constexpr,BH:tl.constexpr,BR:tl.constexpr,BK:tl.constexpr):
-    j,state=tl.program_id(0),tl.program_id(1).to(tl.int64)
-    weight=tl.load(W+state);context=tl.load(CONTEXTS+state)
-    token=tl.load(T_IDS+state*K+j)
-    k=tl.arange(0,BK);cached_ids=tl.load(D_IDS+(state//ROWS*CACHE+tl.maximum(context,0))*K+k,k<K,other=-1)
-    matches=cached_ids==token;found=tl.sum(matches.to(tl.int32),axis=0)>0
-    mass=tl.load(MASS+state)
-    if (weight>0)&(context>=0)&(mass>0)&(mass<float('inf'))&(token>=0):
-        if found:
-            q=tl.sum(tl.where(matches,tl.load(D_Q+(state//ROWS*CACHE+context)*K+k,k<K,other=0),0.),axis=0)
-        else:
-            h,r=tl.arange(0,BH),tl.arange(0,BR)
-            x=tl.load(H+(state//ROWS*CACHE+context)*HIDDEN+h,h<HIDDEN,other=0).to(HEAD_DTYPE).to(tl.float32)
-            row=tl.load(HEAD+token*HIDDEN+h,h<HIDDEN,other=0).to(HEAD_DTYPE).to(tl.float32)
-            raw=tl.sum(x*row,axis=0)
-            if HAS_BIAS:raw=raw+tl.load(BIAS+token).to(HEAD_DTYPE).to(tl.float32)
-            # Dense SpecForge head returns the model dtype before FP32 softmax.
-            raw=raw.to(HEAD_DTYPE).to(tl.float32)
-            u=tl.load(U+(state//ROWS*CACHE+context)*R+r,r<R,other=0)
-            adapter=tl.load(B+token*R+r,r<R,other=0)
-            z=raw+tl.sum(adapter*u,axis=0)
-            maximum=tl.load(NORM+(state//ROWS*CACHE+context)*2)
-            total=tl.load(NORM+(state//ROWS*CACHE+context)*2+1)
-            q=tl.div_rn(tl.exp(z-maximum),total)
-    else:q=0.
-    tl.store(OUT+state*K+j,q)
+    j=tl.program_id(0)
+    worker=tl.program_id(1);stride=tl.num_programs(1)
+    count=tl.load(SELECTED_COUNT)
+    for ordinal in range(worker,count,stride):
+        state=tl.load(SELECTED+ordinal).to(tl.int64)
+        weight=tl.load(W+state);context=tl.load(CONTEXTS+state)
+        token=tl.load(T_IDS+state*K+j)
+        k=tl.arange(0,BK);cached_ids=tl.load(D_IDS+(state//ROWS*CACHE+tl.maximum(context,0))*K+k,k<K,other=-1)
+        matches=cached_ids==token;found=tl.sum(matches.to(tl.int32),axis=0)>0
+        mass=tl.load(MASS+state)
+        if (weight>0)&(context>=0)&(mass>0)&(mass<float('inf'))&(token>=0):
+            if found:
+                q=tl.sum(tl.where(matches,tl.load(D_Q+(state//ROWS*CACHE+context)*K+k,k<K,other=0),0.),axis=0)
+            else:
+                h,r=tl.arange(0,BH),tl.arange(0,BR)
+                x=tl.load(H+(state//ROWS*CACHE+context)*HIDDEN+h,h<HIDDEN,other=0).to(HEAD_DTYPE).to(tl.float32)
+                row=tl.load(HEAD+token*HIDDEN+h,h<HIDDEN,other=0).to(HEAD_DTYPE).to(tl.float32)
+                raw=tl.sum(x*row,axis=0)
+                if HAS_BIAS:raw=raw+tl.load(BIAS+token).to(HEAD_DTYPE).to(tl.float32)
+                # Dense SpecForge head returns the model dtype before FP32 softmax.
+                raw=raw.to(HEAD_DTYPE).to(tl.float32)
+                u=tl.load(U+(state//ROWS*CACHE+context)*R+r,r<R,other=0)
+                adapter=tl.load(B+token*R+r,r<R,other=0)
+                z=raw+tl.sum(adapter*u,axis=0)
+                maximum=tl.load(NORM+(state//ROWS*CACHE+context)*2)
+                total=tl.load(NORM+(state//ROWS*CACHE+context)*2+1)
+                q=tl.div_rn(tl.exp(z-maximum),total)
+        else:q=0.
+        tl.store(OUT+state*K+j,q)
 
 
 @triton.jit(do_not_specialize=["TS0","TS1","TS2","ROWS","CACHE"])
-def _union(TARGET,MAP,W,KIND,CONTEXTS,D_IDS,D_Q,T_IDS,T_P,T_Q,MASS,
+def _union(SELECTED,SELECTED_COUNT,TARGET,MAP,W,KIND,CONTEXTS,D_IDS,D_Q,T_IDS,T_P,T_Q,MASS,
             OUT_IDS,OUT_G,STATS,TS0,TS1,TS2,ROWS,CACHE,
             V:tl.constexpr,K:tl.constexpr,FIELDS:tl.constexpr,BU:tl.constexpr,GREEDY:tl.constexpr):
-    state=tl.program_id(0).to(tl.int64);j=tl.arange(0,BU);first=j<K
-    context=tl.maximum(tl.load(CONTEXTS+state),0);cache=state//ROWS*CACHE+context
-    kk=j%K
-    d_ids=tl.load(D_IDS+cache*K+kk,j<2*K,other=-1)
-    token=tl.where(first,d_ids,tl.load(T_IDS+state*K+kk,j<2*K,other=-1))
-    # Each top-k is unique. Only target additions require cross-set dedup.
-    dk=tl.arange(0,triton.next_power_of_2(K))
-    draft_ids=tl.load(D_IDS+cache*K+dk,dk<K,other=-2)
-    overlap=tl.sum((token[:,None]==draft_ids[None,:]).to(tl.int32),axis=1)>0
-    mass=tl.load(MASS+state);weight=tl.load(W+state)
-    good=(mass>0)&(mass<float('inf'))
-    target_positive=(token>=0)&(tl.load(T_P+state*K+kk,j<2*K,other=0)>0)
-    valid=(j<2*K)&(first|(~overlap&target_positive))&(weight>0)&good
-    target_id=tl.load(MAP+tl.maximum(token,0),j<2*K,other=0)
-    if GREEDY:
-        p=(target_id==tl.load(TARGET+state//ROWS*TS0+state%ROWS*TS1)).to(tl.float32)
-    else:p=tl.load(TARGET+state//ROWS*TS0+state%ROWS*TS1+target_id*TS2,valid,other=0).to(tl.float32)
-    p=tl.where(valid,tl.div_rn(p,tl.where(good,mass,1.)),0.)
-    q=tl.where(first,tl.load(D_Q+cache*K+kk,j<2*K,other=0),tl.load(T_Q+state*K+kk,j<2*K,other=0))
-    q=tl.where(valid,q,0.)
-    p_tail=tl.maximum(1.-tl.sum(p,axis=0),0.);q_tail=tl.maximum(1.-tl.sum(q,axis=0),0.)
-    empty_tail=tl.sum(valid.to(tl.int32),axis=0)==V
-    p_tail=tl.where(empty_tail,0.,p_tail);q_tail=tl.where(empty_tail,0.,q_tail)
-    # Exact categorical KL, with 0*log(0/q)=0. Infinite KL is not hidden.
-    kl=tl.sum(tl.where(p>0,p*(tl.log(p)-tl.log(q)),0.),axis=0)
-    kl=kl+tl.where(p_tail>0,p_tail*(tl.log(p_tail)-tl.log(q_tail)),0.)
-    w=tl.where(good,weight,0.)
-    tl.store(OUT_IDS+state*2*K+j,tl.where(valid,token,-1),j<2*K)
-    tl.store(OUT_G+state*2*K+j,tl.where(valid,w*(q-p),0.),j<2*K)
-    kind=tl.load(KIND+state);selected=w>0
-    # Per-state summaries; one batched reduction feeds metrics and SGD denominator.
-    tl.store(STATS+state*FIELDS+0,w)
-    tl.store(STATS+state*FIELDS+1,selected.to(tl.float32))
-    tl.store(STATS+state*FIELDS+2,(selected&(kind==1)).to(tl.float32))
-    tl.store(STATS+state*FIELDS+3,(selected&(kind==2)).to(tl.float32))
-    finite=(kl==kl)&(tl.abs(kl)<float('inf'))
-    tl.store(STATS+state*FIELDS+4,tl.where(selected&finite,w*kl,0.))
-    tl.store(STATS+state*FIELDS+5,tl.sum(valid.to(tl.float32),axis=0))
-    tl.store(STATS+state*FIELDS+6,tl.where(selected,mass,0.))
-    tl.store(STATS+state*FIELDS+7,tl.sum(tl.where(first,p,0.),axis=0))
-    tl.store(STATS+state*FIELDS+8,((weight>0)&~good).to(tl.float32))
-    tl.store(STATS+state*FIELDS+9,(selected&~finite).to(tl.float32))
+    worker=tl.program_id(0);stride=tl.num_programs(0)
+    count=tl.load(SELECTED_COUNT)
+    for ordinal in range(worker,count,stride):
+        state=tl.load(SELECTED+ordinal).to(tl.int64)
+        j=tl.arange(0,BU);first=j<K
+        context=tl.maximum(tl.load(CONTEXTS+state),0);cache=state//ROWS*CACHE+context
+        kk=j%K
+        d_ids=tl.load(D_IDS+cache*K+kk,j<2*K,other=-1)
+        token=tl.where(first,d_ids,tl.load(T_IDS+state*K+kk,j<2*K,other=-1))
+        # Each top-k is unique. Only target additions require cross-set dedup.
+        dk=tl.arange(0,triton.next_power_of_2(K))
+        draft_ids=tl.load(D_IDS+cache*K+dk,dk<K,other=-2)
+        overlap=tl.sum((token[:,None]==draft_ids[None,:]).to(tl.int32),axis=1)>0
+        mass=tl.load(MASS+state);weight=tl.load(W+state)
+        good=(mass>0)&(mass<float('inf'))
+        target_positive=(token>=0)&(tl.load(T_P+state*K+kk,j<2*K,other=0)>0)
+        valid=(j<2*K)&(first|(~overlap&target_positive))&(weight>0)&good
+        target_id=tl.load(MAP+tl.maximum(token,0),j<2*K,other=0)
+        if GREEDY:
+            p=(target_id==tl.load(TARGET+state//ROWS*TS0+state%ROWS*TS1)).to(tl.float32)
+        else:p=tl.load(TARGET+state//ROWS*TS0+state%ROWS*TS1+target_id*TS2,valid,other=0).to(tl.float32)
+        p=tl.where(valid,tl.div_rn(p,tl.where(good,mass,1.)),0.)
+        q=tl.where(first,tl.load(D_Q+cache*K+kk,j<2*K,other=0),tl.load(T_Q+state*K+kk,j<2*K,other=0))
+        q=tl.where(valid,q,0.)
+        p_tail=tl.maximum(1.-tl.sum(p,axis=0),0.);q_tail=tl.maximum(1.-tl.sum(q,axis=0),0.)
+        empty_tail=tl.sum(valid.to(tl.int32),axis=0)==V
+        p_tail=tl.where(empty_tail,0.,p_tail);q_tail=tl.where(empty_tail,0.,q_tail)
+        # Exact categorical KL, with 0*log(0/q)=0. Infinite KL is not hidden.
+        kl=tl.sum(tl.where(p>0,p*(tl.log(p)-tl.log(q)),0.),axis=0)
+        kl=kl+tl.where(p_tail>0,p_tail*(tl.log(p_tail)-tl.log(q_tail)),0.)
+        w=tl.where(good,weight,0.)
+        tl.store(OUT_IDS+state*2*K+j,tl.where(valid,token,-1),j<2*K)
+        tl.store(OUT_G+state*2*K+j,tl.where(valid,w*(q-p),0.),j<2*K)
+        kind=tl.load(KIND+state);selected=w>0
+        # Per-state summaries; one batched reduction feeds metrics and SGD denominator.
+        tl.store(STATS+state*FIELDS+0,w)
+        tl.store(STATS+state*FIELDS+1,selected.to(tl.float32))
+        tl.store(STATS+state*FIELDS+2,(selected&(kind==1)).to(tl.float32))
+        tl.store(STATS+state*FIELDS+3,(selected&(kind==2)).to(tl.float32))
+        finite=(kl==kl)&(tl.abs(kl)<float('inf'))
+        tl.store(STATS+state*FIELDS+4,tl.where(selected&finite,w*kl,0.))
+        tl.store(STATS+state*FIELDS+5,tl.sum(valid.to(tl.float32),axis=0))
+        tl.store(STATS+state*FIELDS+6,tl.where(selected,mass,0.))
+        tl.store(STATS+state*FIELDS+7,tl.sum(tl.where(first,p,0.),axis=0))
+        tl.store(STATS+state*FIELDS+8,((weight>0)&~good).to(tl.float32))
+        tl.store(STATS+state*FIELDS+9,(selected&~finite).to(tl.float32))
 
 
 @triton.jit(do_not_specialize=["N"])
@@ -356,24 +370,28 @@ def _reduce(STATS,ROUND_WEIGHT,COUNTERS,N,FIELDS:tl.constexpr,BN:tl.constexpr):
 
 
 @triton.jit(do_not_specialize=["ROWS","CACHE"])
-def _update(IDS,G,U,CONTEXTS,ROUND_WEIGHT,B,BITS,ACTIVE,COUNT,
+def _update(SELECTED,SELECTED_COUNT,IDS,G,U,CONTEXTS,ROUND_WEIGHT,B,BITS,ACTIVE,COUNT,
              ROWS,CACHE,K:tl.constexpr,R:tl.constexpr,
              LR:tl.constexpr,BU:tl.constexpr,BR:tl.constexpr):
-    state=tl.program_id(0).to(tl.int64);j,r=tl.arange(0,BU),tl.arange(0,BR)
-    token=tl.load(IDS+state*2*K+j,j<2*K,other=-1)
-    g=tl.load(G+state*2*K+j,j<2*K,other=0)
-    context=tl.maximum(tl.load(CONTEXTS+state),0)
-    u=tl.load(U+(state//ROWS*CACHE+context)*R+r,r<R,other=0)
-    denominator=tl.load(ROUND_WEIGHT)
-    delta=-LR*tl.div_rn(g[:,None]*u[None,:],tl.where(denominator>0,denominator,1.))
-    valid=(j<2*K)&(token>=0)&(denominator>0)
-    tl.atomic_add(B+tl.maximum(token[:,None],0)*R+r[None,:],delta,valid[:,None]&(r[None,:]<R))
-    changed=valid&(tl.sum((delta!=0).to(tl.int32),axis=1)>0)
-    bit=1<<(token%32)
-    old=tl.atomic_or(BITS+tl.maximum(token,0)//32,bit,changed)
-    first=changed&((old&bit)==0)
-    slot=tl.atomic_add(COUNT+tl.zeros((BU,),tl.int32),1,first)
-    tl.store(ACTIVE+slot,token,first)
+    worker=tl.program_id(0);stride=tl.num_programs(0)
+    count=tl.load(SELECTED_COUNT)
+    for ordinal in range(worker,count,stride):
+        state=tl.load(SELECTED+ordinal).to(tl.int64)
+        j,r=tl.arange(0,BU),tl.arange(0,BR)
+        token=tl.load(IDS+state*2*K+j,j<2*K,other=-1)
+        g=tl.load(G+state*2*K+j,j<2*K,other=0)
+        context=tl.maximum(tl.load(CONTEXTS+state),0)
+        u=tl.load(U+(state//ROWS*CACHE+context)*R+r,r<R,other=0)
+        denominator=tl.load(ROUND_WEIGHT)
+        delta=-LR*tl.div_rn(g[:,None]*u[None,:],tl.where(denominator>0,denominator,1.))
+        valid=(j<2*K)&(token>=0)&(denominator>0)
+        tl.atomic_add(B+tl.maximum(token[:,None],0)*R+r[None,:],delta,valid[:,None]&(r[None,:]<R))
+        changed=valid&(tl.sum((delta!=0).to(tl.int32),axis=1)>0)
+        bit=1<<(token%32)
+        old=tl.atomic_or(BITS+tl.maximum(token,0)//32,bit,changed)
+        first=changed&((old&bit)==0)
+        slot=tl.atomic_add(COUNT+tl.zeros((BU,),tl.int32),1,first)
+        tl.store(ACTIVE+slot,token,first)
 
 
 @triton.jit(do_not_specialize=[])
@@ -387,38 +405,106 @@ def _round_end(B,BITS,ACTIVE,COUNT,WEIGHT,COUNTERS,R:tl.constexpr,
 
 
 @triton.jit(do_not_specialize=["ROWS","CACHE"])
-def _projector_terms(IDS,G,HEAD,B,CONTEXTS,H_OUT,V_OUT,
+def _projector_terms(SELECTED,SELECTED_COUNT,IDS,G,HEAD,B,CONTEXTS,H_OUT,V_OUT,
                       ROWS,CACHE,K:tl.constexpr,HIDDEN:tl.constexpr,
                       R:tl.constexpr,BU:tl.constexpr,BH:tl.constexpr,BR:tl.constexpr):
-    state=tl.program_id(0).to(tl.int64)
-    j,r,h=tl.arange(0,BU),tl.arange(0,BR),tl.arange(0,BH)
-    ids=tl.load(IDS+state*2*K+j,j<2*K,other=-1)
-    g=tl.load(G+state*2*K+j,j<2*K,other=0)
-    b=tl.load(B+tl.maximum(ids[:,None],0)*R+r[None,:],(ids[:,None]>=0)&(j[:,None]<2*K)&(r[None,:]<R),other=0)
-    v=tl.sum(g[:,None]*b,axis=0)
-    context=tl.maximum(tl.load(CONTEXTS+state),0)
-    head=tl.load(HEAD+(state//ROWS*CACHE+context)*HIDDEN+h,h<HIDDEN,other=0).to(tl.float32)
-    tl.store(H_OUT+state*HIDDEN+h,head,h<HIDDEN)
-    tl.store(V_OUT+state*R+r,v,r<R)
+    worker=tl.program_id(0);stride=tl.num_programs(0)
+    count=tl.load(SELECTED_COUNT)
+    for ordinal in range(worker,count,stride):
+        state=tl.load(SELECTED+ordinal).to(tl.int64)
+        j,r,h=tl.arange(0,BU),tl.arange(0,BR),tl.arange(0,BH)
+        ids=tl.load(IDS+state*2*K+j,j<2*K,other=-1)
+        g=tl.load(G+state*2*K+j,j<2*K,other=0)
+        b=tl.load(B+tl.maximum(ids[:,None],0)*R+r[None,:],(ids[:,None]>=0)&(j[:,None]<2*K)&(r[None,:]<R),other=0)
+        v=tl.sum(g[:,None]*b,axis=0)
+        context=tl.maximum(tl.load(CONTEXTS+state),0)
+        head=tl.load(HEAD+(state//ROWS*CACHE+context)*HIDDEN+h,h<HIDDEN,other=0).to(tl.float32)
+        tl.store(H_OUT+ordinal*HIDDEN+h,head,h<HIDDEN)
+        tl.store(V_OUT+ordinal*R+r,v,r<R)
 
 
-def feedback(state,tree,path,target,greedy=False):
+@triton.jit
+def _projector_reduce(H,V,COUNT,OUT,HIDDEN:tl.constexpr,R:tl.constexpr,BH:tl.constexpr,BS:tl.constexpr,BR:tl.constexpr):
+    h=tl.program_id(0)*BH+tl.arange(0,BH);r=tl.arange(0,BR);s=tl.arange(0,BS)
+    count=tl.load(COUNT);acc=tl.full((BH,BR),0.,tl.float32)
+    for start in range(0,count,BS):
+        x=tl.load(H+(start+s[:,None])*HIDDEN+h[None,:],(start+s[:,None]<count)&(h[None,:]<HIDDEN),other=0)
+        v=tl.load(V+(start+s[:,None])*R+r[None,:],(start+s[:,None]<count)&(r[None,:]<R),other=0)
+        acc+=tl.sum(x[:,:,None]*v[:,None,:],axis=0)
+    tl.store(OUT+h[:,None]*R+r[None,:],acc,(h[:,None]<HIDDEN)&(r[None,:]<R))
+
+
+@triton.jit(do_not_specialize=['WIDTH'])
+def _teacher_sorted(P,IDS,INVERSE,SELECTED,COUNT,OUT_P,OUT_IDS,MASS,WIDTH,K:tl.constexpr,BLOCK:tl.constexpr,V:tl.constexpr):
+    lane=tl.arange(0,BLOCK)
+    for ordinal in range(tl.program_id(0),tl.load(COUNT),tl.num_programs(0)):
+        state=tl.load(SELECTED+ordinal).to(tl.int64)
+        tl.store(MASS+state,1.)
+        # Read sampler prefix; extend ONLY through positive boundary ties.
+        # Sort integer keys locally to preserve compact-ID teacher tie semantics.
+        boundary=tl.load(P+state*WIDTH+tl.minimum(K,WIDTH)-1)
+        retained=tl.full((BLOCK,),0,tl.uint64)
+        offset=tl.full((),0,tl.int32)
+        more=tl.full((),True,tl.int1)
+        while more:
+            pos=offset+lane
+            value=tl.load(P+state*WIDTH+pos,pos<WIDTH,other=0.)
+            target=tl.load(IDS+state*WIDTH+pos,pos<WIDTH,other=0)
+            compact=tl.load(INVERSE+target)
+            bits=value.to(tl.uint32,bitcast=True).to(tl.uint64)
+            key=tl.where((pos<WIDTH)&(value>0),(bits<<32)|(V-compact).to(tl.uint64),0)
+            merged=tl.sort(tl.reshape(tl.join(retained,key),(2*BLOCK,)),descending=True)
+            retained,discarded=tl.split(tl.trans(tl.reshape(merged,(2,BLOCK))))
+            retained=tl.where(lane<K,retained,0)
+            offset+=BLOCK
+            next_value=tl.load(P+state*WIDTH+offset,offset<WIDTH,other=0.)
+            more=(offset<WIDTH)&(next_value>0)&(next_value>=boundary)
+        probability=(retained>>32).to(tl.uint32).to(tl.float32,bitcast=True)
+        compact=V-(retained&4294967295).to(tl.int64)
+        tl.store(OUT_P+state*K+lane,probability,lane<K)
+        tl.store(OUT_IDS+state*K+lane,tl.where(probability>0,compact,-1),lane<K)
+
+
+@triton.jit(do_not_specialize=['ROWS','TS0','TS1'])
+def _teacher_full_greedy(TARGET,INVERSE,SELECTED,COUNT,P,IDS,MASS,ROWS,TS0,TS1,K:tl.constexpr,BK:tl.constexpr):
+    lane=tl.arange(0,BK)
+    for ordinal in range(tl.program_id(0),tl.load(COUNT),tl.num_programs(0)):
+        state=tl.load(SELECTED+ordinal).to(tl.int64)
+        token=tl.load(TARGET+state//ROWS*TS0+state%ROWS*TS1)
+        compact=tl.load(INVERSE+token)
+        tl.store(P+state*K+lane,tl.where(lane==0,1.,0.),lane<K)
+        tl.store(IDS+state*K+lane,tl.where(lane==0,compact,-1),lane<K)
+        tl.store(MASS+state,1.)
+
+
+def feedback(state,tree,path,target,greedy=False,sampling_metadata=None):
     b,q=tree.parents.shape;n=b*q;k=state.topk;rank=state.rank
     weights=state.selected_weights[:n].view(b,q);kind=state.selected_kind[:n].view(b,q)
     ticket=state.begin('opd_state_select_ms')
     select_states(tree,path,weights,kind,state.visited_weight,state.frontier_weight)
     state.end(ticket);ticket=state.begin('opd_teacher_extract_ms')
     probs=state.teacher_p[:n*k].view(n,k);ids=state.teacher_ids[:n*k].view(n,k);mass=state.teacher_mass[:n]
-    teacher(target,state.mapping,weights,k,state.teacher_tiles,(probs,ids,mass),greedy,
-            selection=(state.selected_ids,state.selected_count))
+    if greedy and state.full_vocab_inverse is not None:
+        _compact_selected[(1,)](weights,state.selected_ids,state.selected_count,n,triton.next_power_of_2(n),num_warps=4)
+        _teacher_full_greedy[(min(n,32),)](target,state.full_vocab_inverse,state.selected_ids,state.selected_count,
+            probs,ids,mass,q,*target.stride(),k,triton.next_power_of_2(k),num_warps=4)
+    elif sampling_metadata is not None and state.full_vocab_inverse is not None:
+        sorted_p,sorted_ids=sampling_metadata
+        _compact_selected[(1,)](weights,state.selected_ids,state.selected_count,n,triton.next_power_of_2(n),num_warps=4)
+        _teacher_sorted[(min(n,32),)](sorted_p,sorted_ids,state.full_vocab_inverse,state.selected_ids,state.selected_count,
+            probs,ids,mass,sorted_p.shape[-1],k,max(32,triton.next_power_of_2(k)),state.vocab,num_warps=4)
+    else:
+        teacher(target,state.mapping,weights,k,state.teacher_tiles,(probs,ids,mass),greedy,
+                selection=(state.selected_ids,state.selected_count))
     state.end(ticket);ticket=state.begin('opd_union_loss_ms')
     head=state.head.weight;bias=state.head.bias if state.head.bias is not None else head
-    _selected_head[(k,n)](state.head_cache,head,bias,state.u_cache,state.B_fast,state.ids_cache,state.q_cache,
+    _selected_head[(k,min(n,32))](state.selected_ids,state.selected_count,state.head_cache,head,bias,state.u_cache,state.B_fast,state.ids_cache,state.q_cache,
         ids,state.norm_cache,weights,mass,tree.feedback_contexts,state.teacher_q,
         triton.language.bfloat16 if state.logits_dtype==torch.bfloat16 else (triton.language.float16 if state.logits_dtype==torch.float16 else triton.language.float32),
         q,state.cache_contexts,head.shape[1],rank,k,state.head.bias is not None,triton.next_power_of_2(head.shape[1]),
         triton.next_power_of_2(rank),triton.next_power_of_2(k),num_warps=4,enable_fp_fusion=False)
-    _union[(n,)](target,state.mapping,weights,kind,tree.feedback_contexts,state.ids_cache,state.q_cache,ids,probs,
+    state.state_stats[:n*10].zero_()
+    _union[(min(n,32),)](state.selected_ids,state.selected_count,target,state.mapping,weights,kind,tree.feedback_contexts,state.ids_cache,state.q_cache,ids,probs,
         state.teacher_q,mass,state.union_ids,state.union_g,state.state_stats,
         target.stride(0),target.stride(1),0 if greedy else target.stride(2),q,state.cache_contexts,state.vocab,k,10,
         triton.next_power_of_2(2*k),greedy,num_warps=4,enable_fp_fusion=False)
@@ -426,15 +512,16 @@ def feedback(state,tree,path,target,greedy=False):
     if state.train_projector and state._ever_updated:
         # B is STILL frozen B_t. No per-round backward/optimizer/DDP sync.
         h=state.head.weight.shape[1]
-        _projector_terms[(n,)](state.union_ids,state.union_g,state.head_cache,state.B_fast,tree.feedback_contexts,
+        _projector_terms[(min(n,32),)](state.selected_ids,state.selected_count,state.union_ids,state.union_g,state.head_cache,state.B_fast,tree.feedback_contexts,
             state.projector_head,state.projector_v,q,state.cache_contexts,k,h,rank,
             triton.next_power_of_2(2*k),triton.next_power_of_2(h),triton.next_power_of_2(rank),num_warps=4,enable_fp_fusion=False)
-        torch.mm(state.projector_head[:n].t(),state.projector_v[:n],out=state.projector_delta)
+        _projector_reduce[(triton.cdiv(h,32),)](state.projector_head,state.projector_v,state.selected_count,
+            state.projector_delta,h,rank,32,32,triton.next_power_of_2(rank),num_warps=4,enable_fp_fusion=False)
         state.model.opd_projector_grad_sum.add_(state.projector_delta)
     if state.train_projector:state.model.opd_projector_grad_weight.add_(state.round_weight)
     state.end(ticket);ticket=state.begin('opd_update_ms')
     if state.fast_lr>0:
-        _update[(n,)](state.union_ids,state.union_g,state.u_cache,tree.feedback_contexts,state.round_weight,
+        _update[(min(n,32),)](state.selected_ids,state.selected_count,state.union_ids,state.union_g,state.u_cache,tree.feedback_contexts,state.round_weight,
             state.B_fast,state.bitmap,state.active_ids,state.active_count,q,state.cache_contexts,k,rank,
             state.fast_lr,triton.next_power_of_2(2*k),triton.next_power_of_2(rank),num_warps=4,enable_fp_fusion=False)
     _round_end[(1,)](state.B_fast,state.bitmap,state.active_ids,

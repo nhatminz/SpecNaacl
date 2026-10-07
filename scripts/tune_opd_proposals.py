@@ -24,10 +24,17 @@ def measure(fn,iterations,torch):
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--output',required=True);p.add_argument('--shapes',default='1x1,8x1,32x1,64x1,16x8,32x8,64x8')
-    p.add_argument('--vocab',type=int,default=32768);p.add_argument('--hidden',type=int,default=2048)
+    p.add_argument('--draft-config');p.add_argument('--vocab',type=int);p.add_argument('--hidden',type=int)
     p.add_argument('--rank',type=int,default=8);p.add_argument('--slots',default='0,16,64,256,1024,4096,8192,V')
-    p.add_argument('--iterations',type=int,default=30);p.add_argument('--dtype',choices=['bf16','fp32'],default='bf16')
+    p.add_argument('--iterations',type=int,default=30);p.add_argument('--dtype',choices=['bf16','fp16','fp32'],default='bf16')
     a=p.parse_args();output=Path(a.output)
+    if a.draft_config:
+        config=json.loads(Path(a.draft_config).read_text())
+        vocab=int(config.get('draft_vocab_size') or config['vocab_size']);hidden=int(config['hidden_size'])
+        if a.vocab is not None and a.vocab!=vocab:p.error('explicit vocab differs from production draft config')
+        if a.hidden is not None and a.hidden!=hidden:p.error('explicit hidden differs from production draft config')
+        a.vocab,a.hidden=vocab,hidden
+    if a.vocab is None or a.hidden is None:p.error('--draft-config required, or explicit --vocab AND --hidden for synthetic kernel tests')
     if output.exists():p.error('choose a new output profile')
     import torch
     import numpy as np
@@ -35,7 +42,7 @@ def main():
     from helper.opd_reflex import OPDReflex,initialize_projector
     from helper import opd_reflex_kernels as kernels
     if not torch.cuda.is_available():p.error('real CUDA needed; no fake timings')
-    torch.manual_seed(42);dtype=torch.bfloat16 if a.dtype=='bf16' else torch.float32
+    torch.manual_seed(42);dtype={'bf16':torch.bfloat16,'fp16':torch.float16,'fp32':torch.float32}[a.dtype]
     thresholds={};dense_implementations={};records=[]
     for shape in a.shapes.split(','):
         b,c=map(int,shape.split('x'));mapping=torch.arange(a.vocab,device='cuda')

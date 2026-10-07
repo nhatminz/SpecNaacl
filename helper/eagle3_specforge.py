@@ -125,6 +125,7 @@ class Eagle3FastGRPOAdapter(nn.Module):
     """
 
     is_eagle3_specforge = True
+    supports_opd_static_kv = True
 
     def __init__(
         self,
@@ -215,6 +216,11 @@ class Eagle3FastGRPOAdapter(nn.Module):
         selected_target_ids = torch.nonzero(self.draft_model.t2d.cpu(), as_tuple=False).flatten()
         if not torch.equal(selected_target_ids, torch.sort(mapped_target_ids).values):
             raise ValueError('SpecForge t2d and d2t vocabulary mappings disagree')
+        full_inverse=None
+        if mapped_target_ids.numel()==int(target_model.config.vocab_size):
+            full_inverse=torch.empty_like(mapped_target_ids)
+            full_inverse[mapped_target_ids]=torch.arange(mapped_target_ids.numel())
+        self.register_buffer('opd_full_vocab_inverse',full_inverse,persistent=False)
         n_layers = int(getattr(target_model.config, "num_hidden_layers"))
         self.feature_layers = resolve_feature_layers(n_layers, feature_layers)
         setattr(target_model, "_fastgrpo_eagle3_capture_layers", tuple(self.feature_layers))
@@ -372,10 +378,12 @@ class Eagle3FastGRPOAdapter(nn.Module):
         from specforge.modeling.draft.llama3_eagle import apply_rotary_pos_emb, repeat_kv
 
         query, key = apply_rotary_pos_emb(query, key, cos.to(query.device), sin.to(query.device), position_ids)
-        if past_key_values:
+        if hasattr(past_key_values,'update'):
+            key,value=past_key_values.update(key,value,0)
+        elif past_key_values:
             key = torch.cat((past_key_values[0][0], key), dim=-2)
             value = torch.cat((past_key_values[0][1], value), dim=-2)
-        present = [[key, value]] if use_cache else []
+        present = (past_key_values if hasattr(past_key_values,'update') else [[key,value]]) if use_cache else []
         key_rep = repeat_kv(key, attn.num_key_value_groups)
         value_rep = repeat_kv(value, attn.num_key_value_groups)
         attended = torch.nn.functional.scaled_dot_product_attention(

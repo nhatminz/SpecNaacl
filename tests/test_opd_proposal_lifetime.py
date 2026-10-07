@@ -76,6 +76,7 @@ def test_tree_scores_survive_changed_depth_batch_layout_and_reused_proposal_scra
         max_contexts=1 + k * (depth - 1), max_nodes=batch * 32,
         max_path=depth + 1, max_proposal_contexts=k)
     root_storage = engine.tree_root_confidences.data_ptr()
+    engine.draft_mask=torch.empty(batch*k*(2+k*depth),device=device,dtype=model.dtype)
     proposals = []
     original_propose = engine.propose
     def capture_propose(*args, **kwargs):

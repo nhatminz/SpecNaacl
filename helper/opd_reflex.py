@@ -84,6 +84,7 @@ class OPDReflex:
         self.train_projector=bool(train_projector)
         self._validated_tuning=False
         self._threshold_cache={}
+        self._dense_choice_cache={}
 
     def proposal_threshold(self,b,c):
         key=(b*c,self.vocab,self.rank,str(self.logits_dtype))
@@ -119,6 +120,12 @@ class OPDReflex:
 
     def selected_dense_implementation(self,b,c):
         if self.dense_implementation!='auto':return self.dense_implementation
+        key=(b*c,self.vocab,self.rank,str(self.logits_dtype))
+        if key not in self._dense_choice_cache:
+            self._dense_choice_cache[key]=self._nearest_dense_implementation(b,c)
+        return self._dense_choice_cache[key]
+
+    def _nearest_dense_implementation(self,b,c):
         buckets=[]
         for key,value in (self.tuning or {}).get('dense_implementations',{}).items():
             pb,pc,v,r,dtype=key.split(',')
@@ -146,6 +153,7 @@ class OPDReflex:
         self.cache_contexts=max_contexts
         layout=(batch,v,hidden_size,max_contexts,max_nodes,max_path,max_proposal_contexts,k,str(device),self.enabled)
         self.head=model.draft_model.lm_head if hasattr(model,'draft_model') else model.draft_head
+        self.full_vocab_inverse=getattr(model,'opd_full_vocab_inverse',None)
         self.model=model
         if self.enabled:
             self.projector=model.get_opd_projector(self.rank) if hasattr(model,'get_opd_projector') else None
@@ -171,7 +179,13 @@ class OPDReflex:
             self.proposal_norm=alloc(batch*max_proposal_contexts*2)
             # Reserved proposal-only workspace: sparse touches ONLY S token
             # scalars; dense GEMM writes all. Not a feedback probability cache.
-            self.score_workspace=alloc(batch*max_proposal_contexts*v if self.enabled else 1)
+            self.sparse_capacity=min(v,256)
+            self.sparse_scores=alloc(batch*max_proposal_contexts*self.sparse_capacity if self.enabled else 1)
+            self.active_slots=alloc(v,torch.int32)
+            # Dense GEMM workspace is lazy, never allocated by sparse/fused runs.
+            self.score_workspace=alloc(1)
+            self.proposal_capacity=batch*max_proposal_contexts
+            self.max_feedback_rows=max_nodes
             tiles=(v+255)//256+1
             self.proposal_tiles=[alloc(batch*max_proposal_contexts*tiles*(k if i>=2 else 1),torch.long if i==3 else torch.float32) for i in range(4)] if self.backend=='triton' else []
             self.path_workspace=[alloc((batch,max_path),torch.long) for _ in range(3)]+[alloc(batch,torch.long)]
@@ -179,6 +193,15 @@ class OPDReflex:
             self.scheduling_packet=alloc((batch,max_path+4),torch.long)
             # Small tree-only lexicographic keys, reused even as the batch shrinks.
             full_nodes=max_proposal_contexts * max_contexts
+            self.tree_buffers={name:alloc((batch,full_nodes),torch.float32 if name=='confidence' else torch.long)
+                for name in ('parents','contexts','tokens','positions','confidence')}
+            self.tree_arange=torch.arange(full_nodes+1,device=device,dtype=torch.long)
+            self.tree_seen=[alloc((batch,max_proposal_contexts,max_path),torch.long) for _ in range(2)]
+            self.tree_positions=alloc((batch,max_proposal_contexts),torch.long)
+            self.tree_branch_confidence=alloc((batch,max_proposal_contexts,max_proposal_contexts))
+            self.tree_top_values=alloc((batch,max_proposal_contexts))
+            self.tree_top_indices=alloc((batch,max_proposal_contexts),torch.long)
+            self.pack_workspace=[alloc(batch*(full_nodes+1),torch.long) for _ in range(4)]
             self.confidence_key_workspace=alloc(batch*full_nodes,torch.int64)
             # Root probabilities outlive the next propose(), whose outputs are
             # views of shared scratch. Keep only B*K values, not all logits.
@@ -207,6 +230,17 @@ class OPDReflex:
         if self.enabled:self.B_fast.zero_();self.counters.zero_()
         self._ever_updated=False;self._events.clear()
 
+    def prepare_proposal_workspace(self,b,c):
+        if self.selected_proposal_backend(b,c)=='sparse':
+            # Snapshot is one update behind; one union per selected state bounds
+            # all unseen activations. No GPU read or allocation each round.
+            required=min(self.vocab,self.host_active_count+(2*self.max_feedback_rows*self.topk if self._ever_updated else 0))
+            if required>self.sparse_capacity:
+                self.sparse_capacity=min(self.vocab,max(required,2*self.sparse_capacity))
+                self.sparse_scores=torch.empty(self.proposal_capacity*self.sparse_capacity,device=self.mapping.device)
+        elif self.selected_dense_implementation(b,c)=='gemm' and self.score_workspace.numel()==1:
+            self.score_workspace=torch.empty(self.proposal_capacity*self.vocab,device=self.mapping.device)
+
     def begin(self,label):
         if self.profile and self.backend=='triton':
             event=torch.cuda.Event(enable_timing=True);event.record();return label,event
@@ -226,6 +260,11 @@ class OPDReflex:
         """
         b,c,v=logits.shape;keep=self.topk
         self.logits_dtype=logits.dtype
+        if self.tuning is not None and not getattr(self,'_profile_shape_checked',False):
+            suffix=f',{v},{self.rank},{logits.dtype}'
+            if not any(key.endswith(suffix) for key in self.tuning.get('thresholds',{})):
+                raise ValueError('proposal profile does not cover actual compact vocabulary/rank/dtype; retune with this draft config')
+            self._profile_shape_checked=True
         if root and self.backend=='torch':self.dispatch_snapshot.copy_(self.active_count)
         if k>keep or v!=self.vocab:raise ValueError('proposal k/vocabulary mismatch')
         ticket=self.begin('opd_feature_ms')
@@ -267,9 +306,9 @@ class OPDReflex:
         return values[...,:k],ids[...,:k],mapping[ids[...,:k]]
 
     @torch.no_grad()
-    def feedback(self,tree,path,target,*,greedy=False):
+    def feedback(self,tree,path,target,*,greedy=False,sampling_metadata=None):
         if not self.enabled:return
-        if self.backend=='triton':self._opd_kernels.feedback(self,tree,path,target,greedy)
+        if self.backend=='triton':self._opd_kernels.feedback(self,tree,path,target,greedy,sampling_metadata)
         else:self._feedback_reference(tree,path,target,greedy)
         if self.fast_lr>0:self._ever_updated=True
 

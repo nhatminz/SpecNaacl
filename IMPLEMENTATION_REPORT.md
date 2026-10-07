@@ -1,4 +1,85 @@
-# OPD performance revision — 2026-10-07 (current behavior)
+# OPD follow-up — static KV / sampler reuse / per-iteration telemetry (2026-10-07)
+
+Current behavior and commands: [OPD_OPTIMIZATION_20261007.md](OPD_OPTIMIZATION_20261007.md).
+This section supersedes the older implementation/validation description below.
+
+Implemented fixed-capacity target + EAGLE draft KV append/crop, reused sorted target
+sampler intermediates for full-vocab/permutation teacher Top16, direct greedy teacher,
+compact sparse correction scratch, selected-only head/union/B/A feedback work,
+tree candidate/branch/mask/packed metadata pools, production-config tuner/autoload,
+and optional separate projector LR with optimizer-state migration. No historical
+FastGRPO generation/sampler or dependency versions changed. Profiling stays off.
+
+Added buffered `rollout_timing.csv`: one row per executed DataLoader iteration,
+including reward-filtered/no-training/invalid batches, weighted cumulative AAL,
+monotonic iterator state restored from checkpoint, per-rank files without logging
+all-reduce, host-only telemetry snapshot (no retained GPU histories). End-iteration
+wall clock includes setup and checkpoint work. Flush on checkpoint/end/interrupt.
+Existing GRPO-step CSV/JSONL remain; all 14 paired launchers expose projector LR
+and rollout flush interval.
+
+Validation:
+
+- Full suite: **387 passed, 3 skipped, 3 failed**. The three failures are existing
+  `tests/test_requirements.py` references to absent `requirements-bootstrap.txt`,
+  `requirements-external.txt` and `scripts/build_offline_wheelhouse.sh` (also absent
+  in HEAD before these edits). Those obsolete offline-install assets were not
+  fabricated/reintroduced or their tests disabled. No claim of full-suite success.
+- CPU/CUDA static-vs-dynamic rollout equality: generated tokens, histories, RNG,
+  target/draft forward counts, stream0/1. Native Transformers **5.12.1** tiny
+  Qwen2/Qwen3/Llama logits match bitwise on CPU/CUDA, eager and SDPA, including crop.
+  Actual vendored SpecForge EAGLE layer/adapter static vs list cache matches in
+  FP32/BF16 on CPU/CUDA. Teacher permutation/positive ties/zero probability and
+  greedy match reference; no fallback vocabulary extraction invoked in those tests.
+- Sparse/fused/GEMM probability/ID parity, compact scratch reuse, historical golden,
+  selected projector gradient, LR/checkpoint moments, CSV skip/resume/weighted ratios,
+  one scheduling packet/round, compileall, shell syntax, paired CLI dry-run, training
+  source integrity and `git diff --check` checked. `pip check`: no broken requirements
+  in the isolated local validation venv, NOT a production B200 stack certification.
+- Hardware: RTX3090; Python3.10, Torch2.5.1+cu124, Triton3.1. Transformers5.12.1
+  installed only in a temporary system-site-packages venv, not the user's base env.
+  SpecForge tests used a **test-process-only** `torch._dynamo.config.recompile_limit`
+  compatibility alias because Torch2.5 calls it `cache_size_limit`. No production
+  source workaround or dependency downgrade was added. Production pins untouched.
+
+Component measurements are stored in `reports/opd_20261007_rtx3090_proposal.json`:
+synthetic BF16 V32768/H128/rank8, context workloads 1/8/64, active slots
+0/16/256/4096/V, median25 warmed CUDA-event samples per mode. All 15 cases passed
+bitwise proposal parity. This is **not production shape, B200 crossover, AAL, or
+end-to-end speedup evidence**; production tuner requires the actual draft config.
+Only the chosen backend launches; profiler/timer events exist in benchmark code,
+not production proposal dispatch.
+
+Remaining boundaries, explicitly:
+
+- Host sync/verification round: **1 before → 1 after**, plus setup/end-rollout
+  transfers; cannot claim a fully GPU-resident decoder.
+- Teacher full-vocab rescans removed for ordinary full-map sorted-sampler inputs.
+  Positive boundary ties require reading the tied interval (uniform worst case:
+  whole support); subset mappings and unfiltered sampling still use a selected-state
+  compact scan. No extra target softmax/sort/model forward.
+- No full-prefix KV copies on append/accept/crop rounds. Prefill repetition and
+  finished-batch compaction still copy surviving prefixes. Static conservative
+  capacity increases reserved VRAM; production peak memory is not measured here.
+- Small tree native TopK/gather still allocate internal scratch; not zero-allocation.
+  Gradient-A selected reduction changes FP32 association; mathematical semantics
+  preserved/tested with tolerances, universal bitwise trained-trajectory replay
+  across hardware/revisions is not promised.
+- **B200 FastGRPO vs OPD AAL/tokens/s, GPU utilization, long-response memory and
+  crossover remain unmeasured**: B200 and server model/data/checkpoints absent.
+  Run the documented tuner and frozen-rollout sweep before selecting LR/stream or
+  claiming speedup. No full training was launched.
+
+Changed files: `grpo_speculative.py`; `helper/{eagle3_specforge,opd_reflex,
+opd_reflex_kernels,specualtive_generate,tree_verification,opd_scheduling}.py`;
+new `helper/{opd_static_cache,opd_sampling,opd_optimizer,rollout_metrics}.py`;
+`scripts/{tune_opd_proposals.py,tune_opd_proposals.sh,sweep_opd_reflex.sh,
+launch/train_model.sh}`; shared env and 14 `train_*.sh`; OPD/EAGLE fixture/tests;
+run guide, this report, new detailed optimization document and benchmark JSON.
+
+---
+
+# Previous OPD performance revision — 2026-10-07 (historical notes)
 
 This section supersedes the older sparse-only defaults / dual-launch adaptive
 description and historical validation numbers below. Historical FastGRPO's

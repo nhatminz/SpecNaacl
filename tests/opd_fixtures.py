@@ -14,6 +14,8 @@ from helper.rollout_history import RolloutHistory
 from helper.opd_history import ContiguousRolloutHistory
 from helper.tree_verification import pack_tree,trace_verified_path,select_confidence_nodes
 from helper.sampling import build_sampling_probs,sample_from_probs,sample_target_from_logits
+from helper.opd_sampling import sample_target_with_metadata
+from helper.opd_static_cache import OPDStaticCache
 from helper.opd_scheduling import schedule,compact_suffix_inplace
 
 class Cache:
@@ -54,21 +56,26 @@ class TinyModel:
         self.masks.append(attention_mask.clone())
         hidden = self.embedding[input_ids]
         keys = hidden.unsqueeze(1)
-        if past_key_values.layers:
+        if isinstance(past_key_values,OPDStaticCache):
+            keys,_=past_key_values.update(keys,keys.clone(),0)
+        elif past_key_values.layers:
             keys = torch.cat((past_key_values.layers[0].keys, keys), -2)
         visible = (attention_mask[:, 0] == 0).to(self.dtype)
         # Attention depends on ancestry/history, not just current token.
         hidden = hidden + visible.matmul(keys[:, 0]) / visible.sum(-1, keepdim=True).clamp_min(1)
-        past_key_values.layers = [SimpleNamespace(keys=keys, values=keys.clone())]
+        if not isinstance(past_key_values,OPDStaticCache):
+            past_key_values.layers = [SimpleNamespace(keys=keys, values=keys.clone())]
         return SimpleNamespace(last_hidden_state=hidden, past_key_values=past_key_values)
 
     def __call__(self, hidden_states, input_ids, past_key_values=None, **kwargs):
         hidden = (hidden_states + self.embedding[input_ids]) * .5
         keys = hidden.unsqueeze(1)
-        if past_key_values is not None:
+        if isinstance(past_key_values,OPDStaticCache):
+            keys,_=past_key_values.update(keys,keys.clone(),0)
+        elif past_key_values is not None:
             keys = torch.cat((past_key_values[0][0], keys), -2)
         return dict(hidden_states=hidden, next_feature_states=hidden,
-                    past_key_values=[(keys, keys.clone())])
+                    past_key_values=past_key_values if isinstance(past_key_values,OPDStaticCache) else [(keys,keys.clone())])
 
     def compute_compact_logits(self, hidden):
         return self.draft_head(hidden)
@@ -111,13 +118,13 @@ def load_rollout(device='cpu',history_type=None):
             n.args.defaults[1]=ast.Constant(device)
     fns=[n for n in tree.body if isinstance(n,ast.FunctionDef)]
     scope=dict(torch=torch,time=time,math=math,deepcopy=deepcopy,DynamicCache=Cache,
-               OPDReflex=OPDReflex,resolve_method=resolve_method,RolloutHistory=opd_history,
+               OPDStaticCache=OPDStaticCache,OPDReflex=OPDReflex,resolve_method=resolve_method,RolloutHistory=opd_history,
                OPD_COUNTER_NAMES=OPD_COUNTER_NAMES,historical_generate=load_historical(device,historical_history),
                schedule=schedule,compact_suffix_inplace=compact_suffix_inplace,
                pack_tree=pack_tree,trace_verified_path=trace_verified_path,
                select_confidence_nodes=select_confidence_nodes,
                build_sampling_probs=build_sampling_probs,sample_from_probs=sample_from_probs,
-               sample_target_from_logits=sample_target_from_logits)
+               sample_target_from_logits=sample_target_from_logits,sample_target_with_metadata=sample_target_with_metadata)
     exec(compile(ast.fix_missing_locations(ast.Module(body=fns,type_ignores=[])),str(path),'exec'),scope)
     generate=scope['speculative_generate'];generate._test_scope=scope
     return generate

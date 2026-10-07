@@ -74,7 +74,8 @@ def test_sparse_dense_switch_bitwise_logits_probabilities_ids(slots,ties):
         s.proposal_mode=mode
         q,ids,_=s.propose(raw,h,8,mapping)
         results.append((q.clone(),ids.clone()))
-        if slots:scores.append(s.score_workspace[:3*4*257].view(3,4,257)[...,tokens].clone())
+        if slots and mode=='sparse':
+            scores.append(s.sparse_scores[:3*4*s.sparse_capacity].view(3,4,s.sparse_capacity)[...,:slots].clone())
     for result in results[1:]:
         for a,b in zip(results[0],result):assert torch.equal(a,b)
     if slots:
@@ -190,6 +191,8 @@ def test_training_checkpoint_restores_rank_local_pending_projector_gradient(tmp_
         all_gather_object=gather),capture_rng_state=lambda:None,restore_rng_state=lambda x:None,
         _atomic_torch_save=lambda state,path:torch.save(state,path),_prune_checkpoints=lambda *a:None,
         get_peft_model_state_dict=None,set_peft_model_state_dict=None)
+    from helper.opd_optimizer import load_draft_optimizer
+    scope['load_draft_optimizer']=load_draft_optimizer
     source=ast.parse((Path(__file__).parents[1]/'grpo_speculative.py').read_text())
     names={'_target_lora_state_dict','_load_target_lora_state_dict','_gradient_state',
            '_restore_gradient_state','save_training_checkpoint','load_training_checkpoint'}
