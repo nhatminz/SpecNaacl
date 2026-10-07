@@ -10,6 +10,7 @@ import time
 import os
 import torch
 from helper.opd_reflex import OPDReflex,OPD_COUNTER_NAMES
+from helper.shared_rollout import FastGRPORuntime
 from helper.method_config import resolve_method
 from helper.rollout_history import RolloutHistory
 from helper.opd_history import ContiguousRolloutHistory
@@ -129,7 +130,7 @@ def load_rollout(device='cpu',history_type=None,source_path=None):
     fns=[n for n in tree.body if isinstance(n,ast.FunctionDef)]
     scope=dict(torch=torch,time=time,math=math,os=os,deepcopy=deepcopy,DynamicCache=Cache,
                persistent_cache=persistent_cache,swap_remove_plan=swap_remove_plan,PackedTree=PackedTree,VerifiedPath=VerifiedPath,
-               AttentionWorkspace=AttentionWorkspace,OPDStaticCache=OPDStaticCache,OPDReflex=OPDReflex,resolve_method=resolve_method,RolloutHistory=opd_history,
+               AttentionWorkspace=AttentionWorkspace,OPDStaticCache=OPDStaticCache,OPDReflex=OPDReflex,FastGRPORuntime=FastGRPORuntime,resolve_method=resolve_method,RolloutHistory=opd_history,
                OPD_COUNTER_NAMES=OPD_COUNTER_NAMES,historical_generate=load_historical(device,historical_history),
                schedule=schedule,compact_suffix_inplace=compact_suffix_inplace,
                pack_tree=pack_tree,trace_verified_path=trace_verified_path,

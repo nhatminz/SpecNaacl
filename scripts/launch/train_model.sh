@@ -209,6 +209,7 @@ ln -sfn "$RUN_DIR" "$TRAIN_MODEL_ROOT/active_run"
   --item "draft_checkpoint=$DRAFT_CHECKPOINT" --item "draft_config=$DRAFT_CONFIG" \
   --item "vocab_mapping=$VOCAB_MAPPING" --item "target_adapter=$TARGET_ADAPTER" \
   --item "target_lr=$TARGET_LR" --item "draft_lr=$DRAFT_LR" \
+  --item "persistent_draft_objective=fastgrpo_smoothl1_2_ce_0.1" \
   --item "batch_size=$BATCH_SIZE" --item "accumulation_steps=$ACCUMULATION_STEPS" \
   --item "responses_per_prompt=$RESPONSES_PER_PROMPT" --item "temperature=$TEMPERATURE" \
   --item "top_p=$TOP_P" --item "max_length=$GEN_MAX_LENGTH" \

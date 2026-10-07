@@ -14,8 +14,9 @@ export PYTHON_BIN="$(command -v python)"
 export CUDA_VISIBLE_DEVICES=0
 export ATTENTION_IMPLEMENTATION=sdpa # target; eager vẫn override được
 export DATASET=simplelr
-export TARGET_LR=1e-5
-export DRAFT_LR=1e-5
+export TARGET_LR=1e-6
+export DRAFT_LR=1e-4
+export DRAFT_ACCUMULATION_STEPS=1
 export OPD_FAST_LR=0.01   # cũng hỗ trợ FAST_LR nếu OPD_FAST_LR chưa được set
 export BATCH_SIZE=8
 export ACCUMULATION_STEPS=4
@@ -26,7 +27,7 @@ export OPD_VISITED_WEIGHT=1.0
 export OPD_FRONTIER_WEIGHT=1.0
 export OPD_UPDATE_STREAM=1   # B200/Qwen2.5-3B observed fastest; vẫn override được
 export OPD_TRAIN_PROJECTOR=1 # A học tại draft optimizer boundary, không reset
-export OPD_PROJECTOR_LR=1e-5 # để trống để kế thừa draft LR; resume giữ optimizer moments
+export OPD_PROJECTOR_LR="" # optional A LR; empty inherits draft LR, separate from B_fast LR
 export ROLLOUT_LOG_FLUSH_INTERVAL=1 # buffer CSV; tăng lên 8 nếu shared storage chậm
 export OPD_PROPOSAL_MODE=auto
 export OPD_DENSE_IMPLEMENTATION=auto
@@ -159,6 +160,7 @@ bash scripts/sweep_opd_reflex.sh --gpu-utilization
 # Sau khi xem report.json/summary.csv; giữ cả delta AAL âm nếu có.
 CUDA_VISIBLE_DEVICES=0 bash train_qwen3_1p7b.sh
 # Baseline historical, cùng model/data/sampling/training settings:
+# Hiện là shared optimized FastGRPO, giữ historical proposal/RNG semantics.
 CUDA_VISIBLE_DEVICES=0 bash train_qwen3_1p7b_fastgrpo.sh
 ```
 

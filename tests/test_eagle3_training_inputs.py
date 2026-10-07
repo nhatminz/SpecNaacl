@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from helper.eagle3_specforge import rollout_tensor_for_training
+from helper.eagle3_specforge import rollout_tensor_for_training,Eagle3FastGRPOAdapter
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -95,8 +95,11 @@ def cpu_training_model(monkeypatch):
         target.lm_head.weight[0, 0] = 5
     target.requires_grad_(False)
     online = scope["OnlineEagle3Model"](draft, length=7, attention_backend="sdpa")
-    return SimpleNamespace(draft_model=draft, target_model=target,
-                           specforge_training_model=online, device=torch.device("cpu"))
+    model=Eagle3FastGRPOAdapter.__new__(Eagle3FastGRPOAdapter)
+    torch.nn.Module.__init__(model)
+    model.draft_model=draft;model.target_model=target;model.specforge_training_model=online;model.config=cfg
+    model.dtype=torch.float32
+    return model
 
 
 def training_entrypoint():
@@ -143,11 +146,10 @@ def test_rollout_training_matches_normal_inputs_loss_and_gradients(
     model.draft_model.zero_grad(set_to_none=True)
     # Observe actual boundary tensors as well as checking successful backward.
     def check_inputs(module, args, kwargs):
-        for key in ("input_ids", "hidden_states", "target_hidden_for_compact"):
+        for key in ("input_ids", "hidden_states"):
             assert not torch.is_inference(kwargs[key])
             assert not kwargs[key].requires_grad
-        assert kwargs["target_head_weight"] is model.target_model.lm_head.weight
-    hook = model.specforge_training_model.register_forward_pre_hook(check_inputs, with_kwargs=True)
+    hook = model.register_forward_pre_hook(check_inputs, with_kwargs=True)
     try:
         actual = training(model, inference_outputs, prompt_mask, token_budget)
     finally:

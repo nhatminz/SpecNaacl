@@ -57,7 +57,7 @@ def collator(tokenizer,max_prompt_length):
 
 def release_runtime_cache(model):
     # Benchmark boundaries only. Don't charge a previous mode's retained pools.
-    for name in ('_opd_runtime_cache','_opd_tree_mask_workspace','_opd_attention_workspace','_opd_padding_workspace','_opd_kv_scratch','_opd_target_kv_pool','_opd_draft_kv_pool'):
+    for name in ('_opd_runtime_cache','_fastgrpo_runtime','_opd_tree_mask_workspace','_opd_attention_workspace','_opd_padding_workspace','_opd_kv_scratch','_opd_target_kv_pool','_opd_draft_kv_pool'):
         if hasattr(model,name):delattr(model,name)
 
 
@@ -90,16 +90,16 @@ def summarize(rows):
     for mode in ('fused','gemm'):result['opd_'+mode+'_rounds']=result['opd_proposal_mode_'+mode+'_rounds']
     host_syncs=sum(r.get('opd_host_syncs',0) for r in rows)
     batches=sum(r.get('batch_verification_rounds',0) for r in rows)
-    result['host_syncs_per_round']=host_syncs/batches if batches and rows[0].get('method','').startswith('opd_reflex') else None
+    result['host_syncs_per_round']=host_syncs/batches if batches and all('opd_host_syncs' in r for r in rows) else None
     result['kv_cache_bytes']=max(r.get('observed_kv_cache_bytes',0) for r in rows)
     for field in ('full_kv_reallocations','full_history_copies','full_history_copy_bytes','row_compactions','row_compaction_bytes','kv_rows_moved','kv_history_copy_bytes','pool_allocations'):
         result[field]=(sum(r.get('opd_target_'+field,0)+r.get('opd_draft_'+field,0) for r in rows)
-                       if rows[0].get('method','').startswith('opd_reflex') else None)
-    if rows[0].get('method','').startswith('opd_reflex'):
+                       if all('opd_target_'+field in r or 'opd_draft_'+field in r for r in rows) else None)
+    if result['full_kv_reallocations'] is not None:
         result['kv_rows_moved']=sum(max(r.get('opd_target_kv_rows_moved',0),r.get('opd_draft_kv_rows_moved',0)) for r in rows)
         result['kv_reallocations_per_iter']=result['full_kv_reallocations']/len(rows)
-        result['kv_pool_allocations_per_iter']=result['pool_allocations']/len(rows)
-        result['kv_history_copy_bytes_per_iter']=result['kv_history_copy_bytes']/len(rows)
+        result['kv_pool_allocations_per_iter']=result['pool_allocations']/len(rows) if result['pool_allocations'] is not None else None
+        result['kv_history_copy_bytes_per_iter']=result['kv_history_copy_bytes']/len(rows) if result['kv_history_copy_bytes'] is not None else None
         result['kv_rows_moved_per_iter']=result['kv_rows_moved']/len(rows)
     else:
         result.update(kv_reallocations_per_iter=None,kv_pool_allocations_per_iter=None,kv_history_copy_bytes_per_iter=None,kv_rows_moved_per_iter=None)
@@ -253,13 +253,13 @@ def benchmark(args):
             proposal_profile=os.environ.get('OPD_PROPOSAL_PROFILE',''),
             dense_implementation=os.environ.get('OPD_DENSE_IMPLEMENTATION','auto'),
             gpu_utilization_note='Per-configuration nvidia-smi samples when --gpu-utilization is set; includes diagnostic replay if requested.',
-            baseline='historical native torch.topk(draft_k), c3f05ad OFF',
+            baseline='FastGRPO shared optimized infrastructure; historical native torch.topk(draft_k) semantics',
             cold_invariant='B=0 leaves raw logits/distribution unchanged; Top16 tie IDs need not equal historical K',reports=reports,
             fastest_observed=dict(method=best['method'],fast_lr=best['fast_lr'],update_stream=best['update_stream'],
                 delta_aal=best['delta_aal'],tokens_per_s=best['tokens_per_s']),
             recommendation=None if recommendation is None else dict(fast_lr=recommendation['fast_lr'],
                 update_stream=recommendation['update_stream'],delta_aal=recommendation['delta_aal']),
-            note='Historical FastGRPO unchanged, OPD only optimized. Frozen policy/draft/A; no A gradient accumulation in evaluation. Wall includes ALL OPD work. Profiling replay excluded from generation wall. Same seed does not imply same responses.')
+            note='Fair shared cache/memory/tree infrastructure. FastGRPO raw native TopK; OPD correction only. Frozen policy/draft/A, no persistent training or A gradient accumulation in evaluation. Profiling replay excluded from wall. Same seed does not imply same responses.')
         return payload
     finally:
         target_hook.remove();draft_hook.remove()

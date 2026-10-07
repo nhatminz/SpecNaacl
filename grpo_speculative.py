@@ -651,6 +651,7 @@ print(f"B200/spec: dtype={args.dtype}, attn_impl={attn_impl or 'default'}, "
       f"max_draft_len={max_draft_token_length}, max_draft_k={max_draft_k}, "
       f"statistical_time={statistical_time}")
 print(f"Draft: train={is_train_draft}")
+print('Persistent EAGLE3 objective: 2.0*SmoothL1 + 0.1*soft CE; generated positions only; shared by both methods')
 print(f"Method: {method} | OPD: rank={args.opd_rank}, topk={args.opd_topk}, fast_lr={args.opd_fast_lr}, stream={args.opd_update_stream}")
 print(f"Trace: max_new_grpo_steps={max_grpo_steps}, drift_topk={drift_topk}, "
       f"drift_temperature={drift_temperature}, drift_row_chunk={drift_row_chunk_size}")
@@ -684,7 +685,7 @@ if args.draft_backend == 'eagle3':
         lk_loss_type=args.eagle_lk_loss_type or None,
         kl_scale=args.eagle_kl_scale,
         kl_decay=args.eagle_kl_decay,
-        opd_rank=args.opd_rank,
+        opd_rank=args.opd_rank if method=='opd_reflex' else None,
     )
 else:
     # The legacy implementation is not a dependency of the EAGLE-3 backend.
@@ -980,6 +981,7 @@ def training_draft_model(model,outputs,prompt_mask,token_budget=None):
             max_tokens=args.draft_train_max_tokens,
             max_padding_ratio=args.draft_train_max_padding_ratio,
             profile=_as_bool(args.draft_train_profile),
+            accumulation_steps=draft_accumulation_steps,
         )
     
 
@@ -1231,12 +1233,13 @@ def training_draft_model(model,outputs,prompt_mask,token_budget=None):
 
 def training_eagle3_specforge(model, outputs, prompt_mask, token_budget=None,
                               mode='batched', max_batch_size=8, max_tokens=2048,
-                              max_padding_ratio=1.25, profile=False):
-    """Use SpecForge's EAGLE-3 architecture, KL/LK loss and TTT unrolling.
+                              max_padding_ratio=1.25, profile=False, accumulation_steps=1):
+    """Persistent upstream-equivalent FastGRPO objective on the real EAGLE3 model.
 
-    This adapter only packs FastGRPO rollout tensors.  Objective computation and
-    recursive unrolling are performed by ``OnlineEagle3Model.forward``.
+    Inputs are SpecForge 3H features; feature supervision is final target H.
+    Shared by both methods; no OPD A/B objective or SpecForge TTT/LK loss here.
     """
+    from helper.eagle3_online_objective import persistent_loss
     feature_rows = outputs['all_draft_input_states']
     target_rows = outputs.get('all_target_hidden_states')
     token_rows = outputs['all_draft_input_ids']
@@ -1248,6 +1251,7 @@ def training_eagle3_specforge(model, outputs, prompt_mask, token_budget=None,
         raise ValueError('draft train mode must be batched or per_response')
     if max_batch_size < 1 or max_tokens < 1 or max_padding_ratio < 1:
         raise ValueError('draft microbatch limits must be positive and padding ratio >= 1')
+    if accumulation_steps<1:raise ValueError('draft accumulation steps must be positive')
     nrows = len(feature_rows)
     if nrows == 0:
         return 0, 0, 0, 0, 0
@@ -1289,19 +1293,13 @@ def training_eagle3_specforge(model, outputs, prompt_mask, token_budget=None,
         pack_sum += lengths[i]
     if pack:
         packs.append(pack)
-    training_model = model.specforge_training_model
-    target_head = _get_base_causal_lm(model.target_model).lm_head.weight
-    if (hasattr(training_model, 'prepare_compact_teacher_selection') and
-            getattr(training_model, '_compact_selected_ids', None) is None):
-        training_model.prepare_compact_teacher_selection()
+    target_head = _get_base_causal_lm(model.target_model).lm_head
     loss_total = torch.zeros((), device=model.device, dtype=torch.float32)
-    acceptance_total = torch.zeros_like(loss_total)
+    distribution_total = torch.zeros_like(loss_total)
     timing = ({'packs': len(packs), 'responses': len(ordered),
                'bucketing_cpu_ms': (time.perf_counter() - profile_start) * 1000,
                'packing_cpu_ms': 0.0} if profile else None)
     cuda_events = []
-    if profile:
-        training_model._profile_events = []
     for pack in packs:
         packing_start = time.perf_counter() if profile else None
         seq_len = max(lengths[i] for i in pack)
@@ -1329,42 +1327,32 @@ def training_eagle3_specforge(model, outputs, prompt_mask, token_budget=None,
         if profile and torch.cuda.is_available() and model.device.type == 'cuda':
             forward_start = torch.cuda.Event(enable_timing=True)
             forward_start.record()
-        result = training_model(
-            input_ids=ids,
-            attention_mask=attention_mask,
-            target=None,
-            loss_mask=loss_mask,
-            hidden_states=features,
-            target_hidden_for_compact=target_hidden,
-            target_head_weight=target_head,
-            **({'per_sample_loss': True, 'original_lengths': row_lengths}
-               if mode == 'batched' else {}),
-        )
-        plosses, acceptance_rates = result[0], result[1]
-        loss = torch.stack([item.float() for item in plosses]).sum()
+        feature_losses, distribution_losses = persistent_loss(
+            model,ids,features,target_hidden,attention_mask,loss_mask.squeeze(-1),target_head)
+        feature_loss=feature_losses.sum()
+        distribution_loss=distribution_losses.sum()
+        loss=feature_loss+distribution_loss
         if profile and torch.cuda.is_available() and model.device.type == 'cuda':
             forward_end = torch.cuda.Event(enable_timing=True)
             forward_end.record()
             cuda_events.append(('total_forward_ms', forward_start, forward_end))
             backward_start = torch.cuda.Event(enable_timing=True)
             backward_start.record()
-        (loss / nrows).backward()
+        (loss / nrows / accumulation_steps).backward()
         if profile and torch.cuda.is_available() and model.device.type == 'cuda':
             backward_end = torch.cuda.Event(enable_timing=True)
             backward_end.record()
             cuda_events.append(('backward_ms', backward_start, backward_end))
-        loss_total += loss.detach()
-        acceptance_total += torch.stack([item.float() for item in acceptance_rates]).sum().detach()
-    total_loss, total_acceptance = torch.stack((loss_total, acceptance_total)).cpu().tolist()
+        loss_total += feature_loss.detach()
+        distribution_total += distribution_loss.detach()
+    total_feature, total_distribution = torch.stack((loss_total, distribution_total)).cpu().tolist()
     if profile:
-        for label, start, end in cuda_events + training_model._profile_events:
+        for label, start, end in cuda_events:
             timing[label] = timing.get(label, 0.0) + start.elapsed_time(end)
-        training_model._profile_events = None
         model.last_draft_train_profile = timing
     denom = nrows
-    # Keep the legacy return arity. The second field is the SpecForge simulated
-    # acceptance objective; sparse legacy drift metrics are deliberately absent.
-    return total_loss / denom, total_acceptance / denom, 0.0, 0.0, valid_tokens
+    # Legacy arity; now the two upstream weighted draft loss components.
+    return total_feature / denom, total_distribution / denom, 0.0, 0.0, valid_tokens
 
         
 optimizer_target = torch.optim.AdamW(model.target_model.parameters(), lr=target_lr)
@@ -1864,6 +1852,8 @@ for epoch in epoch_bar:
                 draft_train_time_start=time.time()
                 draft_phase_ticket = phase_timings.begin('draft')
                 draft_loss1,draft_loss2,draft_sparse_tv,draft_sparse_kl,draft_sparse_count=training_draft_model(model,outputs,attention_mask)
+                iter_outputs.update(iter_draft_feature_loss=float(draft_loss1),
+                    iter_draft_distribution_loss=float(draft_loss2),iter_draft_total_loss=float(draft_loss1+draft_loss2))
                 if _as_bool(args.draft_train_profile) and is_main_process:
                     with open(log_file, 'a', encoding='utf-8') as profile_stream:
                         profile_stream.write(json.dumps({

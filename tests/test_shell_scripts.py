@@ -23,7 +23,7 @@ def test_paired_model_launchers_only_differ_by_method_and_keep_paths_hyperparame
         args=command(script,RUN_NAME='paired',RUN_DIR=str(tmp_path/'paired'))
         flags=dict(zip(args[args.index('--method')::2],args[args.index('--method')+1::2]))
         assert flags.pop('--method')==method
-        for flag,value in (('--target_lr','1e-5'),('--draft_lr','1e-5'),('--batch_size','8'),
+        for flag,value in (('--target_lr','1e-6'),('--draft_lr','1e-4'),('--draft_accumulation_steps','1'),('--batch_size','8'),
                            ('--accumulation_steps','4'),('--repeated_generate_nums','8'),
                            ('--opd_rank','8'),('--opd_topk','16'),('--opd_fast_lr','0.01'),
                            ('--opd_update_stream','1'),('--opd_profile','0'),('--opd_diagnostics','0'),

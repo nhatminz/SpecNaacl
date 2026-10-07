@@ -280,3 +280,60 @@ def test_before_after_benchmark_driver_smoke_with_real_tiny_models(tiny_adapter,
     assert after['kv_reallocations_per_iter']==0
     assert after['tokens_per_s']>0 and after['peak_allocated_bytes']>0
     assert result['fastest_observed']['method']=='opd_reflex'
+
+
+def test_fastgrpo_adapter_has_no_projector_and_keeps_checkpoint_format(tmp_path,monkeypatch):
+    from transformers import LlamaConfig,Qwen2Config,Qwen2ForCausalLM
+    from specforge.modeling.draft import llama3_eagle as eagle
+    for cls in (eagle.LlamaRMSNorm,eagle.LlamaRotaryEmbedding):
+        monkeypatch.setattr(cls,'forward',cls.forward._torchdynamo_orig_callable)
+    monkeypatch.setattr(eagle,'apply_rotary_pos_emb',eagle.apply_rotary_pos_emb._torchdynamo_orig_callable)
+    config=LlamaConfig(hidden_size=16,intermediate_size=32,num_attention_heads=4,
+        num_key_value_heads=2,head_dim=4,num_hidden_layers=1,vocab_size=32,draft_vocab_size=16,
+        target_hidden_size=16,pretraining_tp=1,tie_word_embeddings=False,architectures=['LlamaForCausalLMEagle3'])
+    path=tmp_path/'config.json';config.to_json_file(path)
+    mapping=tmp_path/'mapping.pt'
+    torch.save(dict(d2t=torch.zeros(16,dtype=torch.long),t2d=torch.arange(32)<16),mapping)
+    target=Qwen2ForCausalLM(Qwen2Config(vocab_size=32,hidden_size=16,intermediate_size=32,
+        num_hidden_layers=2,num_attention_heads=4,num_key_value_heads=2,head_dim=4))
+    adapter=Eagle3FastGRPOAdapter(target,str(path),vocab_mapping=str(mapping),
+        initialization_mode='random',feature_layers=[0,0,1],opd_rank=None)
+    assert adapter.opd_projector is None
+    assert not any('opd_projector' in name for name,_ in adapter.draft_model.named_parameters())
+    checkpoint=tmp_path/'draft.pt';adapter.save_model(checkpoint)
+    saved=torch.load(checkpoint,weights_only=True)
+    assert saved['format']=='specforge_eagle3_fastgrpo_v1'
+    assert saved['opd_projector'] is None
+    adapter.load_model(checkpoint)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(),reason='actual historical/shared GPU EAGLE3 parity')
+def test_actual_eagle_fastgrpo_shared_rollout_preserves_historical_rng_and_tokens(tiny_adapter):
+    from types import SimpleNamespace
+    from transformers import Qwen2Config,Qwen2ForCausalLM
+    from helper.eagle3_specforge import _TargetVocabHead
+    from helper.historical_fastgrpo import speculative_generate as historical
+    from helper.specualtive_generate import speculative_generate as shared
+    adapter=tiny_adapter.cuda().to(torch.bfloat16);adapter.dtype=torch.bfloat16
+    cfg=Qwen2Config(vocab_size=32,hidden_size=16,intermediate_size=32,num_hidden_layers=2,
+        num_attention_heads=4,num_key_value_heads=2,head_dim=4)
+    cfg._attn_implementation='sdpa'
+    adapter.target_model=Qwen2ForCausalLM(cfg).cuda().to(torch.bfloat16).eval()
+    adapter.target_model._fastgrpo_eagle3_capture_layers=[0,0,1]
+    adapter.lm_head=_TargetVocabHead(adapter.draft_model);adapter.draft_model.d2t.zero_()
+    results=[]
+    for old in (True,False):
+        torch.manual_seed(71)
+        kwargs={} if old else dict(method='fastgrpo')
+        with torch.inference_mode():
+            output=(historical if old else shared)(adapter,torch.tensor([[1,2,3],[3,4,5]],device='cuda'),
+                torch.ones(2,3,dtype=torch.long,device='cuda'),SimpleNamespace(eos_token_id=31),
+                do_sample=True,repeated_generate_nums=2,max_length=24,verification_capacity=24,
+                max_draft_k=2,max_draft_token_length=2,min_draft_token_length=2,max_verification_num=8,
+                return_all_draft_input=True,**kwargs)
+        results.append((output,torch.cuda.get_rng_state()))
+    assert torch.equal(results[0][1],results[1][1])
+    for key in ('generated_token_ids','total_acc_length','total_decoded_token_num'):
+        assert results[0][0][key]==results[1][0][key]
+    for key in ('all_draft_input_states','all_target_hidden_states','all_draft_input_ids'):
+        for a,b in zip(results[0][0][key],results[1][0][key]):torch.testing.assert_close(a,b,rtol=0,atol=0)

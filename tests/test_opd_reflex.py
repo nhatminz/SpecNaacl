@@ -6,7 +6,7 @@ import pytest
 import torch
 from helper.opd_reflex import OPDReflex,initialize_projector,select_states_reference,union_reference
 from helper.tree_verification import PackedTree,VerifiedPath
-from opd_fixtures import CountModel,load_rollout
+from opd_fixtures import CountModel,load_rollout,load_historical
 
 DEVICES=['cpu']+(['cuda:0'] if torch.cuda.is_available() else [])
 
@@ -213,5 +213,13 @@ def test_rollout_zero_state_identity_histories_rng_forwards_and_positive_lifecyc
         golden=next(x for x in json.loads((Path(__file__).parent/'fastgrpo_golden.json').read_text()) if x['sample']==sample)
         assert off[0]['generated_token_ids']==golden['tokens']
         assert off[1].calls==golden['target_calls'] and off[1].draft_calls==golden['draft_calls']
-        assert digest(off[1].masks)==golden['masks_sha']
+        torch.manual_seed(411);historical_model=CountModel(device)
+        reference=load_historical(device)(historical_model,ids,mask,SimpleNamespace(eos_token_id=16),
+            do_sample=sample,repeated_generate_nums=8,max_length=22,verification_capacity=80,
+            max_verification_num=16,max_draft_k=3,max_draft_token_length=3,min_draft_token_length=2,
+            return_all_draft_input=True)
+        assert digest(historical_model.masks)==golden['masks_sha']
+        assert torch.equal(torch.random.get_rng_state(),off[2])
+        for a,b in zip(historical_model.masks,off[1].masks):
+            assert sorted(digest([row]) for row in a)==sorted(digest([row]) for row in b)
         for key,value in golden['history_sha'].items():assert digest(off[0][key])==value

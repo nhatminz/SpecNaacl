@@ -9,6 +9,7 @@ OPD_FIELDS=('kl','selected_states','visited_states','frontier_states',
 KV_FIELDS=('iter_host_syncs','iter_host_syncs_per_round','iter_kv_cache_bytes',
            'iter_kv_full_reallocations','iter_kv_full_history_copies','iter_kv_history_copy_bytes','iter_kv_rows_moved','iter_kv_pool_allocations')
 FIELDS=('global_iter','epoch','batch_iter','method','grpo_step','used_items','eligible_prompts','total_prompts',
+    'iter_draft_feature_loss','iter_draft_distribution_loss','iter_draft_total_loss',
     'iter_aal','cumulative_aal','iter_generation_time_s','cumulative_generation_time_s','cumulative_wall_time_s',
     'iter_rollout_tokens','cumulative_rollout_tokens','iter_verification_rounds','cumulative_verification_rounds',
     'iter_acceptance_rate','cumulative_acceptance_rate')+tuple('iter_opd_'+s for s in OPD_FIELDS)+KV_FIELDS
@@ -78,9 +79,11 @@ class RolloutMetricsWriter:
             iter_verification_rounds=values['rounds'],cumulative_verification_rounds=self.state['rounds'],
             iter_acceptance_rate=ratio(values['accepted_draft'],values['proposed']),
             cumulative_acceptance_rate=ratio(self.state['accepted_draft'],self.state['proposed']))
+        for name in ('feature','distribution','total'):
+            row['iter_draft_'+name+'_loss']=o.get('iter_draft_'+name+'_loss','')
         for field in OPD_FIELDS:row['iter_opd_'+field]=0.
         for field in KV_FIELDS:row[field]=''
-        if self.method=='opd_reflex':
+        if self.method in ('fastgrpo','opd_reflex'):
             row['iter_host_syncs']=o.get('opd_host_syncs',0)
             row['iter_host_syncs_per_round']=o.get('opd_host_syncs_per_round',0)
             row['iter_kv_cache_bytes']=sum(o.get('opd_'+side+'_kv_cache_bytes',0) for side in ('target','draft'))

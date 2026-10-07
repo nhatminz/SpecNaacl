@@ -1,3 +1,82 @@
+# Fair persistent training and shared execution (2026-10-07)
+
+This revision supersedes older "historical timing baseline / OPD-only infrastructure"
+and persistent SpecForge TTT/KL/LK descriptions below. Scope is the requested shared
+training regime and generic execution infrastructure, not new proposal optimizations.
+
+Objective before: SpecForge OnlineEagle3Model TTT/unrolled KL/LK, with simulated
+acceptance returned in the second legacy loss slot. Objective now, BOTH methods:
+`2*SmoothL1(next_feature[:-1], final_target_H[1:]) + 0.1*soft-label CE`.
+EAGLE3 inputs remain original three-layer3H features, but prediction/feature labels
+are H, using the saved final target hidden state rather than comparing H against3H.
+Prompt/padding excluded; mean hidden-dimension feature error and valid-generated
+position normalization per response, then response averaging as upstream local
+FastGRPO implementation. Distribution uses detached full teacher softmax, existing
+fixed compact-to-target mapping, compact mass renormalization and student FP32
+log_softmax. Head work chunked only at supervised positions, no target-transformer
+forward. No OPD A/B terms enter persistent loss. SpecForge architecture/weights and
+pretraining remain unchanged; online persistent TTT is replaced by teacher forcing
+because additional unrolled objectives would not equal the requested upstream loss.
+Checkpoint format remains specforge_eagle3_fastgrpo_v1; optional A is absent/off
+for FastGRPO and preserved for OPD. Existing pretrained weights remain loadable.
+
+Defaults: paired/generic launchers target/draft **1e-5/1e-5 → 1e-6/1e-4**;
+common draft LR **1e-6 → 1e-4**; parser already had1e-6/1e-4 and is verified.
+Draft accumulation default1 everywhere; OPD_FAST_LR0.01 unchanged and not confused
+with persistent draft LR. All env/CLI overrides retained; no dataset/model/path changes.
+
+Execution: BOTH modes now use the same speculative_generate loop, persistent /
+growable target+draft KV, minimal-move remap with canonical sampler ordering,
+reused attention/position/tree/path/scheduling buffers, contiguous history and
+accepted-suffix in-place compaction. Tree buffer allocation extracted once into
+helper/shared_rollout.py and used by both runtimes; contiguous confidence prefix
+view preserves native historical confidence-TopK input strides without copies.
+FastGRPORuntime proposes raw FP32 softmax + native torch.topk(exact draft_k), and
+retains historical native confidence TopK. OPD keeps its previous Top16/correction
+and tied-candidate/parent-closure semantics; they are NOT imposed on FastGRPO.
+Same budget/adaptive configuration and unchanged sample-once verifier. No extra
+target/draft transformer forward. Frozen historical implementation retained only
+as external correctness reference, not the default benchmark timing baseline.
+
+FastGRPO constructs no OPD runtime, A/B, teacher Top16/union, correction dispatcher,
+KL/update stream. Training constructs its EAGLE adapter with opd_rank=None, so even
+unused A parameters/grad buffers are absent. Shared code never calls OPD teacher
+capture in baseline mode. OPD B/A objective and update code/stream behavior unchanged.
+
+Added rollout CSV fields for both modes: iter_draft_feature_loss,
+iter_draft_distribution_loss, iter_draft_total_loss. These are weighted2.0/0.1
+components and their sum, not simulated acceptance. Existing scalar loss transfer
+is reused; no logging synchronization. Shared KV/host counters and benchmark labels
+now describe fair shared baseline, not old unoptimized historical timing.
+
+Validation: **501 passed, 3 skipped, 3 failed** in the full local suite; targeted
+benchmark/launcher tests also pass after summary-counter compatibility adjustment.
+Failures are unchanged missing offline-install assets (requirements-bootstrap.txt,
+requirements-external.txt, scripts/build_offline_wheelhouse.sh), not hidden/disabled.
+Direct formula/compact support/masks/gradients tested against independent reference;
+no teacher gradients. Ragged batched vs per-response actual EAGLE training, inference
+tensor conversion, all14 paired launcher defaults/overrides, actual adapter no-A /
+checkpoint roundtrip pass. Historical/shared FastGRPO tokens, RNG, accepted counters
+and original-order feature histories match on CPU/CUDA and native tiny Qwen2 +
+real vendored EAGLE3. Physical row-order differences from swap-remove are validated
+with per-row tree-mask equality, not mistaken for topology changes. No extra model
+forward tests and cold OPD distribution invariants preserved. Compileall, shell
+syntax, source check, diff check and isolated pip check pass. Local hardware remains
+RTX3090/Torch2.5.1+cu124/Triton3.1/native HF5.12.1 with the previously documented
+test-process-only Dynamo alias. No production dependency changes/certification or
+full B200 training/benchmark claim.
+
+Changed files: new helper/{shared_rollout,eagle3_online_objective}.py;
+grpo_speculative.py; helper/{specualtive_generate,opd_reflex,opd_scheduling,
+eagle3_specforge,rollout_metrics}.py; shared B200 env and all14 train wrappers;
+scripts/{run_fastgrpo_fair,run_opd_reflex,benchmark_online_draft_training}.sh,
+scripts/{benchmark_opd_reflex,check_training_sources}.py, launch/train_model.sh;
+fairness/EAGLE/shell/import fixture tests; README, run guide and this report.
+No edits to historical_fastgrpo.py, target sampling, verifier, OPD feedback/correction
+kernels, reward/GRPO objective, pretraining code/dependencies or sibling repositories.
+
+---
+
 # Last three OPD bottlenecks — minimal moves / persistent KV / compact teacher (2026-10-07)
 
 Current commands/details: [OPD_MEMORY_LAST_THREE.md](OPD_MEMORY_LAST_THREE.md).

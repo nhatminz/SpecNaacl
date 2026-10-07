@@ -33,11 +33,16 @@ def test_dispatch_historical_fastgrpo_unchanged_exact_k_no_opd(monkeypatch,devic
         assert results[0][0][field]==results[1][0][field]
     assert results[0][1].draft_calls==results[1][1].draft_calls
     assert results[0][1].calls==results[1][1].calls
-    for a,b in zip(results[0][1].masks,results[1][1].masks):assert torch.equal(a,b)
+    for a,b in zip(results[0][1].masks,results[1][1].masks):
+        # Physical swap-remove row order may differ; per-response trees/masks
+        # and returned original-order histories must remain identical.
+        assert sorted(digest([row]) for row in a)==sorted(digest([row]) for row in b)
+    for key in ('all_draft_input_states','all_target_hidden_states','all_draft_input_ids'):
+        for a,b in zip(results[0][0][key],results[1][0][key]):assert torch.equal(a,b)
     if device=='cpu':
         gold=next(x for x in json.loads((Path(__file__).parent/'fastgrpo_golden.json').read_text()) if x['sample']==sample)
         assert results[1][0]['generated_token_ids']==gold['tokens']
-        assert digest(results[1][1].masks)==gold['masks_sha']
+        assert digest(results[0][1].masks)==gold['masks_sha'] # untouched historical oracle
 
 @pytest.mark.parametrize('device',DEVICES)
 @pytest.mark.parametrize('nonzero',[1,3,8])

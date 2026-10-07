@@ -8,7 +8,7 @@ BENCHMARK_ROOT="${BENCHMARK_ROOT:-$REPO_DIR/outputs/benchmarks/online_draft_$(da
 [[ "$BENCHMARK_STEPS" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: BENCHMARK_STEPS must be positive" >&2; exit 2; }
 [[ ! -e "$BENCHMARK_ROOT" ]] || { echo "ERROR: use a new BENCHMARK_ROOT" >&2; exit 2; }
 export MODEL_KEY BATCH_SIZE="${BATCH_SIZE:-8}" RESPONSES_PER_PROMPT="${RESPONSES_PER_PROMPT:-${REPEATED_GENERATE_NUMS:-8}}"
-export TARGET_LR="${TARGET_LR:-1e-5}" DRAFT_LR="${DRAFT_LR:-1e-5}" ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-4}"
+export TARGET_LR="${TARGET_LR:-1e-6}" DRAFT_LR="${DRAFT_LR:-1e-4}" ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-4}"
 export DATASET="${DATASET:-dapo}" RESUME="" REFLEX_PROFILE=0 REFLEX_DIAGNOSTICS=0
 for draft_mode in per_response batched; do
   env METHOD=fastgrpo DRAFT_TRAIN_MODE="$draft_mode" RUN_NAME="draft_${draft_mode}" \

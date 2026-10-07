@@ -15,6 +15,7 @@ import warnings
 from pathlib import Path
 import torch
 from helper.opd_attention import AttentionWorkspace
+from helper.shared_rollout import allocate_tree_buffers
 from helper.opd_profiles import execution_key,fingerprint,discover_profile,validate_profile
 
 OPD_COUNTER_NAMES=(
@@ -215,24 +216,7 @@ class OPDReflex:
             self.max_feedback_rows=max_nodes
             tiles=(v+255)//256+1
             self.proposal_tiles=[alloc(batch*max_proposal_contexts*tiles*(k if i>=2 else 1),torch.long if i==3 else torch.float32) for i in range(4)] if self.backend=='triton' else []
-            self.path_workspace=[alloc((batch,max_path),torch.long) for _ in range(3)]+[alloc(batch,torch.long)]
-            self.padded_path_workspace=[alloc((batch,max_path),torch.bool if i==2 else torch.long) for i in range(3)]+[alloc((batch,1),torch.long)]
-            self.scheduling_packet=alloc((batch,max_path+4),torch.long)
-            # Small tree-only lexicographic keys, reused even as the batch shrinks.
-            full_nodes=max_proposal_contexts * max_contexts
-            self.tree_buffers={name:alloc((batch,full_nodes),torch.float32 if name=='confidence' else torch.long)
-                for name in ('parents','contexts','tokens','positions','confidence')}
-            self.tree_arange=torch.arange(full_nodes+1,device=device,dtype=torch.long)
-            self.tree_seen=[alloc((batch,max_proposal_contexts,max_path),torch.long) for _ in range(2)]
-            self.tree_positions=alloc((batch,max_proposal_contexts),torch.long)
-            self.tree_branch_confidence=alloc((batch,max_proposal_contexts,max_proposal_contexts))
-            self.tree_top_values=alloc((batch,max_proposal_contexts))
-            self.tree_top_indices=alloc((batch,max_proposal_contexts),torch.long)
-            self.pack_workspace=[alloc(batch*(full_nodes+1),torch.long) for _ in range(4)]
-            self.confidence_key_workspace=alloc(batch*full_nodes,torch.int64)
-            # Root probabilities outlive the next propose(), whose outputs are
-            # views of shared scratch. Keep only B*K values, not all logits.
-            self.tree_root_confidences=alloc((batch,max_proposal_contexts))
+            allocate_tree_buffers(self,alloc,batch,max_contexts,max_path,max_proposal_contexts)
             if self.enabled:
                 self.head_cache=alloc((batch,max_contexts,hidden_size),self.head.weight.dtype)
                 self.u_cache=alloc((batch,max_contexts,self.rank))

@@ -72,6 +72,7 @@ def selection_scope(backend):
         "target_model": object(), "adapter_path": "pretrained-checkpoint",
         "Eagle3FastGRPOAdapter": mock.Mock(), "config": SimpleNamespace(),
         "model_torch_dtype": "bf16",
+        "method":"opd_reflex",
     }
 
 

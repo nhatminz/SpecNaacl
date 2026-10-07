@@ -1,4 +1,4 @@
-"""Optimized OPD EAGLE3 rollout; OFF dispatches to frozen historical FastGRPO."""
+"""Shared EAGLE3 rollout infrastructure; native FastGRPO or OPD-only proposal."""
 import torch
 import math
 import time
@@ -7,6 +7,7 @@ from transformers import DynamicCache
 from helper.tree_verification import pack_tree, trace_verified_path, select_confidence_nodes, PackedTree, VerifiedPath
 from helper.opd_history import ContiguousRolloutHistory as RolloutHistory
 from helper.opd_reflex import OPDReflex
+from helper.shared_rollout import FastGRPORuntime
 from helper.method_config import resolve_method
 from helper.historical_fastgrpo import speculative_generate as historical_generate
 from helper.opd_reflex import OPD_COUNTER_NAMES
@@ -107,17 +108,6 @@ def get_adaptive_hyperparameters(bsz, verification_capacity, max_draft_token_len
 @torch.inference_mode()
 def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=False, repeated_generate_nums=None, temperature=0.8, top_p=0.9, top_k=None, verification_capacity=160, max_draft_token_length=5, max_draft_k=8, max_verification_num=160, min_draft_token_length=3, draft_token_length_c=0.75, statistical_time=False, return_all_draft_input=False, max_length=2048, method='fastgrpo', opd_rank=8, opd_topk=16, opd_fast_lr=0.01, opd_visited_weight=1.0, opd_frontier_weight=1.0, opd_update_stream=True, opd_profile=False, opd_diagnostics=False, opd_backend='auto', opd_train_projector=False, kv_gather_strategy='stacked'):
     (method, _) = resolve_method(method)
-    if method=='fastgrpo':
-        result=historical_generate(model,input_ids,attention_mask,tokenizer,
-            do_sample=do_sample,repeated_generate_nums=repeated_generate_nums,temperature=temperature,
-            top_p=top_p,top_k=top_k,verification_capacity=verification_capacity,
-            max_draft_token_length=max_draft_token_length,max_draft_k=max_draft_k,max_verification_num=max_verification_num,
-            min_draft_token_length=min_draft_token_length,draft_token_length_c=draft_token_length_c,
-            statistical_time=statistical_time,return_all_draft_input=return_all_draft_input,max_length=max_length,
-            kv_gather_strategy=kv_gather_strategy)
-        result.update({name:0. for name in OPD_COUNTER_NAMES})
-        result.update(opd_backend='off',opd_profile_time_ms=0.,opd_profile_sections_ms=None)
-        return result
     if not getattr(model, 'is_eagle3_specforge', False):
         raise ValueError('Both fair modes require the real SpecForge EAGLE-3 backend')
     if kv_gather_strategy not in {'stacked', 'per_layer'}:
@@ -138,7 +128,10 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
         beam_node_ids=opd.tree_arange[:draft_k].expand(bsz,-1)
         total_input_ids=opd.tree_buffers['tokens'][:bsz,:node_nums]
         total_position_ids=opd.tree_buffers['positions'][:bsz,:node_nums]
-        confidences=opd.tree_buffers['confidence'][:bsz,:node_nums]
+        # Historical confidence TopK consumed a contiguous concatenated matrix.
+        # Use a flat-prefix view in BOTH modes, preserving its stride/tie path
+        # without allocating/copying confidence history each round.
+        confidences=opd.tree_buffers['confidence'].view(-1)[:bsz*node_nums].view(bsz,node_nums)
         draft_position_ids = opd.tree_positions[:bsz,:draft_k]
         draft_position_ids.copy_(past_position_ids_tensor[:,None])
         total_position_ids[:,:draft_k].copy_(draft_position_ids)
@@ -226,9 +219,12 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
             seen_pool,seen_scratch=seen_scratch,seen_pool
             attention_seen_indices=seen_pool[:bsz,:draft_k,:idx_token+1]
         draft_total_token = min(int(draft_total_token), int(confidences.shape[-1]))
-        chosen_index = select_confidence_nodes(
-            confidences, draft_total_token, kernels=opd._kernels,
-            workspace=opd.confidence_key_workspace)
+        if enabled:
+            chosen_index = select_confidence_nodes(confidences,draft_total_token,
+                kernels=opd._kernels,workspace=opd.confidence_key_workspace)
+        else:
+            # Historical confidence selection AND tied-token semantics retained.
+            chosen_index=torch.topk(confidences,k=draft_total_token,dim=-1).indices.sort(dim=-1).values
         tensor_tree = pack_tree(full_parents, full_contexts, chosen_index, total_input_ids, draft_token_length,workspace=opd.pack_workspace)
         if hasattr(draft_past_key_values_tree,'crop'):draft_past_key_values_tree.crop(init_kv_len)
         return {'trees': [], 'trees_chosen_index': None, 'tensor_tree': tensor_tree, 'next_token_trees': total_input_ids.gather(1, chosen_index), 'target_position_ids': total_position_ids.gather(1, chosen_index)}
@@ -401,17 +397,19 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
     response_verification_rounds = [0 for _ in range(bsz)]
     if getattr(model, 'is_eagle3_specforge', False):
         compact_to_target = model.compact_to_target_ids(device=draft_hidden_states.device)
-    cache = getattr(model, '_opd_runtime_cache', None)
-    if cache is None:
-        cache = {}
-        model._opd_runtime_cache = cache
-    key = (enabled, opd_rank, opd_topk, opd_fast_lr, opd_visited_weight, opd_frontier_weight, opd_profile, opd_diagnostics, opd_backend,opd_train_projector)
-    opd = cache.get(key)
-    if opd is None:
-        cache.clear()
-        opd=OPDReflex(opd_rank,opd_topk,opd_fast_lr,opd_visited_weight,opd_frontier_weight,
-                     opd_profile,opd_diagnostics,enabled,opd_backend,opd_train_projector)
-        cache[key]=opd
+    if enabled:
+        cache = getattr(model, '_opd_runtime_cache', None)
+        if cache is None:cache={};model._opd_runtime_cache=cache
+        key=(enabled,opd_rank,opd_topk,opd_fast_lr,opd_visited_weight,opd_frontier_weight,opd_profile,opd_diagnostics,opd_backend,opd_train_projector)
+        opd=cache.get(key)
+        if opd is None:
+            cache.clear()
+            opd=OPDReflex(opd_rank,opd_topk,opd_fast_lr,opd_visited_weight,opd_frontier_weight,
+                         opd_profile,opd_diagnostics,enabled,opd_backend,opd_train_projector)
+            cache[key]=opd
+    else:
+        opd=getattr(model,'_fastgrpo_runtime',None)
+        if opd is None:opd=FastGRPORuntime();model._fastgrpo_runtime=opd
     opd.start(model, bsz, compact_to_target, draft_hidden_states.shape[-1], max_contexts=1 + max_draft_k * (max_draft_token_length - 1), max_nodes=max(verification_capacity+bsz,2*bsz), max_path=max_draft_token_length + 1, max_proposal_contexts=max_draft_k)
     opd.async_updates=update_stream is not None
     mask_columns_capacity = input_ids.shape[-1] + max_length * (max_draft_token_length + 1) + max_verification_num
@@ -448,7 +446,9 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
         feedback_path=trace_verified_path(feedback_tree,tokens,eos_token_id,kernels=opd._kernels,workspace=opd.path_workspace)
         path=feedback_path if physical_to_canonical is None else VerifiedPath(
             *[x.index_select(0,physical_to_canonical) for x in (feedback_path.tokens,feedback_path.packed_indices,feedback_path.feedback_contexts,feedback_path.lengths)])
-        return opd.prepare_compact_teacher(feedback_tree,feedback_path,probs if do_sample else tokens,sorted_metadata,greedy=not do_sample)
+        if enabled:
+            return opd.prepare_compact_teacher(feedback_tree,feedback_path,probs if do_sample else tokens,sorted_metadata,greedy=not do_sample)
+        return None
     for token_num in range(1, max_length):
         past_kv_len = _cache_seq_length(target_past_key_values)
         kv_length = past_kv_len + draft_total_token + 1
@@ -717,6 +717,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
     opd.clear()
     result = {'generated_token_ids': filtered_generated_token_ids, 'max_sequence_length': max_sequence_length, 'total_acc_length': avg_acc_length[0], 'total_acc': max_sequence_length / token_num, 'total_decoded_token_num': avg_acc_length[1], 'total_accepted_draft_tokens': total_accepted_draft_tokens, 'total_proposed_draft_tokens': total_proposed_draft_tokens, 'total_accepted_medusa_tokens': total_accepted_draft_tokens, 'total_proposed_medusa_tokens': total_proposed_draft_tokens, 'draft_acceptance_rate': draft_acceptance_rate, 'medusa_acceptance_rate': draft_acceptance_rate, 'total_time_cost': time.perf_counter() - start_time, 'target_time_cost': total_target_time, 'draft_time_cost': total_draft_time, 'check_time_cost': total_check_time, 'prefill_time_cost': total_prefill_time, 'post_time_cost': time.time() - post_time_start, 'all_draft_input_states': all_draft_input_states, 'all_target_hidden_states': all_target_hidden_states, 'all_draft_input_ids': all_draft_input_ids, 'response_accepted_length_sum': response_accepted_length_sum, 'response_verification_rounds': response_verification_rounds, 'response_generated_tokens': [len(item) for item in filtered_generated_token_ids], 'batch_verification_rounds': verification_batches, 'verification_batches': verification_batches, 'active_response_rounds': active_response_rounds, 'verified_tree_nodes': verified_tree_nodes}
     result.update(opd_statistics)
+    if not enabled:result.update({name:0. for name in OPD_COUNTER_NAMES})
     result['opd_host_syncs']=opd.host_sync_count
     result['opd_host_syncs_per_round']=opd.host_sync_count/max(verification_batches,1)
     if static_kv:
