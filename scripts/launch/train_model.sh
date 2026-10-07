@@ -16,6 +16,7 @@ export OPD_PROJECTOR_LR="${OPD_PROJECTOR_LR:-}"
 export OPD_PROPOSAL_PROFILE="${OPD_PROPOSAL_PROFILE:-}"
 export OPD_PROPOSAL_MODE="${OPD_PROPOSAL_MODE:-auto}"
 export OPD_DENSE_IMPLEMENTATION="${OPD_DENSE_IMPLEMENTATION:-auto}"
+export OPD_AUTO_TUNE_IF_MISSING="${OPD_AUTO_TUNE_IF_MISSING:-0}"
 if [[ ! "$ROLLOUT_LOG_FLUSH_INTERVAL" =~ ^0*[1-9][0-9]*$ ]]; then
   echo "ERROR: ROLLOUT_LOG_FLUSH_INTERVAL must be a positive integer; got: $ROLLOUT_LOG_FLUSH_INTERVAL" >&2
   exit 2
@@ -54,10 +55,7 @@ DRAFT_CHECKPOINT="${DRAFT_CHECKPOINT:-$PRETRAIN_MODEL_ROOT/latest_checkpoint}"
 DRAFT_CONFIG="${DRAFT_CONFIG:-$PRETRAIN_MODEL_ROOT/latest_draft_config.json}"
 VOCAB_MAPPING="${VOCAB_MAPPING:-$PRETRAIN_MODEL_ROOT/latest_vocab_mapping.pt}"
 DRAFT_INITIALIZATION_MODE="${DRAFT_INITIALIZATION_MODE:-pretrained}"
-if [[ "$METHOD" == opd_reflex && -z "$OPD_PROPOSAL_PROFILE" ]]; then
-  default_profile="$OUTPUT_ROOT/benchmarks/opd_proposals/$MODEL_KEY.json"
-  if [[ -f "$default_profile" ]]; then export OPD_PROPOSAL_PROFILE="$default_profile"; fi
-fi
+export OPD_PROPOSAL_PROFILE_DIR="${OPD_PROPOSAL_PROFILE_DIR:-$OUTPUT_ROOT/benchmarks/opd_proposals}"
 
 TRAIN_MODEL_ROOT="${TRAIN_MODEL_ROOT:-$OUTPUT_ROOT/train/$MODEL_KEY}"
 REQUESTED_RUN_DIR="${RUN_DIR:-}"
@@ -186,6 +184,17 @@ export PYTHONPATH="$PROJECT_DIR:$PROJECT_DIR/third_party/SpecForge${PYTHONPATH:+
 "$PYTHON_BIN" "$PROJECT_DIR/scripts/validate_environment.py" \
   --requirements "$PROJECT_DIR/requirements.txt" --require-cuda
 
+if [[ "$METHOD" == opd_reflex && "$OPD_PROPOSAL_MODE" == auto && "$DRAFT_INITIALIZATION_MODE" == pretrained ]];then
+  OPD_PROPOSAL_PROFILE="$("$PYTHON_BIN" "$PROJECT_DIR/scripts/resolve_opd_profile.py" \
+    --draft-config "$DRAFT_CONFIG" --draft-checkpoint "$DRAFT_CHECKPOINT" --vocab-mapping "$VOCAB_MAPPING" \
+    --profile-dir "$OPD_PROPOSAL_PROFILE_DIR" --profile "$OPD_PROPOSAL_PROFILE" \
+    --rank "$OPD_RANK" --dtype "$MODEL_DTYPE" --topk "$OPD_TOPK" \
+    --auto-tune "$OPD_AUTO_TUNE_IF_MISSING" --batch-size "$BATCH_SIZE" \
+    --responses "$RESPONSES_PER_PROMPT" --max-draft-k "$MAX_DRAFT_K" \
+    --iterations "${OPD_TUNE_ITERATIONS:-30}")"
+  export OPD_PROPOSAL_PROFILE
+fi
+
 mkdir -p "$LOG_DIR" "$CHECKPOINT_DIR" "$RUN_DIR/statistics"
 mkdir -p "$TRAIN_MODEL_ROOT"
 ln -sfn "$RUN_DIR" "$TRAIN_MODEL_ROOT/active_run"
@@ -208,6 +217,7 @@ ln -sfn "$RUN_DIR" "$TRAIN_MODEL_ROOT/active_run"
   --item "opd_train_projector=$OPD_TRAIN_PROJECTOR" --item "opd_proposal_mode=$OPD_PROPOSAL_MODE" \
   --item "opd_dense_implementation=$OPD_DENSE_IMPLEMENTATION" \
   --item "opd_proposal_profile=$OPD_PROPOSAL_PROFILE" \
+  --item "opd_proposal_profile_dir=$OPD_PROPOSAL_PROFILE_DIR" \
   --item "kv_gather_strategy=${KV_GATHER_STRATEGY:-stacked}" \
   --item "nproc_per_node=$NPROC_PER_NODE"
 

@@ -5,7 +5,7 @@ from pathlib import Path
 
 OPD_FIELDS=('kl','selected_states','visited_states','frontier_states',
     'target_mass_in_draft_top16','target_compact_mass','active_rows_mean','active_rows_max',
-    'sparse_rounds','dense_rounds')
+    'sparse_rounds','dense_rounds','fused_rounds','gemm_rounds')
 KV_FIELDS=('iter_host_syncs','iter_host_syncs_per_round','iter_kv_cache_bytes',
            'iter_kv_full_reallocations','iter_kv_full_history_copies','iter_kv_history_copy_bytes')
 FIELDS=('global_iter','epoch','batch_iter','method','grpo_step','used_items','eligible_prompts','total_prompts',
@@ -92,7 +92,7 @@ class RolloutMetricsWriter:
                     ('target_compact_mass','compact_mass_sum','selected_states'),('active_rows_mean','active_rows_sum','rounds')]:
                 row['iter_opd_'+name]=ratio(o.get('opd_'+num,0.),o.get('opd_'+den,0.))
             if o.get('opd_nonfinite_kl_states',0):row['iter_opd_kl']=''
-            for mode in ('sparse','dense'):row['iter_opd_'+mode+'_rounds']=o.get('opd_proposal_mode_'+mode+'_rounds',0.)
+            for mode in ('sparse','dense','fused','gemm'):row['iter_opd_'+mode+'_rounds']=o.get('opd_proposal_mode_'+mode+'_rounds',0.)
         self.writer.writerow(row);self.unflushed+=1
         if self.unflushed>=self.flush_interval:self.flush()
 

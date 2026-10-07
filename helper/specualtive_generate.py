@@ -410,6 +410,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
                      opd_profile,opd_diagnostics,enabled,opd_backend,opd_train_projector)
         cache[key]=opd
     opd.start(model, bsz, compact_to_target, draft_hidden_states.shape[-1], max_contexts=1 + max_draft_k * (max_draft_token_length - 1), max_nodes=max(verification_capacity+bsz,2*bsz), max_path=max_draft_token_length + 1, max_proposal_contexts=max_draft_k)
+    opd.async_updates=update_stream is not None
     mask_columns_capacity = input_ids.shape[-1] + max_length * (max_draft_token_length + 1) + max_verification_num
     model._opd_initial_batch=bsz;model._opd_max_path_capacity=max_draft_token_length+1
     pad_capacity=mask_columns_capacity

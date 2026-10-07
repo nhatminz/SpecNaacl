@@ -90,6 +90,18 @@ def test_invalid_rollout_flush_interval_fails_before_python_training(value):
     assert result.returncode==2
     assert 'ROLLOUT_LOG_FLUSH_INTERVAL must be a positive integer' in result.stderr
 
+
+def test_tuner_defaults_all_six_even_when_training_model_key_is_exported(tmp_path):
+    env=dict(os.environ,PYTHON_BIN=PYTHON,MODEL_KEY='qwen3_1p7b',OUTPUT_ROOT=str(tmp_path/'empty'))
+    for name in ('OPD_TUNE_MODELS','OPD_TUNE_OUTPUT','DRAFT_CONFIG','DRAFT_CHECKPOINT','VOCAB_MAPPING'):
+        env.pop(name,None)
+    result=subprocess.run([BASH,str(ROOT/'scripts/tune_opd_proposals.sh'),'--inspect-only'],
+        cwd=ROOT,env=env,check=True,capture_output=True,text=True)
+    import json
+    payload=json.loads(result.stdout)
+    assert [item['model'] for item in payload['skipped']]==list(MODEL_KEYS[:-1])
+    assert not (tmp_path/'empty').exists()
+
 def test_real_sweep_dry_run_no_writes_and_quick_settings(tmp_path):
     destination=tmp_path/'not-created'
     out=subprocess.run([BASH,str(ROOT/'scripts/sweep_opd_reflex.sh')],cwd=ROOT,

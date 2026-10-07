@@ -79,13 +79,14 @@ def summarize(rows):
         d=sum(r.get(denominator,0.) for r in rows)
         result[name]=sum(r.get(raw,0.) for r in rows)/d if d else None
     for name in ('opd_selected_states','opd_visited_states','opd_frontier_states','opd_updates','opd_invalid_states',
-                 'opd_proposal_mode_sparse_rounds','opd_proposal_mode_dense_rounds'):
+                 'opd_proposal_mode_sparse_rounds','opd_proposal_mode_dense_rounds','opd_proposal_mode_fused_rounds','opd_proposal_mode_gemm_rounds'):
         result[name]=sum(r.get(name,0.) for r in rows)
     result['opd_nonfinite_kl_states']=sum(r.get('opd_nonfinite_kl_states',0.) for r in rows)
     result['opd_active_rows_mean']=result['opd_active_token_rows']
     result['opd_active_rows_max']=max(r.get('opd_active_rows_max',0.) for r in rows)
     result['opd_sparse_rounds']=result['opd_proposal_mode_sparse_rounds']
     result['opd_dense_rounds']=result['opd_proposal_mode_dense_rounds']
+    for mode in ('fused','gemm'):result['opd_'+mode+'_rounds']=result['opd_proposal_mode_'+mode+'_rounds']
     host_syncs=sum(r.get('opd_host_syncs',0) for r in rows)
     batches=sum(r.get('batch_verification_rounds',0) for r in rows)
     result['host_syncs_per_round']=host_syncs/batches if batches and rows[0].get('method')=='opd_reflex' else None

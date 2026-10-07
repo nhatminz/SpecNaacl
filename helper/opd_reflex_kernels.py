@@ -126,9 +126,9 @@ def _corrected_scan(Z,SCORES,BITS,SLOTS,CAPACITY,MAX,SUM,VALUES,IDS,U,B,COUNTERS
         tl.store(VALUES+offset*K+j,score);tl.store(IDS+offset*K+j,token)
         z=tl.where(v==token,-float('inf'),z);live=live&(v!=token)
 
-def prepare_scores(logits,u,state,root=False):
+def prepare_scores(logits,u,state,root=False,selected=None):
     b,c,v=logits.shape
-    mode=0 if state.selected_proposal_backend(b,c)=='sparse' else 1
+    mode=0 if (selected or state.selected_proposal_backend(b,c))=='sparse' else 1
     if mode==0:
         _sparse_scores[(b*c,)](logits,u,state.B_fast,state.active_ids,state.active_count,state.sparse_scores,state.active_slots,state.sparse_capacity,
             state.counters,*logits.stride(),c,v,state.rank,0,mode,root,128,
@@ -142,12 +142,18 @@ def propose(logits,u,state,k,workspace,outputs,enabled,root=False):
     b,c,v=logits.shape;tiles=triton.cdiv(v,256)
     maxima,sums,values,ids=[p[:b*c*tiles*(k if i>=2 else 1)] for i,p in enumerate(workspace)]
     out,indices,norm=outputs
-    sparse=state.selected_proposal_backend(b,c)=='sparse'
-    dense=enabled and state.selected_proposal_backend(b,c)=='dense' and state.selected_dense_implementation(b,c)=='fused'
+    selected='sparse' if state.selected_proposal_backend(b,c)=='sparse' else state.selected_dense_implementation(b,c)
+    sparse=selected=='sparse'
+    dense=enabled and selected=='fused'
+    if root and enabled:
+        # Selection is already known on host. No extra GPU atomics, kernel,
+        # scalar read or synchronization merely for backend-specific logging.
+        if selected=='fused':state.host_fused_rounds+=1
+        elif selected=='gemm':state.host_gemm_rounds+=1
     if enabled:
-        state.prepare_proposal_workspace(b,c)
+        state.prepare_proposal_workspace(b,c,selected)
         ticket=state.begin('opd_proposal_extra_ms')
-        if not dense:prepare_scores(logits,u,state,root)
+        if not dense:prepare_scores(logits,u,state,root,selected)
         state.end(ticket)
     elif root and state.enabled:
         # Cold raw path has zero B. No correction preparation at all.

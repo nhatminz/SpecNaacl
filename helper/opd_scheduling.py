@@ -8,8 +8,11 @@ def schedule(path,past,eos,workspace,packet,kernels=None,opd=None):
         if opd is not None:opd.host_sync_count+=1
         tokens,indices,mask=[x[:b,:capacity] for x in workspace[:3]];last=workspace[3][:b,:1]
         out_packet=packet[:b,:capacity+3]
-        kernels.pad_schedule(path,past,eos,tokens,indices,mask,last,out_packet,
-                             snapshot=opd.dispatch_snapshot if opd is not None else None)
+        # Synchronous updates are ordered before this kernel: count is exact.
+        # Async retains the pre-update snapshot to preserve overlap, never races
+        # a concurrent active_count mutation or adds a wait for dispatch alone.
+        snapshot=(opd.dispatch_snapshot if getattr(opd,'async_updates',False) else opd.active_count) if opd is not None else None
+        kernels.pad_schedule(path,past,eos,tokens,indices,mask,last,out_packet,snapshot=snapshot)
         if opd is not None:
             rows=packet[:b,:capacity+4].cpu().tolist()
             opd.host_active_count=rows[0][-1]

@@ -63,14 +63,14 @@ MAX_TRAIN_SAMPLES=128 bash train_qwen25_3b_fastgrpo.sh --max_grpo_steps 2
 
 ## Sweep nhanh LR/stream: FROZEN model, không train/checkpoint
 
-Revision growable-KV/compact-sampler thay đổi kernel fingerprint. Profile cũ sẽ
-bị reject có chủ đích; tạo profile mới bằng config thật trước khi sweep/train:
+Quy trình autotuning mới đầy đủ: [OPD_AUTOTUNING.md](OPD_AUTOTUNING.md).
+Tune6 models trong một lần, dedup theo execution key. Profile cũ bị reject;
+launcher/sweep tự tìm đúng profile, không cần export một profile theo model name.
 
 ```bash
-export MODEL_KEY=qwen3_1p7b # hoặc qwen25_3b / qwen3_4b
-export OPD_TUNE_OUTPUT="$PWD/outputs/benchmarks/opd_proposals/${MODEL_KEY}_$(date -u +%Y%m%dT%H%M%S_%N).json"
+unset OPD_PROPOSAL_PROFILE OPD_TUNE_OUTPUT
 bash scripts/tune_opd_proposals.sh
-export OPD_PROPOSAL_PROFILE="$OPD_TUNE_OUTPUT"
+export MODEL_KEY=qwen3_1p7b # hoặc qwen25_3b / qwen3_4b
 
 # KV memory/latency, không model forward hay training. Đọc config target/draft.
 KV_BENCH_LENGTHS=256,512,1024,2048 KV_BENCH_BATCHES=16,32,64 \
@@ -82,7 +82,7 @@ và `kv.csv`. Full-layer memory mặc định; OOM được ghi trong report. Mu
 component nhỏ trước: `KV_BENCH_LAYERS=1 bash scripts/benchmark_opd_kv.sh` (không
 được xem như memory của full model). Cache không realloc khi row finish; geometric
 growth/row remap vẫn copy live prefix, telemetry không che giấu các copies này.
-Không reuse proposal profile khác model/GPU/compiler/kernel.
+Model khác có cùng execution key được reuse; không reuse sai GPU/V/rank/dtype/kernel.
 
 ```bash
 OPD_FAST_LRS=0.001,0.01,0.05,0.1 OPD_STREAMS=0,1 \
@@ -126,20 +126,22 @@ rollout, không thêm target/draft transformer forward.
 ## Tune sparse/dense trên B200 và benchmark end-to-end
 
 ```bash
-export MODEL_KEY=qwen3_1p7b
-export DRAFT_CONFIG="$PWD/outputs/pretrain/$MODEL_KEY/latest_draft_config.json"
-export OPD_TUNE_OUTPUT="$PWD/outputs/benchmarks/opd_proposals/${MODEL_KEY}_$(date -u +%Y%m%dT%H%M%S_%N).json"
+unset OPD_PROPOSAL_PROFILE OPD_TUNE_OUTPUT
+# Mặc định cả6 model, không bị MODEL_KEY của training trước đó giới hạn.
 CUDA_VISIBLE_DEVICES=0 bash scripts/tune_opd_proposals.sh
-export OPD_PROPOSAL_PROFILE="$OPD_TUNE_OUTPUT"
+# Hoặc chỉ một model / custom model:
+OPD_TUNE_MODELS=qwen3_1p7b CUDA_VISIBLE_DEVICES=0 bash scripts/tune_opd_proposals.sh
 ```
 
-Script đọc V/H từ draft config thật, không có vocab mặc định 32768.
-Profile mặc định: `outputs/benchmarks/opd_proposals/$MODEL_KEY.json`; launcher
-train và sweep tự load nếu có. Profile kiểm tra GPU/Torch/Triton/CUDA/kernel hash
-và V/rank/dtype; batch/context mới dùng interpolation. KHÔNG dùng profile RTX3090
-cho B200. Khi đổi kernel/config, dùng `OPD_TUNE_OUTPUT` mới rồi export
-`OPD_PROPOSAL_PROFILE` tới file đó (script không ghi đè profile cũ).
-Nếu chưa có profile thì threshold V/8 chỉ là fallback chưa đo, không phải B200 optimum.
+Script đọc real config/checkpoint/mapping và detect V/rank/dtype; không load target
+hay draft transformer để benchmark. Shared profiles ở `outputs/benchmarks/opd_proposals/`
+với GPU/cc/V/r/dtype/TopK/kernel/compiler key, không key theo tên model/H. Summary
+`models_summary.json` ghi profile dùng cho từng model. Missing/corrupt resources
+warning+skip; profile compatible đã tồn tại không tune lại.
+Valid profile interpolates measured costs theo contexts và active rows để chọn
+sparse/fused/GEMM. Default không tự tune dài trong train; có thể opt-in
+`OPD_AUTO_TUNE_IF_MISSING=1`. Explicit profile sai key bị reject; missing exact
+profile warning+uncalibrated safe fallback. Không deploy RTX3090 profile lên B200.
 
 Tiếp theo:
 
@@ -156,13 +158,10 @@ CUDA_VISIBLE_DEVICES=0 bash train_qwen3_1p7b.sh
 CUDA_VISIBLE_DEVICES=0 bash train_qwen3_1p7b_fastgrpo.sh
 ```
 
-Shape/V/H phải đúng model; override OPD_TUNE_SHAPES nếu cần;
-V/H đọc từ DRAFT_CONFIG, không đo bằng vocabulary giả. Default đo contexts
-1/8/32/64/128/256/512 và active rows
-0/16/64/256/1024/4096/8192/V, so sánh sparse/dense-fused/dense-GEMM/auto.
-Profile sai GPU/compiler/hash bị reject. Shape chưa đo nội suy theo tổng contexts;
-không fallback sparse vô điều kiện. Chưa có profile thì auto dùng ngưỡng V/8
-chưa tune, dense=fused. Không đem profile RTX3090 dùng trên B200.
+Context/active-row trial grids sinh geometric từ batch*responses*max_draft_k và
+actual V; không hard-code absolute context/slot sizes. OPD_TUNE_SHAPES/SLOTS là
+explicit override nếu bạn cần workload riêng. Tuner đo correction/Top16/normalization,
+không đo feature projection chung, do đó hidden size khác được reuse cùng key.
 --gpu-utilization lấy mẫu nvidia-smi mỗi 0.5s, có thể ảnh hưởng nhẹ CPU timing;
 bỏ flag để đo throughput riêng. OPD_PROFILE=1 thêm replay profiling tách khỏi
 wall/throughput chính. Sweep ghi outputs/benchmarks/opd_<model>_<timestamp>/.
@@ -174,6 +173,10 @@ nhận. Không thêm fallback chậm. A phải qua optimizer steps mới gọi l
 muốn đánh giá learned A hãy dùng DRAFT_CHECKPOINT của run OPD đã train. Sweep
 frozen không tự train A/policy/draft. Một scheduling host boundary vẫn còn để
 giữ đúng dynamic batch/HF crop/RNG; không claim toàn decoder zero-sync.
+UPDATE_STREAM=0: packet count sau update chính xác cho proposal kế tiếp.
+UPDATE_STREAM=1: giữ overlap, dùng snapshot một round cũ + safe scratch bound;
+không thêm wait để lấy current count chỉ cho dispatch. Chi tiết trong OPD_AUTOTUNING.md.
+Rollout CSV thêm iter_opd_fused_rounds/gemm_rounds; dense_rounds giữ backward compatibility.
 
 ## Outputs và plot AAL đúng từng step
 

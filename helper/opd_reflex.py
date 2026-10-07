@@ -11,10 +11,11 @@ import importlib
 import math
 import json
 import os
-import hashlib
+import warnings
 from pathlib import Path
 import torch
 from helper.opd_attention import AttentionWorkspace
+from helper.opd_profiles import execution_key,fingerprint,discover_profile,validate_profile
 
 OPD_COUNTER_NAMES=(
     'opd_state_weight','opd_selected_states','opd_visited_states','opd_frontier_states',
@@ -23,6 +24,7 @@ OPD_COUNTER_NAMES=(
     'opd_nonfinite_kl_states',
     'opd_proposal_mode_sparse_rounds','opd_proposal_mode_dense_rounds',
     'opd_active_rows_max',
+    'opd_proposal_mode_fused_rounds','opd_proposal_mode_gemm_rounds',
 )
 GENERATION_COUNTER_NAMES=('verification_batches','active_response_rounds','verified_tree_nodes')
 
@@ -82,6 +84,10 @@ class OPDReflex:
         if self.dense_implementation not in ('auto','fused','gemm'):raise ValueError('invalid OPD_DENSE_IMPLEMENTATION')
         profile_path=os.environ.get('OPD_PROPOSAL_PROFILE','')
         self.tuning=json.loads(Path(profile_path).read_text()) if profile_path else None
+        self.profile_path=profile_path
+        self.explicit_profile_path=profile_path
+        self.profile_selector=None
+        self._profile_execution_shape=None
         self.train_projector=bool(train_projector)
         self._validated_tuning=False
         self._threshold_cache={}
@@ -114,6 +120,8 @@ class OPDReflex:
 
     def selected_proposal_backend(self,b,c):
         if self.proposal_mode in ('sparse','dense'):return self.proposal_mode
+        if self.profile_selector is not None:
+            return 'sparse' if self.profile_selector.choose(b*c,self.host_active_count)=='sparse' else 'dense'
         # Snapshot piggybacks on the existing HF scheduling packet. It is one
         # feedback round old when an update stream is used; this affects only
         # speed, never the correction, which reads the CURRENT GPU active set.
@@ -121,6 +129,13 @@ class OPDReflex:
 
     def selected_dense_implementation(self,b,c):
         if self.dense_implementation!='auto':return self.dense_implementation
+        if self.profile_selector is not None:
+            selected=self.profile_selector.choose(b*c,self.host_active_count)
+            if selected!='sparse':return selected
+            # Explicit MODE=dense can override a calibrated sparse choice;
+            # still use measured dense costs, never a global dense heuristic.
+            costs=self.profile_selector.costs(b*c,self.host_active_count)
+            return 'fused' if costs[1]<=costs[2] else 'gemm'
         key=(b*c,self.vocab,self.rank,str(self.logits_dtype))
         if key not in self._dense_choice_cache:
             self._dense_choice_cache[key]=self._nearest_dense_implementation(b,c)
@@ -144,18 +159,27 @@ class OPDReflex:
         if self.requested_backend=='triton' and device.type!='cuda':raise ValueError('Triton OPD requires CUDA')
         self._kernels=importlib.import_module('helper.tree_kernels') if self.backend=='triton' else None
         self._opd_kernels=importlib.import_module('helper.opd_reflex_kernels') if self.backend=='triton' else None
-        if self.tuning is not None and not self._validated_tuning:
-            if self.backend!='triton':raise ValueError('measured adaptive CUDA profile requires Triton')
-            fingerprint=dict(gpu=torch.cuda.get_device_name(device),torch=torch.__version__,
-                triton=self._opd_kernels.triton.__version__,cuda=torch.version.cuda,
-                kernel_sha256=hashlib.sha256(Path(self._opd_kernels.__file__).read_bytes()).hexdigest())
-            if any(self.tuning.get(k)!=value for k,value in fingerprint.items()):
-                raise ValueError('tuning profile GPU/compiler/kernel mismatch; retune')
-            self._validated_tuning=True
         self.mapping,self.vocab,self.topk,self.max_batch=mapping,v,k,batch
         self.cache_contexts=max_contexts
-        layout=(batch,v,hidden_size,max_contexts,max_nodes,max_path,max_proposal_contexts,k,str(device),self.enabled)
         self.head=model.draft_model.lm_head if hasattr(model,'draft_model') else model.draft_head
+        layout=(batch,v,hidden_size,max_contexts,max_nodes,max_path,max_proposal_contexts,k,str(device),self.enabled,self.head.weight.dtype)
+        execution_shape=(str(device),v,self.rank,self.head.weight.dtype,k)
+        if self._profile_execution_shape is not None and execution_shape!=self._profile_execution_shape:
+            self._validated_tuning=False;self._profile_shape_checked=False
+            self.profile_selector=None;self.tuning=None;self.profile_path=self.explicit_profile_path
+            self._threshold_cache.clear();self._dense_choice_cache.clear()
+        if self.backend=='triton' and not self._validated_tuning:
+            key=execution_key(fingerprint(device),v,self.rank,self.head.weight.dtype,k)
+            directory=os.environ.get('OPD_PROPOSAL_PROFILE_DIR',str(Path(__file__).resolve().parents[1]/'outputs/benchmarks/opd_proposals'))
+            path,payload=discover_profile(directory,key,self.profile_path)
+            if path:
+                self.profile_path=str(path);self.tuning=payload
+                self.profile_selector=validate_profile(payload,key)
+            elif self.proposal_mode in ('auto','adaptive'):
+                warnings.warn('No exact compatible OPD proposal profile; using UNCALIBRATED safe fallback. Run scripts/tune_opd_proposals.sh; no tuning in hot path.')
+            print(f'OPD proposal mode: {self.proposal_mode}\nprofile: {self.profile_path or "NONE (uncalibrated fallback)"}\nGPU: {key["gpu"]} cc{key["compute_capability"]}\nV: {v}\nrank: {self.rank}\ndtype: {key["dtype"]}\nkernel hash: {key["kernel_sha256"]}',flush=True)
+            self._validated_tuning=True
+        self._profile_execution_shape=execution_shape
         self.full_vocab_inverse=getattr(model,'opd_full_vocab_inverse',None)
         self.model=model
         if self.enabled:
@@ -231,18 +255,21 @@ class OPDReflex:
         self.bitmap.zero_();self.active_count.zero_();self.dispatch_snapshot.zero_()
         self.host_active_count=0
         self.host_sync_count=0
+        self.host_fused_rounds=self.host_gemm_rounds=0
         if self.enabled:self.B_fast.zero_();self.counters.zero_()
         self._ever_updated=False;self._events.clear()
 
-    def prepare_proposal_workspace(self,b,c):
-        if self.selected_proposal_backend(b,c)=='sparse':
+    def prepare_proposal_workspace(self,b,c,selected=None):
+        selected=selected or ('sparse' if self.selected_proposal_backend(b,c)=='sparse' else self.selected_dense_implementation(b,c))
+        if selected=='sparse':
             # Snapshot is one update behind; one union per selected state bounds
             # all unseen activations. No GPU read or allocation each round.
-            required=min(self.vocab,self.host_active_count+(2*self.max_feedback_rows*self.topk if self._ever_updated else 0))
+            unseen=2*self.max_feedback_rows*self.topk if self._ever_updated else 0
+            required=min(self.vocab,self.host_active_count+unseen)
             if required>self.sparse_capacity:
                 self.sparse_capacity=min(self.vocab,max(required,2*self.sparse_capacity))
                 self.sparse_scores=torch.empty(self.proposal_capacity*self.sparse_capacity,device=self.mapping.device)
-        elif self.selected_dense_implementation(b,c)=='gemm' and self.score_workspace.numel()==1:
+        elif selected=='gemm' and self.score_workspace.numel()<self.proposal_capacity*self.vocab:
             self.score_workspace=torch.empty(self.proposal_capacity*self.vocab,device=self.mapping.device)
 
     def begin(self,label):
@@ -383,6 +410,8 @@ class OPDReflex:
             packet=payload.cpu().tolist()  # exactly ONE counter/diagnostic packet
         else:packet=[0.]*len(OPD_COUNTER_NAMES)
         result=dict(zip(OPD_COUNTER_NAMES,packet[:len(OPD_COUNTER_NAMES)]))
+        result['opd_proposal_mode_fused_rounds']=float(self.host_fused_rounds)
+        result['opd_proposal_mode_gemm_rounds']=float(self.host_gemm_rounds)
         if self.enabled and self.diagnostics:
             result.update(dict(zip(('opd_final_b_norm','opd_final_b_max_abs','opd_final_active_rows'),packet[len(OPD_COUNTER_NAMES):])))
         sections={}

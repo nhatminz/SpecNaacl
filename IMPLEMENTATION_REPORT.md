@@ -1,3 +1,86 @@
+# Generalized OPD autotuning — execution key / six-model dedup (2026-10-07)
+
+Current procedure: [OPD_AUTOTUNING.md](OPD_AUTOTUNING.md), also integrated into
+[huongdanchay.md](huongdanchay.md). This section supersedes older model-named
+profile paths, fixed trial grids and single-crossover dispatch descriptions.
+
+Implemented:
+
+- `bash scripts/tune_opd_proposals.sh` defaults to all6 requested Qwen models,
+  regardless of a previously exported training MODEL_KEY. `OPD_TUNE_MODELS` selects
+  any explicit subset/custom model. Read real draft config, checkpoint shape/dtype/
+  learned-projector rank and validate fixed d2t/t2d. Torch meta/mmap / safetensors
+  headers avoid loading full model weights onto GPU. Missing/corrupt resources
+  warn+skip; no valid resources means no measured profile fabricated.
+- Deduplicate by GPU name/cc + V/rank/execution dtype/TopK + proposal+merge hash +
+  Torch/Triton/CUDA versions. Hidden size and model names are NOT keys. Proposal
+  benchmark directly consumes raw logits and projected U, excluding common
+  H-dependent feature projection. Each unique config measured once; existing exact
+  profiles reused. tqdm shows inspected models/configs/contexts/active-row trials.
+- Context grids generated geometrically from actual batch*responses*max_draft_k;
+  slots generated from actual V. No absolute model-specific context/slot tables.
+  JSON stores measured sparse/fused/GEMM costs plus threshold/dense summaries and
+  execution metadata. Dispatcher interpolates measured costs in log(contexts)
+  and linear active rows, clamps outside range, memoizes host decisions. Valid
+  profiles never consult the uncalibrated global fallback. Exactly one correction
+  backend launches. No new device scalar read, kernel or transfer for dispatch.
+- Startup exact discovery in launcher before model loading and direct runtime/
+  sweep setup. Log mode/profile/GPU/cc/V/rank/dtype/hash; wrong explicit profiles
+  reject instead of silent reuse. Missing auto profiles warn and use the existing
+  explicitly UNCALIBRATED safe fallback. `OPD_AUTO_TUNE_IF_MISSING=1` opt-in only;
+  default0 never surprises a training job with long tuning. Runtime re-discovers
+  and rebuilds dtype-sensitive buffers if dtype/vocab/device configuration changes.
+- One existing scheduling D2H packet per round retained. Stream0 reads exact
+  post-update active_count. **Per user's explicit choice**, stream1 preserves
+  overlap and reads stable pre-update snapshot (one round stale); no wait merely
+  for dispatch. Kernel still consumes CURRENT B/active set with safe sparse bound:
+  dispatch lag can affect performance, not numerical results/update semantics.
+- Rollout CSV adds fused/gemm counts and retains sparse/dense/active_rows fields;
+  step CSV/JSONL and frozen sweep summaries include new backend counts. Fused/GEMM
+  counts use already-known host selection, NO added GPU atomics/logging kernels.
+  Legacy dense counter stays unchanged. Resume CSV schema migration preserved.
+
+Validation:
+
+- Full suite: **462 passed, 3 skipped, 3 failed**. All new tuning/discovery/dispatch
+  tests pass. Three failures are the same pre-existing absent offline-install
+  assets: requirements-bootstrap.txt, requirements-external.txt,
+  scripts/build_offline_wheelhouse.sh. Tests not hidden/disabled; no all-pass claim.
+- Real CUDA proposal tuner smoke measured two tiny fixture checkpoint/configs of
+  different hidden size with one shared execution profile; sparse/fused/GEMM
+  probability/ID/normalizer parity bitwise. Fixture profiles remain temporary test
+  artifacts, not production measurements. Pure tests cover V41/127/521, ranks4/8/16,
+  contexts/active counts, mismatched GPU/cc/V/rank/dtype/hash/compiler/TopK, explicit
+  failures vs automatic skip, corrupt checkpoints, exported safetensors and saved
+  projector, dedup/reuse, startup resolver and execution-shape re-discovery.
+- GPU tests prove only selected correction preparation launches and all three
+  counters register when a test profile requests them. One packet per round / no
+  production synchronization tests preserved. Actual native HF Qwen2 + vendored
+  EAGLE3 complete rollout smoke still passes stream0/1, with unchanged RNG/histories
+  and exact expected target/draft forward counts.
+- Compileall, all shell syntax, launcher/source checks and diff checks pass.
+  `pip check` reports no broken requirements in isolated RTX3090 validation venv
+  (Torch2.5.1+cu124/Triton3.1/native HF5.12.1; test-process-only Dynamo compatibility
+  alias as documented below). Production dependencies NOT modified/certified.
+
+**Not measured:** production B200 six-model tuning and end-to-end throughput/AAL
+before/after. Server checkpoints/data and B200 are unavailable here. Frozen
+end-to-end benchmark commands are supplied; no fabricated result, no claim of
+guaranteed speedup or zero regression across hardware without those measurements.
+Historical FastGRPO generation, target sampler/RNG, verifier, objective/B update
+and online draft loss/schedule untouched.
+
+Changed files: new `helper/opd_profiles.py`, `scripts/resolve_opd_profile.py`,
+`tests/test_opd_profiles.py`, `OPD_AUTOTUNING.md`; modified
+`helper/{opd_reflex,opd_reflex_kernels,opd_scheduling,specualtive_generate,
+rollout_metrics,step_metrics}.py`, `scripts/{tune_opd_proposals.py,
+tune_opd_proposals.sh,launch/train_model.sh,sweep_opd_reflex.sh,
+benchmark_opd_reflex.py,check_training_sources.py}`, shared B200 env, shell/profile
+revision tests, run guide/optimization notes and this report. Sibling repos and
+unrelated existing local reports left unchanged.
+
+---
+
 # Launcher fix — optional variables under set -u (2026-10-07)
 
 `scripts/launch/train_model.sh` now sets optional defaults after sourcing configs,

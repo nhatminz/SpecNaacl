@@ -1,5 +1,9 @@
 # OPD: growable KV, reused masks, compact sampler metadata, iteration logs
 
+Autotuner/dispatcher đã được nâng cấp sau phần memory revision dưới đây.
+Current tuning/discovery commands: [OPD_AUTOTUNING.md](OPD_AUTOTUNING.md).
+Các ghi chú thresholds/profile layout cũ ở dưới chỉ mô tả revision trước.
+
 Phạm vi: chỉ OPD generation và telemetry chung. Không đổi historical FastGRPO
 generation, reward, target sampler/RNG, verifier, GRPO loss hay EAGLE training
 schedule. Không đổi dependencies hoặc các đường dẫn model/data/pretrained draft.

@@ -18,7 +18,7 @@ COUNTERS = (
 )+tuple(name for name in OPD_COUNTER_NAMES if name!='opd_active_rows_max')+GENERATION_COUNTER_NAMES
 DERIVED_OPD_FIELDS=tuple(f'{prefix}_{name}' for prefix in ('step','cumulative') for name in (
     'opd_kl','opd_mean_union_size','opd_target_compact_mass','opd_target_mass_in_draft_top16',
-    'opd_active_token_rows','opd_active_rows_mean','opd_active_rows_max','opd_sparse_rounds','opd_dense_rounds',
+    'opd_active_token_rows','opd_active_rows_mean','opd_active_rows_max','opd_sparse_rounds','opd_dense_rounds','opd_fused_rounds','opd_gemm_rounds',
     'mean_active_responses_per_verify_round','mean_verified_tree_nodes',
     'mean_verified_path_length','mean_frontier_per_visited_state'))
 MEMORY_FIELDS = ('gpu_allocated_gb', 'gpu_reserved_gb', 'gpu_peak_allocated_gb', 'gpu_free_gb')
@@ -153,6 +153,8 @@ def step_record(step, current, previous, extras=None):
         if result[f'{prefix}_opd_nonfinite_kl_states']>0:result[f'{prefix}_opd_kl']=None
         result[f'{prefix}_opd_sparse_rounds']=result[f'{prefix}_opd_proposal_mode_sparse_rounds']
         result[f'{prefix}_opd_dense_rounds']=result[f'{prefix}_opd_proposal_mode_dense_rounds']
+        for mode in ('fused','gemm'):
+            result[f'{prefix}_opd_'+mode+'_rounds']=result[f'{prefix}_opd_proposal_mode_'+mode+'_rounds']
     result.setdefault('step_opd_active_rows_max',0.)
     result.setdefault('cumulative_opd_active_rows_max',0.)
     # Legacy plotting columns keep their former cumulative meaning.

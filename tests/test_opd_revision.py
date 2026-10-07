@@ -143,9 +143,10 @@ def test_projector_gradient_accumulates_no_round_parameter_update_then_boundary(
 def test_measured_adaptive_switch_and_mode_counters(tmp_path,monkeypatch):
     from helper import opd_reflex_kernels as kernels
     path=tmp_path/'profile.json'
-    payload=dict(gpu=torch.cuda.get_device_name(),torch=torch.__version__,triton=kernels.triton.__version__,
-        cuda=torch.version.cuda,kernel_sha256=hashlib.sha256(Path(kernels.__file__).read_bytes()).hexdigest(),
-        thresholds={'3,1,257,8,torch.float32':8})
+    from helper.opd_profiles import execution_key,fingerprint
+    payload=dict(execution_key=execution_key(fingerprint(),257,8,torch.float32),
+        thresholds={'3,1,257,8,torch.float32':8},records=[dict(contexts=3,trials=[
+            dict(slots=0,sparse=1.,fused=2.,gemm=3.),dict(slots=257,sparse=100.,fused=2.,gemm=3.)])])
     path.write_text(json.dumps(payload));monkeypatch.setenv('OPD_PROPOSAL_MODE','adaptive')
     monkeypatch.setenv('OPD_PROPOSAL_PROFILE',str(path))
     s,_,mapping=state('cuda:0',v=257)

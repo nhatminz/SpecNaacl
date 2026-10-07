@@ -29,9 +29,7 @@ PRETRAIN_MODEL_ROOT="${PRETRAIN_MODEL_ROOT:-$OUTPUT_ROOT/pretrain/$MODEL_KEY}"
 export DRAFT_CHECKPOINT="${DRAFT_CHECKPOINT:-$PRETRAIN_MODEL_ROOT/latest_checkpoint}"
 export DRAFT_CONFIG="${DRAFT_CONFIG:-$PRETRAIN_MODEL_ROOT/latest_draft_config.json}"
 export VOCAB_MAPPING="${VOCAB_MAPPING:-$PRETRAIN_MODEL_ROOT/latest_vocab_mapping.pt}"
-if [[ -z "$OPD_PROPOSAL_PROFILE" && -f "$OUTPUT_ROOT/benchmarks/opd_proposals/$MODEL_KEY.json" ]]; then
-  export OPD_PROPOSAL_PROFILE="$OUTPUT_ROOT/benchmarks/opd_proposals/$MODEL_KEY.json"
-fi
+export OPD_PROPOSAL_PROFILE_DIR="${OPD_PROPOSAL_PROFILE_DIR:-$OUTPUT_ROOT/benchmarks/opd_proposals}"
 BENCH_OUTPUT="${BENCH_OUTPUT:-$OUTPUT_ROOT/benchmarks/opd_${MODEL_KEY}_$(date -u +%Y%m%dT%H%M%S_%N)}"
 cmd=("$PYTHON_BIN" "$PROJECT_DIR/scripts/benchmark_opd_reflex.py"
  --target-model "$MODEL" --target-adapter "$TARGET_ADAPTER"
