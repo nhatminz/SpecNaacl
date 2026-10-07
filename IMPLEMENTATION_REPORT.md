@@ -1,4 +1,78 @@
-# OPD follow-up — static KV / sampler reuse / per-iteration telemetry (2026-10-07)
+# OPD memory completion — growable KV / mask reuse / compact metadata (2026-10-07)
+
+Current code and commands: [OPD_OPTIMIZATION_20261007.md](OPD_OPTIMIZATION_20261007.md).
+This section supersedes fixed-capacity descriptions and earlier validation counts.
+
+Implemented target + EAGLE growable KV: initial256/real prompt rounded to256,
+geometric growth only when needed, suffix writes/crop/accepted suffix in-place.
+Batch axis reserves actual responses; repeat/select reuse same pool and shared
+live-prefix CUDA gather/scatter workspace, not a new full-capacity allocation.
+Weak owner references prevent rollout-end GPU storage being held by cyclic GC.
+Growable causal/tree/expansion mask and position workspaces replace large per-round
+mask allocations. Target sampler consumes its existing sort inside a callback;
+selected teacher Top16/mass buffers own storage and full sorted arrays are released
+at sampler return. Full probs remain only for exact DraftTop16 probability lookup.
+The temporary teacher alias is dropped after feedback enqueue (stream-safe), so
+old full probabilities do not overlap the next sampler's arrays. Whole-tree
+activations and transient KV views are released as soon as gathering completes.
+No second sort, extra transformer forward, target distribution/RNG/verifier change.
+Learned A, rollout-local B, selected-only updates, adaptive proposal dispatch and
+async update waiting only before the next reader are preserved. Baseline unchanged.
+
+Instrumentation: one scheduling D2H packet/verification round, grow-only pool
+reallocation counters, honest full-history/live-prefix copy counts/bytes, cache and
+workspace bytes. Per-iteration CSV keeps its previous fields and adds these host
+counters. Older CSV headers migrate with a backup on resume. Per-GRPO-step CSV/JSONL
+remain unchanged. Profiling stays opt-in; no production cuda.synchronize added.
+
+Validation in isolated local venv (RTX3090, Torch2.5.1+cu124/Triton3.1,
+native Transformers5.12.1; production dependencies unchanged):
+
+- Full suite: **411 passed, 3 skipped, 3 failed**. All new KV/mask/sampler/rollout
+  tests pass; three pre-existing failures reference absent offline-install assets:
+  `requirements-bootstrap.txt`, `requirements-external.txt`, and
+  `scripts/build_offline_wheelhouse.sh`.
+  These assets are absent in HEAD as well, not caused by this revision. They were
+  not fabricated and tests were not disabled to make a green summary.
+- Actual tiny HF Qwen2 + vendored SpecForge EAGLE3 complete GPU rollouts compare
+  dynamic vs growable cache, stream0/1: identical tokens, accepted counters,
+  feature/history tensors and CUDA RNG; exact expected target/draft forward counts.
+- CPU/CUDA growth/crop/repeat/select/permutation/duplicate-row tests; no pool
+  replacement on finish, no cyclic owner retention; no KV history cat in hot loop;
+  exact reused masks; sampler FP32/BF16/FP16 tokens/probs/RNG and sorted-array
+  lifetime; positive teacher ties/nonzero support; runtime extent kernel contracts.
+- `python -m compileall -q .`, all shell syntax checks, paired launcher dry-run,
+  benchmark CLI validation, source integrity and `git diff --check` pass.
+  `python -m pip check`: no broken requirements in the isolated local venv;
+  this is NOT validation of the unavailable B200 production stack. SpecForge
+  imports use a test-process-only alias of Torch2.5 `cache_size_limit` to its newer
+  `recompile_limit` name. No production import/compile fallback was added.
+
+Measured raw component data: `reports/opd_20261007_kv_rtx3090.json`, all24 cases
+successful. Batch64/history2048/one BF16 layer heads4/dim64: old fixed pool vs new
+growable KV before finish **810.5 → 128 MiB**, peak **1286.5 → 516.75 MiB**, finish
+compaction **0.6697 → 0.3509 ms**, finish reallocation **1 → 0**. Geometric growth
+and exceptional row remap still copy live prefixes; finish latency remains linear
+in surviving history. No claim of O(new suffix) for exceptional row remap.
+Append **0.0574 → 0.0594ms** in that case, so no append speedup claim.
+
+**Not measured:** B200 full-model peak VRAM, AAL, generation tokens/s/utilization
+before/after and long production-rollout stability. Server assets are unavailable.
+Run `scripts/benchmark_opd_kv.sh` and the frozen sweep on B200; component numbers
+are not end-to-end evidence. Existing proposal profiles must be regenerated after
+kernel fingerprint change; do not deploy RTX3090 fixture profiles to B200.
+
+Files changed/added this revision:
+`helper/{opd_static_cache,opd_kv_kernels,opd_attention,opd_attention_kernels,
+opd_sampling,opd_scheduling,opd_reflex,opd_reflex_kernels,specualtive_generate,
+rollout_metrics}.py`; `scripts/{benchmark_opd_kv.py,benchmark_opd_kv.sh,
+benchmark_opd_reflex.py,check_training_sources.py}`; OPD/EAGLE tests/fixtures;
+this report, optimization notes, run guide and measured KV JSON.
+`.gitignore` whitelists only that measured JSON; other local reports stay ignored.
+
+---
+
+# Prior OPD follow-up — fixed KV / sampler reuse / telemetry (historical notes)
 
 Current behavior and commands: [OPD_OPTIMIZATION_20261007.md](OPD_OPTIMIZATION_20261007.md).
 This section supersedes the older implementation/validation description below.

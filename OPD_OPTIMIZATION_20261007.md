@@ -1,4 +1,4 @@
-# OPD: static KV, sampler reuse, selected-state feedback, iteration logs
+# OPD: growable KV, reused masks, compact sampler metadata, iteration logs
 
 Phạm vi: chỉ OPD generation và telemetry chung. Không đổi historical FastGRPO
 generation, reward, target sampler/RNG, verifier, GRPO loss hay EAGLE training
@@ -6,15 +6,30 @@ schedule. Không đổi dependencies hoặc các đường dẫn model/data/pret
 
 ## Những thay đổi đã implement
 
-- `helper/opd_static_cache.py`: Cache API của Transformers 5.12.1, fixed-capacity
-  K/V pools cho target và EAGLE draft. Append ghi suffix; rollback/crop đổi length;
+- `helper/opd_static_cache.py`: Cache API của Transformers 5.12.1, growable K/V
+  pools cho target và EAGLE draft. Initial capacity 256 token (hoặc prompt thực
+  làm tròn theo chunk256 nếu lớn hơn); tăng geometric khi append thực sự vượt
+  capacity, chỉ copy prefix đang sống. Không reserve theo max_length*tree_depth.
+  Append ghi suffix; rollback/crop đổi length;
   attention chỉ nhìn prefix hợp lệ, không attention vào toàn capacity. EAGLE tree
   expansion rollback về prefix ban đầu, không làm committed cache dài thêm.
   Accepted target suffix vẫn gather vào scratch nhỏ rồi copy in-place.
+- `helper/opd_kv_kernels.py`: repeat/select ghi trở lại SAME KV pool, không tạo
+  full-capacity pool mới khi row finish. CUDA gather/scatter bằng hai kernel
+  stream-ordered, scratch live-prefix growable dùng chung giữa các layers. CPU
+  oracle dùng token tiles. Pre-reserve batch axis theo số responses thực để repeat
+  không grow pool. Weak owner backlink tránh giữ pool đến cyclic GC cuối rollout.
+- `helper/opd_attention{,_kernels}.py`: grow/reuse committed-draft và tree masks,
+  expansion mask, token/position buffers, cached position ramp. CUDA causal mask
+  ghi một lần vào workspace; không full/repeat large mask mỗi round. Past-position
+  buffer có storage riêng, không alias position workspace được ghi lại.
 - `helper/opd_sampling.py`: cùng FP32 temperature, softmax, top-p/top-k operations
-  và multinomial như sampler cũ; giữ lại sorted IDs/probabilities đã có. Full
+  và multinomial như sampler cũ. Callback GPU reuse sorted IDs/probabilities đã có,
+  trace path một lần, chọn states và extract teacher vào independent buffers
+  [selected-state capacity,16] + compact_mass. Full sorted arrays không escape
+  sampler. Reuse probability storage khi scatter thay vì zeros_like mới. Full
   vocab/permutation lấy teacher Top16 từ sampler prefix, compact_mass=1; greedy
-  lấy trực tiếp sampled ID. Không thêm target hoặc draft transformer forward.
+  lấy trực tiếp sampled ID. Không thêm target/draft transformer forward hay sort.
 - Positive ties ở biên teacher được merge bằng integer probability/compact-ID key,
   giữ low-compact-ID tie rule; token p=0 không hợp lệ. Không sort/softmax lại vocab.
   **Ngoại lệ cần nói rõ:** khi positive boundary tie rất lớn, phải đọc phần tied
@@ -47,11 +62,20 @@ vẫn wait ngay trước proposal tiếp theo; cả stream=0/1 có parity tests.
 Prefill và natural end-rollout vẫn có transfers. Optional profiling có timing sync
 riêng; production PROFILE=DIAGNOSTICS=STATISTICAL_TIME=0 không thêm sync.
 
-KV không copy full prefix **khi append/crop/accept mỗi round**. Prefill repeat và
-finished-response batch compaction vẫn copy các prefix đang sống; không claim đã
-loại các exceptional copies này. Static pool dùng conservative padded-length bound:
-prompt_width + max_length*(max_depth+1) + verification_limit + max_k*max_depth.
-Đây là tradeoff VRAM để tránh grow/cat; B200 peak VRAM với model lớn chưa đo.
+KV không copy full prefix **khi append/crop/accept mỗi round trong capacity**.
+Geometric grow, prefill repeat và finished-response batch compaction vẫn copy
+live prefixes; counters ghi thật các copies này. Không copy phần unused capacity,
+không realloc KV pool khi finish. Row compaction vẫn O(live history), KHÔNG claim
+latency history-independent: layout attention flat HF cần survivors contiguous.
+Scratch CUDA gồm live KV của một layer và dùng chung giữa layers, không full
+capacity scratch cho mọi layer; pool batch capacity giữ nguyên sau compaction.
+Chỉ full-vocab probability tensor còn sống đến feedback để lookup p của DraftTop16;
+không giữ sorted_probs/sorted_ids sau sampler. Subset mapping/unfiltered sampler
+vẫn extract teacher từ existing selected-state probabilities, không second sort.
+Alias `teacher` cũng được bỏ sau enqueue (record_stream bảo vệ async reader),
+không pin probabilities của round cũ đến sampler round sau. Release whole-tree
+activations sau accepted-feature gather và temporary KV views trước geometric grow.
+B200 peak VRAM với model lớn chưa đo.
 Thay layout KV và reduction grad_A giữ cùng toán học, nhưng không hứa bitwise
 trajectory trên mọi GPU/attention kernel hoặc qua các checkpoint revision.
 
@@ -88,12 +112,24 @@ export CUDA_VISIBLE_DEVICES=0
 export MODEL_KEY=qwen3_1p7b
 
 # Dùng config pretrained thật của model; tự đọc compact vocab, hidden size.
+# Kernel fingerprint thay đổi ở revision này: KHÔNG reuse profile revision cũ.
+export OPD_TUNE_OUTPUT="$PWD/outputs/benchmarks/opd_proposals/${MODEL_KEY}_$(date -u +%Y%m%dT%H%M%S_%N).json"
 bash scripts/tune_opd_proposals.sh
+export OPD_PROPOSAL_PROFILE="$OPD_TUNE_OUTPUT"
+
+# KV component: target + draft config thật, lengths256/512/1024/2048,
+# batches16/32/64. Full layers mặc định; OOM được ghi thật, không thay bằng số giả.
+bash scripts/benchmark_opd_kv.sh
 
 # Đo frozen-rollout với historical FastGRPO + OPD, response dài, 2 stream modes.
 # Không dùng kết quả timing từ diagnostic replay để claim speedup.
 OPD_FAST_LRS=0.001,0.01,0.05 OPD_STREAMS=0,1 BENCH_SEEDS=42,43 \
 BENCH_ITERATIONS=2 BENCH_MAX_LENGTH=2048 BENCH_MAX_PROMPT_LENGTH=256 \
+bash scripts/sweep_opd_reflex.sh --gpu-utilization
+
+# Tách replay profiling để đo compaction/OPD sections, không lấy replay làm timing win.
+OPD_PROFILE=1 OPD_FAST_LRS=0.01 OPD_STREAMS=0,1 BENCH_SEEDS=42 \
+BENCH_ITERATIONS=1 BENCH_MAX_LENGTH=2048 BENCH_MAX_PROMPT_LENGTH=256 \
 bash scripts/sweep_opd_reflex.sh --gpu-utilization
 
 # Chọn LR/stream sau khi xem report.json; dưới đây vẫn là defaults chưa tune.
@@ -109,6 +145,28 @@ draft token budget2048, OPD rank8/Top16, fastLR0.01, update_stream0, profile0,
 diagnostics0, proposal/dense implementation auto.
 
 ## Validation và benchmark
+
+Raw KV result: `reports/opd_20261007_kv_rtx3090.json` (24 measured cases: 4 lengths
+× 3 batches × 2 implementations). BF16, one KV layer, heads4/dim64, median25 warmed
+CUDA-event samples; finish event một lần sau warmup. Peak gồm input/scratch và
+append length+8 qua geometric-growth boundary, không phải chỉ KV pool bytes.
+`previous_fixed_pool` reproduces previous OPD reserve/remap, KHÔNG phải historical
+FastGRPO end-to-end baseline. Batch64:
+
+| History | KV trước finish MiB cũ → mới | Peak MiB cũ → mới | Finish ms cũ → mới |
+| --- | --- | --- | --- |
+| 256 | 138.5 → 16 | 222.5 → 68.75 | 0.114 → 0.075 |
+| 512 | 234.5 → 32 | 374.5 → 132.75 | 0.194 → 0.116 |
+| 1024 | 426.5 → 64 | 678.5 → 260.75 | 0.354 → 0.195 |
+| 2048 | 810.5 → 128 | 1286.5 → 516.75 | 0.670 → 0.351 |
+
+Append median ở case2048 là 0.0574 → 0.0594ms (không claim append speedup).
+Finish KV reallocations: 1 → 0 mỗi layer. Live-prefix copy vẫn cần khi row remap.
+Các counters bao gồm cả warmup/repeated measurements, không phải một training run.
+Script B200 xuất `outputs/benchmarks/kv_<model>_<timestamp>/{target,draft}/`
+`report.json` và `kv.csv`. Frozen sweep report thêm cache bytes, host syncs/round,
+full reallocations/history copies/bytes; opt-in replay thêm KV compaction time.
+Baseline counters không instrument là null, không ghi giả bằng0.
 
 Xem section đầu IMPLEMENTATION_REPORT.md. Máy kiểm tra là RTX3090, không phải
 B200. Production model/data/pretrained checkpoint không có tại máy này; chưa có

@@ -477,7 +477,7 @@ def _teacher_full_greedy(TARGET,INVERSE,SELECTED,COUNT,P,IDS,MASS,ROWS,TS0,TS1,K
         tl.store(MASS+state,1.)
 
 
-def feedback(state,tree,path,target,greedy=False,sampling_metadata=None):
+def prepare_teacher(state,tree,path,target,greedy=False,sampling_metadata=None):
     b,q=tree.parents.shape;n=b*q;k=state.topk;rank=state.rank
     weights=state.selected_weights[:n].view(b,q);kind=state.selected_kind[:n].view(b,q)
     ticket=state.begin('opd_state_select_ms')
@@ -496,7 +496,18 @@ def feedback(state,tree,path,target,greedy=False,sampling_metadata=None):
     else:
         teacher(target,state.mapping,weights,k,state.teacher_tiles,(probs,ids,mass),greedy,
                 selection=(state.selected_ids,state.selected_count))
-    state.end(ticket);ticket=state.begin('opd_union_loss_ms')
+    state.end(ticket)
+    return probs,ids,mass
+
+
+def feedback(state,tree,path,target,greedy=False,sampling_metadata=None):
+    b,q=tree.parents.shape;n=b*q;k=state.topk;rank=state.rank
+    weights=state.selected_weights[:n].view(b,q);kind=state.selected_kind[:n].view(b,q)
+    if sampling_metadata is not None and len(sampling_metadata)==3:
+        probs,ids,mass=sampling_metadata
+    else:
+        probs,ids,mass=prepare_teacher(state,tree,path,target,greedy,sampling_metadata)
+    ticket=state.begin('opd_union_loss_ms')
     head=state.head.weight;bias=state.head.bias if state.head.bias is not None else head
     _selected_head[(k,min(n,32))](state.selected_ids,state.selected_count,state.head_cache,head,bias,state.u_cache,state.B_fast,state.ids_cache,state.q_cache,
         ids,state.norm_cache,weights,mass,tree.feedback_contexts,state.teacher_q,

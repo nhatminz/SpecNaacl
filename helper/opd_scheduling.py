@@ -5,6 +5,7 @@ import torch
 def schedule(path,past,eos,workspace,packet,kernels=None,opd=None):
     b,capacity=path.tokens.shape
     if kernels is not None:
+        if opd is not None:opd.host_sync_count+=1
         tokens,indices,mask=[x[:b,:capacity] for x in workspace[:3]];last=workspace[3][:b,:1]
         out_packet=packet[:b,:capacity+3]
         kernels.pad_schedule(path,past,eos,tokens,indices,mask,last,out_packet,

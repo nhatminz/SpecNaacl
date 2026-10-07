@@ -6,10 +6,12 @@ from pathlib import Path
 OPD_FIELDS=('kl','selected_states','visited_states','frontier_states',
     'target_mass_in_draft_top16','target_compact_mass','active_rows_mean','active_rows_max',
     'sparse_rounds','dense_rounds')
+KV_FIELDS=('iter_host_syncs','iter_host_syncs_per_round','iter_kv_cache_bytes',
+           'iter_kv_full_reallocations','iter_kv_full_history_copies','iter_kv_history_copy_bytes')
 FIELDS=('global_iter','epoch','batch_iter','method','grpo_step','used_items','eligible_prompts','total_prompts',
     'iter_aal','cumulative_aal','iter_generation_time_s','cumulative_generation_time_s','cumulative_wall_time_s',
     'iter_rollout_tokens','cumulative_rollout_tokens','iter_verification_rounds','cumulative_verification_rounds',
-    'iter_acceptance_rate','cumulative_acceptance_rate')+tuple('iter_opd_'+s for s in OPD_FIELDS)
+    'iter_acceptance_rate','cumulative_acceptance_rate')+tuple('iter_opd_'+s for s in OPD_FIELDS)+KV_FIELDS
 
 
 class RolloutMetricsWriter:
@@ -29,10 +31,11 @@ class RolloutMetricsWriter:
         path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
         # Resume at the checkpoint's iterator position, removing future rows.
         if path.exists():
-            with path.open(newline='') as f:rows=list(csv.DictReader(f))
+            with path.open(newline='') as f:
+                reader=csv.DictReader(f);rows=list(reader);previous_fields=reader.fieldnames
             limit=self.state.get('global_iter',0)
             kept=[r for r in rows if int(r['global_iter'])<=limit]
-            if len(kept)!=len(rows):
+            if len(kept)!=len(rows) or previous_fields!=list(FIELDS):
                 backup=path.with_suffix('.pre_resume.csv')
                 if not backup.exists():backup.write_bytes(path.read_bytes())
                 with path.open('w',newline='') as f:
@@ -76,7 +79,13 @@ class RolloutMetricsWriter:
             iter_acceptance_rate=ratio(values['accepted_draft'],values['proposed']),
             cumulative_acceptance_rate=ratio(self.state['accepted_draft'],self.state['proposed']))
         for field in OPD_FIELDS:row['iter_opd_'+field]=0.
+        for field in KV_FIELDS:row[field]=''
         if self.method=='opd_reflex':
+            row['iter_host_syncs']=o.get('opd_host_syncs',0)
+            row['iter_host_syncs_per_round']=o.get('opd_host_syncs_per_round',0)
+            row['iter_kv_cache_bytes']=sum(o.get('opd_'+side+'_kv_cache_bytes',0) for side in ('target','draft'))
+            for field,name in (('iter_kv_full_reallocations','full_kv_reallocations'),('iter_kv_full_history_copies','full_history_copies'),('iter_kv_history_copy_bytes','full_history_copy_bytes')):
+                row[field]=sum(o.get('opd_'+side+'_'+name,0) for side in ('target','draft'))
             for name in ('selected_states','visited_states','frontier_states','active_rows_max'):
                 row['iter_opd_'+name]=o.get('opd_'+name,0.)
             for name,num,den in [('kl','kl_sum','state_weight'),('target_mass_in_draft_top16','draft_topk_target_mass_sum','selected_states'),

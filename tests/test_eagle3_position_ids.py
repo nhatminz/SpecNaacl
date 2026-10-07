@@ -1,4 +1,4 @@
-"""Actual EAGLE adapter/RoPE regression with tiny CPU weights, no GPU rollout."""
+"""Actual EAGLE/RoPE parity and tiny HF target + EAGLE GPU rollout integration."""
 
 import ast
 from pathlib import Path
@@ -177,3 +177,51 @@ def test_eagle_static_cache_matches_legacy_prefill_append_and_rollback(tiny_adap
             assert static['past_key_values'][0][0].untyped_storage().data_ptr()==ptr
         static['past_key_values'].crop(4)
         assert torch.equal(static['past_key_values'][0][0],legacy['past_key_values'][0][0][...,:4,:])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(),reason='real tiny HF + SpecForge GPU rollout')
+@pytest.mark.parametrize('update_stream',[False,True])
+def test_real_hf_eagle_rollout_mask_cache_sampler_feedback_integration(tiny_adapter,update_stream):
+    from types import SimpleNamespace
+    from transformers import Qwen2Config,Qwen2ForCausalLM
+    from helper.opd_reflex import initialize_projector
+    from helper.specualtive_generate import speculative_generate
+    config=Qwen2Config(vocab_size=32,hidden_size=16,intermediate_size=32,num_hidden_layers=2,
+        num_attention_heads=4,num_key_value_heads=2,head_dim=4)
+    config._attn_implementation='sdpa'
+    adapter=tiny_adapter.cuda().to(torch.bfloat16);adapter.dtype=torch.bfloat16
+    adapter.target_model=Qwen2ForCausalLM(config).cuda().to(torch.bfloat16).eval()
+    adapter.target_model._fastgrpo_eagle3_capture_layers=[0,0,1]
+    adapter.draft_model.register_parameter('opd_projector',torch.nn.Parameter(initialize_projector(16,8).cuda()))
+    adapter.draft_model.register_buffer('opd_projector_grad_sum',torch.zeros(16,8,device='cuda'))
+    adapter.draft_model.register_buffer('opd_projector_grad_weight',torch.zeros(1,device='cuda'))
+    adapter.draft_model.d2t.zero_()
+    calls={'target':0,'draft':0}
+    hooks=[adapter.target_model.model.register_forward_pre_hook(lambda *a:calls.__setitem__('target',calls['target']+1)),
+        adapter.register_forward_pre_hook(lambda *a:calls.__setitem__('draft',calls['draft']+1))]
+    try:
+        results=[]
+        for static in (False,True):
+            adapter.supports_opd_static_kv=static
+            calls.update(target=0,draft=0)
+            torch.manual_seed(71)
+            output=speculative_generate(adapter,torch.tensor([[1,2,3],[3,4,5]],device='cuda'),
+                torch.ones(2,3,dtype=torch.long,device='cuda'),SimpleNamespace(eos_token_id=31),
+                do_sample=True,repeated_generate_nums=2,max_length=24,verification_capacity=24,
+                max_draft_k=2,max_draft_token_length=2,min_draft_token_length=2,max_verification_num=8,
+                method='opd_reflex',opd_update_stream=update_stream,return_all_draft_input=True)
+            assert calls['target']==1+output['batch_verification_rounds']
+            assert calls['draft']==2*output['batch_verification_rounds']
+            assert len(output['generated_token_ids'])==4
+            assert output['opd_host_syncs_per_round']==1
+            results.append((output,torch.cuda.get_rng_state()))
+        legacy,growable=(x[0] for x in results)
+        assert torch.equal(results[0][1],results[1][1])
+        for key in ('generated_token_ids','total_acc_length','total_decoded_token_num',
+                    'response_accepted_length_sum','response_verification_rounds'):
+            assert legacy[key]==growable[key]
+        for key in ('all_draft_input_states','all_target_hidden_states','all_draft_input_ids'):
+            for before,after in zip(legacy[key],growable[key]):
+                torch.testing.assert_close(before,after,rtol=0,atol=0)
+    finally:
+        for hook in hooks:hook.remove()

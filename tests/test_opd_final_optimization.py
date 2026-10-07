@@ -43,9 +43,7 @@ def test_sampling_metadata_preserves_distribution_rng(device,top_p,top_k):
     torch.manual_seed(17);new=sample_target_with_metadata(logits,**kwargs)
     assert torch.equal(after,torch.rand(7,device=device))
     assert torch.equal(old[0],new[0]) and torch.equal(old[1],new[1])
-    if new[2] is not None:
-        p,ids=new[2]
-        assert torch.equal(new[1].flatten(0,1).gather(1,ids),p)
+    assert new[2] is None  # full sorted arrays never escape sampler
 
 @pytest.mark.skipif(not torch.cuda.is_available(),reason='compiled teacher metadata kernel')
 @pytest.mark.parametrize('ties',[False,True])
@@ -62,7 +60,9 @@ def test_teacher_full_permutation_reuses_sampler_and_matches_reference(ties,top_
     tree=PackedTree(root,root.clone(),torch.zeros_like(root),0)
     path=SimpleNamespace(packed_indices=torch.zeros_like(root))
     logits=torch.zeros(3,1,37,device='cuda') if ties else torch.randn(3,1,37,device='cuda')
-    _,p,meta=sample_target_with_metadata(logits,do_sample=True,temperature=1.,top_p=.95,top_k=top_k,eos_token_id=2)
+    def build(tokens,p,sorted_metadata):
+        return s.prepare_sampler_teacher(tree,path,p,sorted_metadata)
+    _,p,meta=sample_target_with_metadata(logits,do_sample=True,temperature=1.,top_p=.95,top_k=top_k,eos_token_id=2,metadata_builder=build)
     def forbidden(*a,**k):raise AssertionError('full-vocab teacher rescan')
     monkeypatch.setattr(kernels,'teacher',forbidden)
     s.feedback(tree,path,p,sampling_metadata=meta)

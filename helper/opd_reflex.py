@@ -14,6 +14,7 @@ import os
 import hashlib
 from pathlib import Path
 import torch
+from helper.opd_attention import AttentionWorkspace
 
 OPD_COUNTER_NAMES=(
     'opd_state_weight','opd_selected_states','opd_visited_states','opd_frontier_states',
@@ -135,6 +136,8 @@ class OPDReflex:
 
     def start(self,model,batch,mapping,hidden_size,*,max_contexts,max_nodes,max_path,max_proposal_contexts):
         device=mapping.device;v=mapping.numel();k=min(v,self.requested_topk)
+        if not hasattr(self,'attention_workspace') or self.attention_workspace.device!=device:
+            self.attention_workspace=AttentionWorkspace(device)
         if self.requested_backend=='torch' and device.type=='cuda':
             raise ValueError('Torch OPD is CPU oracle only; production CUDA requires Triton')
         self.backend='triton' if device.type=='cuda' else 'torch'
@@ -227,6 +230,7 @@ class OPDReflex:
                     self.projector_delta=alloc((hidden_size,self.rank))
         self.bitmap.zero_();self.active_count.zero_();self.dispatch_snapshot.zero_()
         self.host_active_count=0
+        self.host_sync_count=0
         if self.enabled:self.B_fast.zero_();self.counters.zero_()
         self._ever_updated=False;self._events.clear()
 
@@ -249,6 +253,12 @@ class OPDReflex:
     def end(self,ticket):
         if ticket is not None:
             end=torch.cuda.Event(enable_timing=True);end.record();self._events.append((ticket[0],ticket[1],end))
+
+    def prepare_sampler_teacher(self,tree,path,target,sorted_metadata):
+        if self.backend=='triton' and self.full_vocab_inverse is not None and sorted_metadata is not None:
+            return self._opd_kernels.prepare_teacher(self,tree,path,target,sampling_metadata=sorted_metadata)
+        # Subsets use selected compact extraction in feedback; no sorted retention.
+        return None
 
     @torch.no_grad()
     def propose(self,logits,hidden,k,mapping,*,root=False,context_offset=0,head_inputs=None):

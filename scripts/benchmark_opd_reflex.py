@@ -56,7 +56,7 @@ def collator(tokenizer,max_prompt_length):
 
 def release_runtime_cache(model):
     # Benchmark boundaries only. Don't charge a previous mode's retained pools.
-    for name in ('_opd_runtime_cache','_opd_tree_mask_workspace','_opd_padding_workspace','_opd_kv_scratch'):
+    for name in ('_opd_runtime_cache','_opd_tree_mask_workspace','_opd_attention_workspace','_opd_padding_workspace','_opd_kv_scratch'):
         if hasattr(model,name):delattr(model,name)
 
 
@@ -86,6 +86,16 @@ def summarize(rows):
     result['opd_active_rows_max']=max(r.get('opd_active_rows_max',0.) for r in rows)
     result['opd_sparse_rounds']=result['opd_proposal_mode_sparse_rounds']
     result['opd_dense_rounds']=result['opd_proposal_mode_dense_rounds']
+    host_syncs=sum(r.get('opd_host_syncs',0) for r in rows)
+    batches=sum(r.get('batch_verification_rounds',0) for r in rows)
+    result['host_syncs_per_round']=host_syncs/batches if batches and rows[0].get('method')=='opd_reflex' else None
+    result['kv_cache_bytes']=max(r.get('observed_kv_cache_bytes',0) for r in rows)
+    for field in ('full_kv_reallocations','full_history_copies','full_history_copy_bytes','row_compactions','row_compaction_bytes'):
+        result[field]=(sum(r.get('opd_target_'+field,0)+r.get('opd_draft_'+field,0) for r in rows)
+                       if rows[0].get('method')=='opd_reflex' else None)
+    measured_compactions=[r['kv_compaction_profile_ms'] for r in rows
+                          if r.get('kv_compaction_profile_ms') is not None]
+    result['kv_compaction_profile_ms']=sum(measured_compactions) if measured_compactions else None
     if result['opd_nonfinite_kl_states']:result['opd_kl']=None
     return result
 
@@ -121,8 +131,20 @@ def benchmark(args):
         if batch['input_ids'].shape[1]>=args.max_length:raise ValueError('prompt exhausts total max_length')
         batches.append({k:batch[k].cuda() for k in ('input_ids','attention_mask')})
     count={'target':0,'draft':0}
+    observed_kv={'target':0,'draft':0}
+    def observe_cache(kind,output):
+        cache=output.get('past_key_values') if isinstance(output,dict) else getattr(output,'past_key_values',None)
+        if cache is None:return
+        if hasattr(cache,'statistics'):
+            size=cache.statistics()['kv_cache_bytes']
+        else:
+            layers=((layer.keys,layer.values) for layer in cache.layers) if hasattr(cache,'layers') else iter(cache)
+            size=sum(t.untyped_storage().nbytes() for layer in layers for t in layer if t is not None)
+        observed_kv[kind]=max(observed_kv[kind],size)
     target_hook=target.model.register_forward_pre_hook(lambda *unused:count.__setitem__('target',count['target']+1))
     draft_hook=model.register_forward_pre_hook(lambda *unused:count.__setitem__('draft',count['draft']+1))
+    target_cache_hook=target.model.register_forward_hook(lambda module,args,out:observe_cache('target',out))
+    draft_cache_hook=model.register_forward_hook(lambda module,args,out:observe_cache('draft',out))
     base=dict(do_sample=True,repeated_generate_nums=args.responses,max_length=args.max_length,
         temperature=args.temperature,top_p=args.top_p,top_k=args.top_k or None,
         verification_capacity=args.verification_capacity,max_verification_num=args.max_verification_num,
@@ -132,6 +154,7 @@ def benchmark(args):
         opd_profile=False,opd_diagnostics=args.diagnostics,statistical_time=False)
     def run(method,lr,stream,batch,seed):
         torch.manual_seed(seed);before=count.copy()
+        observed_kv.update(target=0,draft=0)
         out=speculative_generate(model,batch['input_ids'],batch['attention_mask'],tokenizer,
             method=method,opd_fast_lr=lr,opd_update_stream=bool(stream),**base)
         return out,{k:count[k]-before[k] for k in count}
@@ -168,6 +191,10 @@ def benchmark(args):
                         peak_allocated_bytes=allocated,peak_reserved_bytes=reserved,**forwards,
                         **{k:output.get(k,0.) for k in OPD_COUNTER_NAMES})
                     row.update({k:v for k,v in output.items() if k.startswith('opd_final_')})
+                    row['batch_verification_rounds']=output['batch_verification_rounds']
+                    row['observed_kv_cache_bytes']=sum(observed_kv.values())
+                    for name,value in output.items():
+                        if isinstance(value,(int,float)) and (name.startswith(('opd_target_','opd_draft_','opd_host_sync','opd_attention_'))):row[name]=value
                     if args.profile:
                         # Diagnostic replay does not evict warmed non-profile pools.
                         cache=getattr(model,'_opd_runtime_cache',None)
@@ -177,6 +204,9 @@ def benchmark(args):
                         if profile['generated_token_ids']!=output['generated_token_ids']:
                             raise AssertionError('profiling changed output; discard timings')
                         row['profile_sections_ms']=profile['opd_profile_sections_ms']
+                        sections=profile.get('opd_profile_sections_ms') or {}
+                        row['kv_compaction_profile_ms']=(sum(sections.get(key,0) for key in ('kv_batch_compaction_ms','kv_suffix_compaction_ms'))
+                            if method=='opd_reflex' else None)
                     with response_file.open('a') as f:
                         for response,(tokens,a,n) in enumerate(zip(output['generated_token_ids'],output['response_accepted_length_sum'],output['response_verification_rounds'])):
                             f.write(json.dumps(dict(method=method,fast_lr=lr,update_stream=stream,seed=actual_seed,
@@ -209,7 +239,9 @@ def benchmark(args):
                 update_stream=recommendation['update_stream'],delta_aal=recommendation['delta_aal']),
             note='Historical FastGRPO unchanged, OPD only optimized. Frozen policy/draft/A; no A gradient accumulation in evaluation. Wall includes ALL OPD work. Profiling replay excluded from generation wall. Same seed does not imply same responses.')
         return payload
-    finally:target_hook.remove();draft_hook.remove()
+    finally:
+        target_hook.remove();draft_hook.remove()
+        target_cache_hook.remove();draft_cache_hook.remove()
 
 
 def main():

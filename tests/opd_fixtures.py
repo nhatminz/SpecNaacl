@@ -16,6 +16,7 @@ from helper.tree_verification import pack_tree,trace_verified_path,select_confid
 from helper.sampling import build_sampling_probs,sample_from_probs,sample_target_from_logits
 from helper.opd_sampling import sample_target_with_metadata
 from helper.opd_static_cache import OPDStaticCache
+from helper.opd_attention import AttentionWorkspace
 from helper.opd_scheduling import schedule,compact_suffix_inplace
 
 class Cache:
@@ -118,7 +119,7 @@ def load_rollout(device='cpu',history_type=None):
             n.args.defaults[1]=ast.Constant(device)
     fns=[n for n in tree.body if isinstance(n,ast.FunctionDef)]
     scope=dict(torch=torch,time=time,math=math,deepcopy=deepcopy,DynamicCache=Cache,
-               OPDStaticCache=OPDStaticCache,OPDReflex=OPDReflex,resolve_method=resolve_method,RolloutHistory=opd_history,
+               AttentionWorkspace=AttentionWorkspace,OPDStaticCache=OPDStaticCache,OPDReflex=OPDReflex,resolve_method=resolve_method,RolloutHistory=opd_history,
                OPD_COUNTER_NAMES=OPD_COUNTER_NAMES,historical_generate=load_historical(device,historical_history),
                schedule=schedule,compact_suffix_inplace=compact_suffix_inplace,
                pack_tree=pack_tree,trace_verified_path=trace_verified_path,

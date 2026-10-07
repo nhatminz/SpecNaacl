@@ -94,6 +94,25 @@ def test_benchmark_aal_uses_weighted_rounds_and_kl_uses_state_weights():
     assert result['aal']==1.5 and result['tokens_per_s']==7.5 and result['opd_kl']==2.
 
 
+def test_benchmark_copy_sync_and_replay_timing_do_not_fake_baseline_measurements():
+    common=dict(generated_tokens=5,generation_wall_s=1.,accepted_length_sum=3,
+        verification_rounds=2,accepted_draft_tokens=1,proposed_draft_tokens=4,
+        peak_allocated_bytes=100,peak_reserved_bytes=120,batch_verification_rounds=2,
+        observed_kv_cache_bytes=80)
+    baseline=summarize([dict(common,method='fastgrpo')])
+    assert baseline['host_syncs_per_round'] is None
+    assert baseline['full_kv_reallocations'] is None
+    assert baseline['kv_compaction_profile_ms'] is None
+    assert baseline['kv_cache_bytes']==80
+    row=dict(common,method='opd_reflex',opd_host_syncs=2,
+             opd_target_full_kv_reallocations=1,opd_draft_full_kv_reallocations=2,
+             kv_compaction_profile_ms=.5)
+    measured=summarize([row,row])
+    assert measured['host_syncs_per_round']==1
+    assert measured['full_kv_reallocations']==6
+    assert measured['kv_compaction_profile_ms']==1
+
+
 def test_no_host_sync_in_production_feedback_and_no_dense_vocab_correction_or_target_forward():
     root=Path(__file__).resolve().parents[1]/'helper'
     kernels=(root/'opd_reflex_kernels.py').read_text()

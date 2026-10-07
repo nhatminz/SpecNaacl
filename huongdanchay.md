@@ -63,8 +63,29 @@ MAX_TRAIN_SAMPLES=128 bash train_qwen25_3b_fastgrpo.sh --max_grpo_steps 2
 
 ## Sweep nhanh LR/stream: FROZEN model, không train/checkpoint
 
+Revision growable-KV/compact-sampler thay đổi kernel fingerprint. Profile cũ sẽ
+bị reject có chủ đích; tạo profile mới bằng config thật trước khi sweep/train:
+
 ```bash
-MODEL_KEY=qwen25_3b OPD_FAST_LRS=0.001,0.01,0.05,0.1 OPD_STREAMS=0,1 \
+export MODEL_KEY=qwen3_1p7b # hoặc qwen25_3b / qwen3_4b
+export OPD_TUNE_OUTPUT="$PWD/outputs/benchmarks/opd_proposals/${MODEL_KEY}_$(date -u +%Y%m%dT%H%M%S_%N).json"
+bash scripts/tune_opd_proposals.sh
+export OPD_PROPOSAL_PROFILE="$OPD_TUNE_OUTPUT"
+
+# KV memory/latency, không model forward hay training. Đọc config target/draft.
+KV_BENCH_LENGTHS=256,512,1024,2048 KV_BENCH_BATCHES=16,32,64 \
+bash scripts/benchmark_opd_kv.sh
+```
+
+KV output: `outputs/benchmarks/kv_<model_key>_<timestamp>/{target,draft}/report.json`
+và `kv.csv`. Full-layer memory mặc định; OOM được ghi trong report. Muốn kiểm tra
+component nhỏ trước: `KV_BENCH_LAYERS=1 bash scripts/benchmark_opd_kv.sh` (không
+được xem như memory của full model). Cache không realloc khi row finish; geometric
+growth/row remap vẫn copy live prefix, telemetry không che giấu các copies này.
+Không reuse proposal profile khác model/GPU/compiler/kernel.
+
+```bash
+OPD_FAST_LRS=0.001,0.01,0.05,0.1 OPD_STREAMS=0,1 \
 BENCH_SEEDS=42,43 BENCH_ITERATIONS=2 BENCH_WARMUP=1 \
 bash scripts/sweep_opd_reflex.sh
 ```
@@ -74,9 +95,22 @@ max_prompt_length256, verification_capacity512, K8, depth5. Warmup chạy đúng
 seed/prompt schedule để tránh đổ JIT vào timing. Muốn workload train:
 
 ```bash
-MODEL_KEY=qwen25_3b BENCH_MAX_LENGTH=2048 BENCH_MAX_PROMPT_LENGTH=2048 \
+BENCH_MAX_LENGTH=2048 BENCH_MAX_PROMPT_LENGTH=256 \
 BENCH_ITERATIONS=3 BENCH_SEEDS=11,29,47 bash scripts/sweep_opd_reflex.sh
 ```
+
+Thêm `--gpu-utilization` để benchmark-only lấy nvidia-smi utilization. Để đo riêng
+OPD/KV compaction trong diagnostic replay (excluded from wall/throughput):
+
+```bash
+OPD_PROFILE=1 OPD_FAST_LRS=0.01 OPD_STREAMS=0,1 BENCH_SEEDS=42 \
+BENCH_ITERATIONS=1 BENCH_MAX_LENGTH=2048 BENCH_MAX_PROMPT_LENGTH=256 \
+bash scripts/sweep_opd_reflex.sh --gpu-utilization
+```
+
+Report/summary có `kv_cache_bytes`, `host_syncs_per_round`, copy/reallocation
+counters và `kv_compaction_profile_ms` khi profile được bật. OPD còn1 scheduling
+host packet/round; counters baseline không instrument là null. PROFILE=0 khi train.
 
 Prompt đã dài bằng max_length bị reject; tăng max_length hoặc giảm max_prompt_length.
 Dùng BENCH_OUTPUT mới nếu muốn chỉ định output. Script xuất report.json,
@@ -94,7 +128,9 @@ rollout, không thêm target/draft transformer forward.
 ```bash
 export MODEL_KEY=qwen3_1p7b
 export DRAFT_CONFIG="$PWD/outputs/pretrain/$MODEL_KEY/latest_draft_config.json"
+export OPD_TUNE_OUTPUT="$PWD/outputs/benchmarks/opd_proposals/${MODEL_KEY}_$(date -u +%Y%m%dT%H%M%S_%N).json"
 CUDA_VISIBLE_DEVICES=0 bash scripts/tune_opd_proposals.sh
+export OPD_PROPOSAL_PROFILE="$OPD_TUNE_OUTPUT"
 ```
 
 Script đọc V/H từ draft config thật, không có vocab mặc định 32768.
@@ -120,8 +156,9 @@ CUDA_VISIBLE_DEVICES=0 bash train_qwen3_1p7b.sh
 CUDA_VISIBLE_DEVICES=0 bash train_qwen3_1p7b_fastgrpo.sh
 ```
 
-Shape/V/H phải đúng model; override OPD_TUNE_SHAPES, OPD_TUNE_VOCAB,
-OPD_TUNE_HIDDEN. Default đo contexts 1/8/32/64/128/256/512 và active rows
+Shape/V/H phải đúng model; override OPD_TUNE_SHAPES nếu cần;
+V/H đọc từ DRAFT_CONFIG, không đo bằng vocabulary giả. Default đo contexts
+1/8/32/64/128/256/512 và active rows
 0/16/64/256/1024/4096/8192/V, so sánh sparse/dense-fused/dense-GEMM/auto.
 Profile sai GPU/compiler/hash bị reject. Shape chưa đo nội suy theo tổng contexts;
 không fallback sparse vô điều kiện. Chưa có profile thì auto dùng ngưỡng V/8
