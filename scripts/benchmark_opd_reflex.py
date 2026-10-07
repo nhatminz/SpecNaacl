@@ -9,6 +9,7 @@ from pathlib import Path
 import statistics
 import sys
 import time
+import os
 
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT))
@@ -33,6 +34,7 @@ def parse_args(argv=None):
     p.add_argument('--attn-implementation',default='sdpa');p.add_argument('--dtype',choices=['bf16','fp16'],default='bf16')
     p.add_argument('--profile',action='store_true',help='Separate same-seed replay, excluded from wall/throughput')
     p.add_argument('--diagnostics',action='store_true',help='Opt-in end-rollout B norm; excluded by default')
+    p.add_argument('--gpu-utilization',action='store_true',help='Benchmark-only 0.5s nvidia-smi sampling; may perturb host timing')
     p.add_argument('--dry-run',action='store_true')
     a=p.parse_args(argv)
     a.lr_values=[float(x) for x in a.fast_lrs.split(',')];a.stream_values=[int(x) for x in a.streams.split(',')]
@@ -80,6 +82,10 @@ def summarize(rows):
                  'opd_proposal_mode_sparse_rounds','opd_proposal_mode_dense_rounds'):
         result[name]=sum(r.get(name,0.) for r in rows)
     result['opd_nonfinite_kl_states']=sum(r.get('opd_nonfinite_kl_states',0.) for r in rows)
+    result['opd_active_rows_mean']=result['opd_active_token_rows']
+    result['opd_active_rows_max']=max(r.get('opd_active_rows_max',0.) for r in rows)
+    result['opd_sparse_rounds']=result['opd_proposal_mode_sparse_rounds']
+    result['opd_dense_rounds']=result['opd_proposal_mode_dense_rounds']
     if result['opd_nonfinite_kl_states']:result['opd_kl']=None
     return result
 
@@ -91,6 +97,7 @@ def benchmark(args):
     from helper.get_QAs import get_QAs_from_path
     from helper.specualtive_generate import speculative_generate
     from helper.opd_reflex import OPD_COUNTER_NAMES
+    from scripts.gpu_utilization import GPUUtilization
     if not torch.cuda.is_available():raise RuntimeError('real CUDA + configured pretrained checkpoints required')
     dtype=torch.bfloat16 if args.dtype=='bf16' else torch.float16
     torch.cuda.set_device(0);torch.manual_seed(args.seed_values[0])
@@ -145,6 +152,7 @@ def benchmark(args):
                 for seed in args.seed_values:
                     for i,batch in enumerate(batches):run(method,lr,stream,batch,seed+i)
             rows=[];measured_total_begin=time.perf_counter()
+            utilization=GPUUtilization(args.gpu_utilization).start()
             for seed in args.seed_values:
                 for i,batch in enumerate(batches):
                     actual_seed=seed+i
@@ -177,7 +185,7 @@ def benchmark(args):
                                 token_ids_sha256=hashlib.sha256(json.dumps(tokens).encode()).hexdigest()))+'\n')
                     rows.append(row)
             result=dict(method=method,fast_lr=lr,update_stream=stream,**summarize(rows),rollouts=rows,
-                measured_total_wall_s=time.perf_counter()-measured_total_begin)
+                measured_total_wall_s=time.perf_counter()-measured_total_begin,**utilization.finish())
             reports.append(result)
         baseline=reports[0]
         for result in reports:
@@ -189,7 +197,10 @@ def benchmark(args):
         goal_candidates=[x for x in reports[1:] if x['delta_aal']>0 and x['tokens_per_s']>=baseline['tokens_per_s']]
         recommendation=max(goal_candidates,key=lambda x:x['tokens_per_s']) if goal_candidates else None
         payload=dict(gpu=torch.cuda.get_device_name(),torch=torch.__version__,config=vars(args),
-            gpu_utilization=None,gpu_utilization_note='No sampling profiler installed; not inferred from throughput',
+            proposal_mode=os.environ.get('OPD_PROPOSAL_MODE','auto'),
+            proposal_profile=os.environ.get('OPD_PROPOSAL_PROFILE',''),
+            dense_implementation=os.environ.get('OPD_DENSE_IMPLEMENTATION','auto'),
+            gpu_utilization_note='Per-configuration nvidia-smi samples when --gpu-utilization is set; includes diagnostic replay if requested.',
             baseline='historical native torch.topk(draft_k), c3f05ad OFF',
             cold_invariant='B=0 leaves raw logits/distribution unchanged; Top16 tie IDs need not equal historical K',reports=reports,
             fastest_observed=dict(method=best['method'],fast_lr=best['fast_lr'],update_stream=best['update_stream'],

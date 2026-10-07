@@ -15,10 +15,11 @@ COUNTERS = (
     'wall_time_s', 'generation_time_s', 'target_train_time_s', 'draft_train_time_s',
     'rollout_tokens', 'accepted_tokens', 'verification_rounds',
     'accepted_draft_tokens', 'proposed_draft_tokens',
-)+OPD_COUNTER_NAMES+GENERATION_COUNTER_NAMES
+)+tuple(name for name in OPD_COUNTER_NAMES if name!='opd_active_rows_max')+GENERATION_COUNTER_NAMES
 DERIVED_OPD_FIELDS=tuple(f'{prefix}_{name}' for prefix in ('step','cumulative') for name in (
     'opd_kl','opd_mean_union_size','opd_target_compact_mass','opd_target_mass_in_draft_top16',
-    'opd_active_token_rows','mean_active_responses_per_verify_round','mean_verified_tree_nodes',
+    'opd_active_token_rows','opd_active_rows_mean','opd_active_rows_max','opd_sparse_rounds','opd_dense_rounds',
+    'mean_active_responses_per_verify_round','mean_verified_tree_nodes',
     'mean_verified_path_length','mean_frontier_per_visited_state'))
 MEMORY_FIELDS = ('gpu_allocated_gb', 'gpu_reserved_gb', 'gpu_peak_allocated_gb', 'gpu_free_gb')
 STEP_FIELDS = ('step', 'method', 'grpo_step', 'phase_time_basis') + tuple(
@@ -84,6 +85,8 @@ def gpu_memory_stats(device):
 def completed_step_snapshot(global_metrics, data, timings, device, wall_time_s):
     """Called after _aggregate_job_metrics' existing GPU-to-CPU transfer."""
     durations = timings.resolve()
+    interval_max=float(global_metrics.get('opd_interval_active_rows_max',0.))
+    data['opd_interval_active_rows_max']=0.
     data['_phase_target_time_s'] = durations['target']
     data['_phase_draft_time_s'] = durations['draft']
     memory = gpu_memory_stats(device)
@@ -109,6 +112,7 @@ def completed_step_snapshot(global_metrics, data, timings, device, wall_time_s):
         'cumulative_proposed_draft_tokens': int(global_metrics['total_proposed_draft_tokens']),
         'phase_time_basis': timings.basis,
         **{f'cumulative_{name}':float(global_metrics.get(name,0.)) for name in OPD_COUNTER_NAMES+GENERATION_COUNTER_NAMES},
+        'step_opd_active_rows_max':interval_max,
         **memory,
     }
 
@@ -140,12 +144,17 @@ def step_record(step, current, previous, extras=None):
             ('opd_target_compact_mass','opd_compact_mass_sum','opd_selected_states'),
             ('opd_target_mass_in_draft_top16','opd_draft_topk_target_mass_sum','opd_selected_states'),
             ('opd_active_token_rows','opd_active_rows_sum','opd_rounds'),
+            ('opd_active_rows_mean','opd_active_rows_sum','opd_rounds'),
             ('mean_active_responses_per_verify_round','active_response_rounds','verification_batches'),
             ('mean_verified_tree_nodes','verified_tree_nodes','verification_rounds'),
             ('mean_verified_path_length','accepted_tokens','verification_rounds'),
             ('mean_frontier_per_visited_state','opd_frontier_states','opd_visited_states'),
         ):result[f'{prefix}_{name}']=ratio(numerator,denominator)
         if result[f'{prefix}_opd_nonfinite_kl_states']>0:result[f'{prefix}_opd_kl']=None
+        result[f'{prefix}_opd_sparse_rounds']=result[f'{prefix}_opd_proposal_mode_sparse_rounds']
+        result[f'{prefix}_opd_dense_rounds']=result[f'{prefix}_opd_proposal_mode_dense_rounds']
+    result.setdefault('step_opd_active_rows_max',0.)
+    result.setdefault('cumulative_opd_active_rows_max',0.)
     # Legacy plotting columns keep their former cumulative meaning.
     result.update(rollout_tokens=result['cumulative_rollout_tokens'],
                   tokens_per_s=result['cumulative_rollout_tokens'] / max(result['cumulative_wall_time_s'], 1e-9),
@@ -245,7 +254,11 @@ class StepMetricsWriter:
 
     def submit(self, step, snapshot, extras):
         self.advance(step)
-        self.pending = {'step': int(step), 'snapshot': dict(snapshot), 'extras': dict(extras)}
+        snapshot=dict(snapshot)
+        if self.pending is not None:
+            snapshot['step_opd_active_rows_max']=max(snapshot.get('step_opd_active_rows_max',0.),
+                self.pending['snapshot'].get('step_opd_active_rows_max',0.))
+        self.pending = {'step': int(step), 'snapshot': snapshot, 'extras': dict(extras)}
 
     def flush(self):
         if self.pending is None:

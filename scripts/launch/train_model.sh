@@ -185,6 +185,7 @@ ln -sfn "$RUN_DIR" "$TRAIN_MODEL_ROOT/active_run"
   --item "opd_profile=$OPD_PROFILE" --item "opd_diagnostics=$OPD_DIAGNOSTICS" \
   --item "opd_backend=$OPD_BACKEND" \
   --item "opd_train_projector=$OPD_TRAIN_PROJECTOR" --item "opd_proposal_mode=$OPD_PROPOSAL_MODE" \
+  --item "opd_dense_implementation=$OPD_DENSE_IMPLEMENTATION" \
   --item "opd_proposal_profile=$OPD_PROPOSAL_PROFILE" \
   --item "kv_gather_strategy=${KV_GATHER_STRATEGY:-stacked}" \
   --item "nproc_per_node=$NPROC_PER_NODE"

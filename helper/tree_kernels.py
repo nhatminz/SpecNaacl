@@ -4,8 +4,8 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
-def _confidence_keys(SCORES, KEYS, N: tl.constexpr, S0, S1,
+@triton.jit(do_not_specialize=["N","S0","S1"])
+def _confidence_keys(SCORES, KEYS, N, S0, S1,
                      BLOCK: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
@@ -22,11 +22,11 @@ def confidence_keys(confidences, keys):
         confidences, keys, nodes, *confidences.stride(), 256, num_warps=4)
 
 
-@triton.jit
-def _pad_schedule(TOKENS,INDICES,LENGTHS,OT,OI,OM,LAST,PACKET,
-                   B:tl.constexpr,CAP:tl.constexpr,PAST:tl.constexpr,EOS:tl.constexpr,
+@triton.jit(do_not_specialize=["B","CAP","PAST","TS0","TS1","IS0","IS1","OS0","OS1","PS0","PS1"])
+def _pad_schedule(TOKENS,INDICES,LENGTHS,OT,OI,OM,LAST,PACKET,SNAPSHOT,
+                   B,CAP,PAST,EOS:tl.constexpr,
                    TS0,TS1,IS0,IS1,OS0,OS1,PS0,PS1,
-                   BW:tl.constexpr,BB:tl.constexpr):
+                   BW:tl.constexpr,BB:tl.constexpr,HAS_SNAPSHOT:tl.constexpr):
     batch=tl.program_id(0).to(tl.int64);slot=tl.arange(0,BW);rows=tl.arange(0,BB)
     lengths=tl.load(LENGTHS+rows,rows<B,other=0);width=tl.max(lengths,axis=0)
     length=tl.load(LENGTHS+batch)
@@ -48,18 +48,19 @@ def _pad_schedule(TOKENS,INDICES,LENGTHS,OT,OI,OM,LAST,PACKET,
     tl.store(PACKET+batch*PS0,length)
     tl.store(PACKET+batch*PS0+PS1,(eos_token==EOS).to(tl.int64))
     tl.store(PACKET+batch*PS0+2*PS1,extension)
+    if HAS_SNAPSHOT:tl.store(PACKET+batch*PS0+(CAP+3)*PS1,tl.load(SNAPSHOT))
     tl.store(PACKET+batch*PS0+(slot+3)*PS1,tl.where((slot<width)&~accepted,output_ids,-1),slot<CAP)
 
 
-def pad_schedule(path,past,eos,tokens,indices,mask,last,packet):
+def pad_schedule(path,past,eos,tokens,indices,mask,last,packet,snapshot=None):
     b,cap=path.tokens.shape
-    _pad_schedule[(b,)](path.tokens,path.packed_indices,path.lengths,tokens,indices,mask,last,packet,
+    _pad_schedule[(b,)](path.tokens,path.packed_indices,path.lengths,tokens,indices,mask,last,packet,snapshot,
         b,cap,past,eos,*path.tokens.stride(),*path.packed_indices.stride(),*tokens.stride(),*packet.stride(),
-        triton.next_power_of_2(cap),triton.next_power_of_2(b),num_warps=4)
+        triton.next_power_of_2(cap),triton.next_power_of_2(b),snapshot is not None,num_warps=4)
 
-@triton.jit
+@triton.jit(do_not_specialize=["CONTEXTS"])
 def _proposal_merge(MAX, SUM, VALUES, IDS, PROBS, TOP_IDS, NORM,
-                    CONTEXTS: tl.constexpr, VOCAB: tl.constexpr, K: tl.constexpr,
+                    CONTEXTS, VOCAB: tl.constexpr, K: tl.constexpr,
                     TILES: tl.constexpr, BT: tl.constexpr, BK: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     t = tl.arange(0, BT)
@@ -82,9 +83,9 @@ def _proposal_merge(MAX, SUM, VALUES, IDS, PROBS, TOP_IDS, NORM,
         # separately, or exhausted finite candidates are emitted again at q=0.
         live = live & (ids != index)
 
-@triton.jit
+@triton.jit(do_not_specialize=["CONTEXTS","ROWS","WIDTH","OS0","OS1"])
 def _trace_path(PARENTS, TOKENS, CONTEXTS, SAMPLES, OUT_T, OUT_I, OUT_C, LENGTHS,
-                ROWS: tl.constexpr, WIDTH: tl.constexpr, EOS: tl.constexpr,
+                ROWS, WIDTH, EOS: tl.constexpr,
                 OS0, OS1, BR: tl.constexpr):
     batch = tl.program_id(0).to(tl.int64)
     candidates = tl.arange(0, BR)
@@ -111,9 +112,9 @@ def trace_path(tree, samples, eos, tokens, indices, contexts, lengths):
         tokens, indices, contexts, lengths, rows, tokens.shape[1], int(eos), *tokens.stride(),
         triton.next_power_of_2(rows), num_warps=4)
 
-@triton.jit
+@triton.jit(do_not_specialize=["CAPACITY","WIDTH","PAST","TS0","TS1","IS0","IS1","OS0","OS1"])
 def _pad_verified_path(TOKENS, INDICES, LENGTHS, OUT_TOKENS, OUT_INDICES, OUT_MASK, LAST,
-                       CAPACITY: tl.constexpr, WIDTH: tl.constexpr, PAST: tl.constexpr,
+                       CAPACITY, WIDTH, PAST,
                        EOS: tl.constexpr, TS0, TS1, IS0, IS1, OS0, OS1, BW: tl.constexpr):
     batch = tl.program_id(0).to(tl.int64)
     slot = tl.arange(0, BW)
@@ -153,11 +154,11 @@ def pad_verified_path(path, past_length, width, eos_token_id, workspace=None):
         num_warps=4)
     return tokens, indices, mask, last
 
-@triton.jit
-def _tree_mask(PARENTS, MASK, ROWS: tl.constexpr, PAST: tl.constexpr,
-               WIDTH: tl.constexpr, MINIMUM: tl.constexpr, BK: tl.constexpr):
+@triton.jit(do_not_specialize=["ROWS","PAST","WIDTH"])
+def _tree_mask(PARENTS, MASK, ROWS, PAST,
+               WIDTH, MINIMUM: tl.constexpr, BK: tl.constexpr):
     row, batch = tl.program_id(0), tl.program_id(1).to(tl.int64)
-    columns = tl.arange(0, BK)
+    columns = tl.program_id(2) * BK + tl.arange(0, BK)
     visible = columns <= PAST  # prefix and root are shared by every query
     current = row.to(tl.int64)  # parent loads are int64; stable loop-carried dtype
     for depth in range(WIDTH):
@@ -168,5 +169,5 @@ def _tree_mask(PARENTS, MASK, ROWS: tl.constexpr, PAST: tl.constexpr,
 
 def tree_mask(tree, past_length, mask):
     batch, rows = tree.parents.shape
-    _tree_mask[(rows, batch)](tree.parents, mask, rows, past_length, tree.max_depth + 1,
-                             torch.finfo(mask.dtype).min, triton.next_power_of_2(past_length + rows), num_warps=4)
+    _tree_mask[(rows, batch, triton.cdiv(past_length + rows, 256))](tree.parents, mask, rows, past_length, tree.max_depth + 1,
+                             torch.finfo(mask.dtype).min, 256, num_warps=4)

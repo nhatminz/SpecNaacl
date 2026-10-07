@@ -1,3 +1,110 @@
+# OPD performance revision — 2026-10-07 (current behavior)
+
+This section supersedes the older sparse-only defaults / dual-launch adaptive
+description and historical validation numbers below. Historical FastGRPO's
+generation, sampling, history, and model algorithms were not edited.
+
+Implemented:
+
+- Runtime extents/strides in tree/OPD Triton kernels use `do_not_specialize` rather
+  than constexpr. Tree mask columns use fixed 256-wide tiles. A GPU test changes
+  past=3/17/1025/2051 and live batch/rows without increasing compiled variants.
+  Power-of-two block buckets and fixed model vocabulary/rank still specialize.
+- Default `OPD_PROPOSAL_MODE=auto`. Exactly one correction backend launches.
+  Interpolated log(contexts) crossover handles unseen shapes; nearest measured
+  dense-implementation bucket chooses fused vs tiled GEMM. No profile means an
+  explicitly uncalibrated V/8 threshold and fused dense. Profiles reject a different
+  GPU/compiler/kernel. No B200 threshold is invented or shipped as measured.
+- Fused dense correction + Top16 + normalization avoids writing/reading dense
+  corrected logits. Alternative GEMM uses preallocated workspace. One Top16
+  serves both OPD and tree TopK. Ordered rank adds and explicit pairwise FP32
+  normalization prevent layout-dependent sparse/fused-dense rounding differences.
+  This normalization has the same mathematical semantics but may round differently
+  from the previous generic reduction; old checkpoint trajectory bitwise replay
+  across this code revision is not promised.
+- Active bitmap/IDs are append-only during rollout. `_round_end` is O(1), with
+  GPU sum/max counters; it no longer loads/scans B or compacts zero rows.
+- Teacher visited/frontier IDs compact on GPU before a persistent selected-row
+  vocabulary scan. Unselected rows do not read target probabilities or run Top16
+  reduction. Existing post-sampling target probabilities are reused; no extra
+  target sort/softmax or target/draft transformer forward.
+- OPD history has contiguous original-response pools, chunk index_copy with GPU
+  owner IDs, finish-length metadata only, and one compact final gather per field.
+  No per-response clone at finish or per-round full-history concatenation. Rare
+  capacity doubling handles verification padding; no old pool survives that grow.
+- Side-stream waits remain immediately before the next proposal. Dispatch's GPU
+  active-count snapshot piggybacks on the existing scheduling packet and can lag
+  one feedback update. Actual correction always uses CURRENT GPU state. This is
+  only a performance choice, not stale correction or feedback gating.
+- Small union/dedup/p/q/tail/KL/gradient terms remain fused on GPU. Learned A
+  manual gradients and the existing optimizer/DDP boundaries are unchanged.
+- Added step/cumulative active_rows_mean/max and sparse/dense_rounds aliases to
+  both CSV/JSONL. Step maximum is an interval maximum, NOT a difference of running
+  maxima. Repeated optimizer updates with the same step label merge their maxima.
+
+Host synchronization per OPD verification round: **1 before → 1 after**, the
+existing consolidated HF scheduling packet. No extra transfer for backend dispatch,
+teacher selection, or metrics. Profile-OFF introduces no cuda.synchronize. Prefill
+setup/end-of-rollout returned lists and packed metrics still have boundary transfers;
+the entire decoder is not claimed zero-sync. Optional profiling is separate.
+
+Validation on RTX3090, Python3.10 / Torch2.5.1+cu124 / Triton3.1:
+260 related tests passed, 3 CPU-only stream parameterizations skipped; one existing
+torch.load FutureWarning. Covers historical golden outputs, no extra forwards,
+all teacher support cases, projector/checkpoint, both update streams, history vs
+concat, exact per-step telemetry, one packet/round, one chosen correction backend,
+compiled variant reuse. compileall, shell syntax, CLI dry-runs, source integrity,
+git diff --check and pip check pass in the existing local test environment.
+Production B200 pinned environment was not installed here.
+
+Isolated proposal benchmark (BF16, V32768, H2048, rank8, median of 10 CUDA-event
+samples): 7 context workloads × 8 active counts × sparse/fused-dense/GEMM/auto.
+All Top16 IDs/probabilities/normalizers passed BITWISE cross-backend parity.
+Raw evidence: `validation/opd_performance_20261007/rtx3090_proposal.json`.
+
+| Contexts | Sparse ms, S=V | Fused dense ms, S=V | Auto ms, S=V | Measured threshold |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.2464 | 0.2147 | 0.2167 | 0 |
+| 8 | 0.2659 | 0.2161 | 0.2190 | 0 |
+| 32 | 0.4136 | 0.2375 | 0.2401 | 0 |
+| 64 | 0.4752 | 0.3178 | 0.3204 | 0 |
+| 128 | 0.6523 | 0.4940 | 0.4965 | 4096 |
+| 256 | 1.0105 | 0.8539 | 0.8632 | 8192 |
+| 512 | 1.7881 | 1.6128 | 1.6134 | 8192 |
+
+Threshold 0 means dense is preferable at all measured nonzero counts in that workload; cold
+still skips correction. Auto timings use the uncalibrated V/8 policy, not an
+artificially perfect switch. At 512 contexts fused dense was 1.5862 ms at S4096
+and 1.6128 ms at S32768; sparse was 1.5857→1.7881 ms. These are component results
+on RTX3090, not before/after end-to-end speedup or B200 crossover measurements.
+
+B200 end-to-end FastGRPO vs OPD AAL/tokens/s: **not run**. Actual Qwen model,
+pretrained EAGLE checkpoint, and configured dataset are absent on this machine.
+No synthetic AAL replaces this experiment. `scripts/sweep_opd_reflex.sh` runs both
+methods with the same frozen resources/seeds and exports AAL, round counts,
+generation wall/tokens/s, VRAM, active rows, backend counts, optional nvidia-smi
+utilization, and separate optional profiling replay. Instructions in huongdanchay.md.
+Positive delta AAL is a measurement goal, not an implementation guarantee.
+
+Remaining costs: one scheduling packet; target top-p sampling; one compact scan
+per selected teacher state; selected lm_head row reconstruction; learned-A GEMM;
+HF DynamicCache's native append and finished-batch KV index_select. Accepted KV
+suffix compaction was already in-place and remains so. No unvalidated static-HF
+cache replacement was introduced. Contiguous history reserves capacity up front
+and therefore may use more memory early in rollout than the former small per-row
+buffers; final packing temporarily needs both pool and used output storage.
+
+Changed files: helper/{opd_reflex,opd_reflex_kernels,tree_kernels,opd_scheduling,
+specualtive_generate,step_metrics}.py; new helper/opd_history.py;
+grpo_speculative.py; shared config, scripts/launch/train_model.sh and 14 paired model launchers;
+scripts/{tune_opd_proposals.py,tune_opd_proposals.sh,benchmark_opd_reflex.py,
+gpu_utilization.py}; related tests/fixtures and docs. Requirements/model/data paths
+and historical_fastgrpo.py/sampling.py/rollout_history.py are unchanged.
+
+---
+
+# Previous revision history (superseded where noted above)
+
 # Learned OPD / historical baseline optimization — 2026-10-07
 
 ## User-requested SDPA target default

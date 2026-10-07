@@ -441,11 +441,12 @@ def _aggregate_job_metrics(
         'opd_updates',
         'trace_rollout_count', 'used_items', 'ignore_due_correct', 'ignore_due_incorrect',
     )
-    sum_names += tuple(name for name in OPD_COUNTER_NAMES+GENERATION_COUNTER_NAMES if name!='opd_updates')
+    sum_names += tuple(name for name in OPD_COUNTER_NAMES+GENERATION_COUNTER_NAMES if name not in ('opd_updates','opd_active_rows_max'))
     max_names = (
         'generate_time_cost', 'train_time_cost', 'draft_train_time_cost',
         'prefill_time_cost', 'target_time_cost', 'draft_time_cost',
         'check_time_cost',
+        'opd_active_rows_max','opd_interval_active_rows_max',
     )
     if include_opd_profile:
         max_names += ('opd_profile_time_ms',)
@@ -1935,7 +1936,11 @@ for epoch in epoch_bar:
         batch_data['total_accepted_draft_tokens']+=accepted_draft_tokens
         batch_data['total_proposed_draft_tokens']+=proposed_draft_tokens
         for name in OPD_COUNTER_NAMES+GENERATION_COUNTER_NAMES:
-            batch_data[name]=batch_data.get(name,0.)+float(outputs.get(name,0.))
+            value=float(outputs.get(name,0.))
+            if name=='opd_active_rows_max':
+                batch_data[name]=max(batch_data.get(name,0.),value)
+                batch_data['opd_interval_active_rows_max']=max(batch_data.get('opd_interval_active_rows_max',0.),value)
+            else:batch_data[name]=batch_data.get(name,0.)+value
         batch_data['opd_profile_time_ms']+=float(outputs.get('opd_profile_time_ms',0.))
         batch_data['generate_length']+=generate_length
         trace_rollout_count += 1
@@ -2622,6 +2627,9 @@ summary = {
     "fastgrpo_ablation": bool(fastgrpo_ablation),
     "method": method,
     "opd_rank": int(args.opd_rank),
+    "opd_proposal_mode": os.environ.get('OPD_PROPOSAL_MODE','auto'),
+    "opd_dense_implementation": os.environ.get('OPD_DENSE_IMPLEMENTATION','auto'),
+    "opd_proposal_profile": os.environ.get('OPD_PROPOSAL_PROFILE',''),
     "opd_topk": int(args.opd_topk),
     "opd_update_stream": _as_bool(args.opd_update_stream),
     "opd_visited_weight": args.opd_visited_weight,

@@ -23,7 +23,8 @@ export OPD_VISITED_WEIGHT=1.0
 export OPD_FRONTIER_WEIGHT=1.0
 export OPD_UPDATE_STREAM=0   # UNTUNED: đo cả0/1, không giả định async nhanh hơn
 export OPD_TRAIN_PROJECTOR=1 # A học tại draft optimizer boundary, không reset
-export OPD_PROPOSAL_MODE=sparse # chưa có profile B200: không đoán crossover
+export OPD_PROPOSAL_MODE=auto
+export OPD_DENSE_IMPLEMENTATION=auto
 export OPD_PROFILE=0
 export OPD_DIAGNOSTICS=0
 ```
@@ -86,25 +87,44 @@ OPD_PROFILE=1 chạy diagnostic replay TÁCH RIÊNG khỏi wall/throughput. Các
 timers không phải authoritative speedup. OPD_DIAGNOSTICS=1 thêm B norm/max ở cuối
 rollout, không thêm target/draft transformer forward.
 
-## Tune sparse/dense trên B200 trước khi dùng adaptive
+## Tune sparse/dense trên B200 và benchmark end-to-end
 
 ```bash
+export MODEL_KEY=qwen3_1p7b
+export DRAFT_CONFIG="$PWD/outputs/pretrain/$MODEL_KEY/latest_draft_config.json"
+export OPD_TUNE_VOCAB="$("$PYTHON_BIN" -c 'import json,os; print(json.load(open(os.environ["DRAFT_CONFIG"]))["draft_vocab_size"])')"
+export OPD_TUNE_HIDDEN="$("$PYTHON_BIN" -c 'import json,os; print(json.load(open(os.environ["DRAFT_CONFIG"]))["hidden_size"])')"
+export OPD_TUNE_OUTPUT="$PWD/outputs/benchmarks/opd_b200_$(date -u +%Y%m%dT%H%M%S_%N).json"
 CUDA_VISIBLE_DEVICES=0 bash scripts/tune_opd_proposals.sh
+export OPD_PROPOSAL_PROFILE="$OPD_TUNE_OUTPUT"
 ```
 
 Profile được lưu trong outputs/benchmarks/ (script in đúng tên file). Export
 OPD_PROPOSAL_PROFILE trỏ tới JSON thực đó rồi chạy:
 
 ```bash
-export OPD_PROPOSAL_MODE=adaptive
-MODEL_KEY=qwen25_3b bash scripts/sweep_opd_reflex.sh
+export OPD_PROPOSAL_MODE=auto
+export OPD_DENSE_IMPLEMENTATION=auto
+MODEL_KEY=qwen3_1p7b OPD_FAST_LRS=0.001,0.01,0.05 OPD_STREAMS=0,1 \
+BENCH_SEEDS=42,43 BENCH_ITERATIONS=2 BENCH_MAX_LENGTH=2048 \
+bash scripts/sweep_opd_reflex.sh --gpu-utilization
+
+# Sau khi xem report.json/summary.csv; giữ cả delta AAL âm nếu có.
+CUDA_VISIBLE_DEVICES=0 bash train_qwen3_1p7b.sh
+# Baseline historical, cùng model/data/sampling/training settings:
+CUDA_VISIBLE_DEVICES=0 bash train_qwen3_1p7b_fastgrpo.sh
 ```
 
 Shape/V/H phải đúng model; override OPD_TUNE_SHAPES, OPD_TUNE_VOCAB,
-OPD_TUNE_HIDDEN. Default gồm64x1/64x7/64x8/32x1/32x8: effective batch64 với
-verification_capacity512 ban đầu draft_k=7. Profile sai GPU/compiler/hash bị
-reject; shape chưa đo fallback sparse. Không đem profile RTX3090 dùng trên B200.
-Đo sparse/dense/adaptive end-to-end bằng cùng frozen sweep, không chỉ component.
+OPD_TUNE_HIDDEN. Default đo contexts 1/8/32/64/128/256/512 và active rows
+0/16/64/256/1024/4096/8192/V, so sánh sparse/dense-fused/dense-GEMM/auto.
+Profile sai GPU/compiler/hash bị reject. Shape chưa đo nội suy theo tổng contexts;
+không fallback sparse vô điều kiện. Chưa có profile thì auto dùng ngưỡng V/8
+chưa tune, dense=fused. Không đem profile RTX3090 dùng trên B200.
+--gpu-utilization lấy mẫu nvidia-smi mỗi 0.5s, có thể ảnh hưởng nhẹ CPU timing;
+bỏ flag để đo throughput riêng. OPD_PROFILE=1 thêm replay profiling tách khỏi
+wall/throughput chính. Sweep ghi outputs/benchmarks/opd_<model>_<timestamp>/.
+Một sweep frozen không train A: dùng checkpoint OPD đã train khi đánh giá learned A.
 
 FastGRPO từ nay là historical native TopK(draft_k), không dùng shared Top16.
 OPD luôn fused Top16 kể cả cold; tied candidate IDs khác historical được chấp

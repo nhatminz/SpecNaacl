@@ -151,6 +151,7 @@ def test_measured_adaptive_switch_and_mode_counters(tmp_path,monkeypatch):
     h=torch.randn(3,1,32,device='cuda');raw=torch.randn(3,1,257,device='cuda')
     for count in (1,16):
         seed(s,torch.arange(count,device='cuda'),torch.randn(count,8,device='cuda'))
+        s.host_active_count=count # scheduling packet supplies this in rollout
         q,ids,_=s.propose(raw,h,8,mapping,root=True)
         expected=(q.clone(),ids.clone())
         s.proposal_mode='sparse';actual=s.propose(raw,h,8,mapping)

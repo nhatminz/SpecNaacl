@@ -101,7 +101,10 @@ def test_no_host_sync_in_production_feedback_and_no_dense_vocab_correction_or_ta
         assert forbidden not in kernels
     tree=ast.parse(kernels)
     scan=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='_corrected_scan')
-    assert not {x.arg for x in scan.args.args}&{'B','U','R','HEAD'}
+    # Dense branch fuses correction with scan; sparse branch only reads scores.
+    dense=next(n for n in ast.walk(scan) if isinstance(n,ast.If) and ast.unparse(n.test)=='DENSE')
+    sparse_code='\n'.join(ast.unparse(n) for n in dense.orelse)
+    assert 'tl.load(B +' not in sparse_code and 'tl.load(U +' not in sparse_code
     active=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='_sparse_scores')
     assert 'range(0, count, BS)' in ast.unparse(active)
     assert 'probability_pool' not in (root/'opd_reflex.py').read_text()

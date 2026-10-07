@@ -5,7 +5,7 @@ import time
 from copy import deepcopy
 from transformers import DynamicCache
 from helper.tree_verification import pack_tree, trace_verified_path, select_confidence_nodes
-from helper.rollout_history import RolloutHistory
+from helper.opd_history import ContiguousRolloutHistory as RolloutHistory
 from helper.opd_reflex import OPDReflex
 from helper.method_config import resolve_method
 from helper.historical_fastgrpo import speculative_generate as historical_generate
@@ -472,7 +472,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
             else:
                 opd.feedback(tensor_tree, path, teacher, greedy=not do_sample)
         scheduling_packet,next_token,chosen_index,newly_padded,last_valid_index,max_acc_length=schedule(
-            path,past_kv_len,eos_token_id,opd.padded_path_workspace,opd.scheduling_packet,opd._kernels)
+            path,past_kv_len,eos_token_id,opd.padded_path_workspace,opd.scheduling_packet,opd._kernels,opd=opd)
         acc_length=[row[0] for row in scheduling_packet]
         end_sig=[row[1] for row in scheduling_packet]
         for idx_tree,length in enumerate(acc_length):
@@ -501,7 +501,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
         history_chunk = {'generated_ids': next_token}
         if return_all_draft_input:
             history_chunk.update(features=feature_states, target_hidden=target_hidden_states, input_ids=next_token)
-        history.append(residual_index, history_chunk)
+        history.append(residual_index, history_chunk, owners=owners)
         del history_chunk
         finished_indices = [index for (index, finished) in enumerate(end_sig) if finished]
         if 0 not in end_sig:
@@ -518,14 +518,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
             keep = torch.tensor(keep_rows, device=device, dtype=torch.long)
             for row in finished_indices:
                 original = residual_index[row]
-                finished_history = history.finish(original)
-                # Padding masks are materialized once at rollout completion.
-                generated_sequences_dict[str(original)] = finished_history['generated_ids']
-                if return_all_draft_input:
-                    draft_input_states_dict[str(original)] = finished_history['features']
-                    target_hidden_states_dict[str(original)] = finished_history['target_hidden']
-                    draft_input_ids_dict[str(original)] = finished_history['input_ids']
-                del finished_history
+                history.mark_finished(original)
             end_sig = [end_sig[row] for row in keep_rows]
             pad_counts=[pad_counts[row] for row in keep_rows]
             owners=owners.index_select(0,keep)
@@ -590,11 +583,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
     padding_cpu=pad_mask[:,:max_recorded_pad_column].cpu()
     padding_positions_dict={str(row):set(torch.nonzero(mask,as_tuple=False).flatten().tolist())
         for row,mask in enumerate(padding_cpu)}
-    for idx_batch in range(bsz):
-        delete_idx = idx_batch
-        ori_idx = residual_index[idx_batch]
-        # Global padding mask already contains the finished owner row.
-        finished_history = history.finish(ori_idx)
+    for ori_idx,finished_history in enumerate(history.finalize()):
         generated_sequences_dict[str(ori_idx)] = finished_history['generated_ids']
         if return_all_draft_input:
             draft_input_states_dict[str(ori_idx)] = finished_history['features']

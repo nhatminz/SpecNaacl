@@ -2,13 +2,19 @@
 import torch
 
 
-def schedule(path,past,eos,workspace,packet,kernels=None):
+def schedule(path,past,eos,workspace,packet,kernels=None,opd=None):
     b,capacity=path.tokens.shape
     if kernels is not None:
         tokens,indices,mask=[x[:b,:capacity] for x in workspace[:3]];last=workspace[3][:b,:1]
         out_packet=packet[:b,:capacity+3]
-        kernels.pad_schedule(path,past,eos,tokens,indices,mask,last,out_packet)
-        rows=out_packet.cpu().tolist()  # ONE existing HF scheduling boundary
+        kernels.pad_schedule(path,past,eos,tokens,indices,mask,last,out_packet,
+                             snapshot=opd.dispatch_snapshot if opd is not None else None)
+        if opd is not None:
+            rows=packet[:b,:capacity+4].cpu().tolist()
+            opd.host_active_count=rows[0][-1]
+            rows=[row[:-1] for row in rows]
+        else:
+            rows=out_packet.cpu().tolist()  # ONE existing HF scheduling boundary
         width=max(row[0] for row in rows)
         return rows,tokens[:,:width],indices[:,:width],mask[:,:width],last,width
     lengths=path.lengths.tolist();width=max(lengths)

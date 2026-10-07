@@ -48,24 +48,46 @@ Target sampling and verifier rules unchanged. Actual trajectories/round counts
 may differ; no extra forwards means existing prefill/verify/expand/committed work
 per round, not forcing equal totals when AAL changes.
 
-Sparse prepares ONLY S active corrected scalars. Dense uses tiled batched rank
-GEMM, reusing B tiles across contexts. Both use explicit ordered FP32 multiply/
-adds (FMA/TF32 disabled) and write one reused CURRENT-proposal score workspace.
-Common full-vocab scan replaces active raw values at ORIGINAL token positions,
-giving bitwise same logits/topk/probability reduction across sparse/dense switches.
-No probability tensor for all historical states cached. Proposal scratch reserves
-O(B*C*V) for dense strategy once; sparse only touches O(S) entries. Full scan O(V),
-sparse correction O(S*r); when S approaches V, measured dense strategy avoids
-serial sparse loops. Canonical rank GEMM deliberately does not silently use
-cuBLAS/TensorCore association if it changes exact results.
+Sparse prepares ONLY S active corrected scalars. Dense supports fused rank-8
+correction + normalization + Top16, or tiled ordered FP32 rank GEMM into reused
+workspace. Both use ordered FP32 multiply/add (FMA/TF32 disabled). The fused
+implementation avoids a dense workspace write/read. Fixed pairwise tile sums
+prevent compiler layout choices from changing the sum association when switching
+backends. This can change a few rounding bits versus the previous version's
+generic reduction, but not the mathematical distribution. No historical-state
+probability cache or extra transformer forward is introduced.
 
-Adaptive selection reads S on GPU, never .item(). Both guarded preparation
-kernels are launched; only the selected one computes. A measured threshold
-profile must match GPU/Torch/Triton/CUDA/kernel hash and exact proposal geometry.
-Unprofiled geometries stay sparse, no guessed nearest-shape interpolation.
-Tune on B200 then verify end-to-end; RTX3090 profiles cannot select B200 default.
+OPD_PROPOSAL_MODE=auto is default (adaptive remains an alias). Exactly ONE backend
+is launched per proposal. A GPU active-count snapshot is piggybacked on the ONE
+existing host scheduling packet, not read with an extra .item(). Dispatch uses
+the previous proposal's active count (one feedback update behind), while BOTH
+backends use CURRENT B/bitmap/active IDs for exact correction. The delay can only
+affect speed. It preserves side-stream overlap rather than waiting for feedback
+early. Active rows are append-only until rollout reset, including canceled rows.
+
+Measured profiles must match GPU/Torch/Triton/CUDA/kernel hash. Thresholds are
+interpolated by log(total contexts), with endpoint clamping, so previously unseen
+batch factorizations do not fall back to sparse. Without a profile, auto switches
+at V/8 active rows: an explicit uncalibrated policy, NOT a measured B200 crossover.
+OPD_DENSE_IMPLEMENTATION=auto chooses the measured fused/GEMM implementation in
+the nearest context bucket; without measurements it uses fused. Override with
+fused/gemm for experiments. Tune on B200 and validate end-to-end.
 Counters opd_proposal_mode_sparse_rounds/dense_rounds count ROOT verification
 trees, not expansion calls; cold zero-correction trees count sparse/raw.
+
+Runtime scalar extents/strides are no longer constexpr and use do_not_specialize;
+fixed power-of-two tile sizes may still have bounded variants. Tree masks tile
+columns in blocks of 256, independent of past length. Teacher selection compacts
+visited/frontier IDs on GPU. Persistent scan CTAs iterate only selected IDs;
+unselected rows do not read target vocab or compute Top16. Already-sampled target
+probabilities are reused, without a second target sort/softmax. Compact-vocab
+extraction still requires one selected-row scan.
+
+OPD history uses contiguous [original response, capacity, ...] pools. Append
+scatters only the newly accepted chunk using GPU owner IDs. Finish records lengths,
+not row views or clones. Rare growth for verification padding cannot retain old
+storage; one end-of-rollout gather per field materializes compact output storage.
+Historical FastGRPO continues using its original per-response history.
 
 OPD-only scheduler pads into fixed capacity, computes path lengths/EOS/prefix
 extension on GPU, and transfers ONE small packet at the existing scheduling

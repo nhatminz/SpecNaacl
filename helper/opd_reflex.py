@@ -21,6 +21,7 @@ OPD_COUNTER_NAMES=(
     'opd_invalid_states','opd_updates','opd_active_rows_sum','opd_rounds',
     'opd_nonfinite_kl_states',
     'opd_proposal_mode_sparse_rounds','opd_proposal_mode_dense_rounds',
+    'opd_active_rows_max',
 )
 GENERATION_COUNTER_NAMES=('verification_batches','active_response_rounds','verified_tree_nodes')
 
@@ -74,30 +75,66 @@ class OPDReflex:
         self.visited_weight,self.frontier_weight=float(visited_weight),float(frontier_weight)
         self.profile,self.diagnostics,self.enabled=bool(profile),bool(diagnostics),bool(enabled)
         self.requested_backend=backend;self._events=[];self._layout=None
-        self.proposal_mode=os.environ.get('OPD_PROPOSAL_MODE','sparse')
-        if self.proposal_mode not in ('sparse','dense','adaptive'):raise ValueError('invalid OPD_PROPOSAL_MODE')
+        self.proposal_mode=os.environ.get('OPD_PROPOSAL_MODE','auto')
+        if self.proposal_mode not in ('sparse','dense','auto','adaptive'):raise ValueError('invalid OPD_PROPOSAL_MODE')
+        self.dense_implementation=os.environ.get('OPD_DENSE_IMPLEMENTATION','auto')
+        if self.dense_implementation not in ('auto','fused','gemm'):raise ValueError('invalid OPD_DENSE_IMPLEMENTATION')
         profile_path=os.environ.get('OPD_PROPOSAL_PROFILE','')
         self.tuning=json.loads(Path(profile_path).read_text()) if profile_path else None
-        if self.proposal_mode=='adaptive' and self.tuning is None:
-            raise ValueError('adaptive requires measured OPD_PROPOSAL_PROFILE; no guessed crossover')
         self.train_projector=bool(train_projector)
         self._validated_tuning=False
+        self._threshold_cache={}
 
     def proposal_threshold(self,b,c):
-        if self.proposal_mode!='adaptive':return self.vocab+1
-        key=f'{b},{c},{self.vocab},{self.rank},{self.logits_dtype}'
-        return int(self.tuning.get('thresholds',{}).get(key,self.vocab+1))
+        key=(b*c,self.vocab,self.rank,str(self.logits_dtype))
+        if key not in self._threshold_cache:self._threshold_cache[key]=self._interpolated_threshold(b,c)
+        return self._threshold_cache[key]
+
+    def _interpolated_threshold(self,b,c):
+        # Dispatch depends on flattened context workload, not arbitrary batch
+        # factorization. Log-space interpolation covers shrinking live batches.
+        points={}
+        for key,value in (self.tuning or {}).get('thresholds',{}).items():
+            pb,pc,v,r,dtype=key.split(',')
+            if (int(v),int(r),dtype)==(self.vocab,self.rank,str(self.logits_dtype)):
+                points.setdefault(int(pb)*int(pc),[]).append(int(value))
+        if not points:
+            # Explicit uncalibrated policy, NOT a claimed B200 measurement.
+            return max(1,self.vocab//8)
+        points=sorted((n,sum(values)/len(values)) for n,values in points.items())
+        work=b*c
+        if work<=points[0][0]:return round(points[0][1])
+        for (lo,a),(hi,z) in zip(points,points[1:]):
+            if work<=hi:
+                w=math.log(work/lo)/math.log(hi/lo)
+                return round(a+(z-a)*w)
+        return round(points[-1][1])
+
+    def selected_proposal_backend(self,b,c):
+        if self.proposal_mode in ('sparse','dense'):return self.proposal_mode
+        # Snapshot piggybacks on the existing HF scheduling packet. It is one
+        # feedback round old when an update stream is used; this affects only
+        # speed, never the correction, which reads the CURRENT GPU active set.
+        return 'dense' if self.host_active_count>=self.proposal_threshold(b,c) else 'sparse'
+
+    def selected_dense_implementation(self,b,c):
+        if self.dense_implementation!='auto':return self.dense_implementation
+        buckets=[]
+        for key,value in (self.tuning or {}).get('dense_implementations',{}).items():
+            pb,pc,v,r,dtype=key.split(',')
+            if (int(v),int(r),dtype)==(self.vocab,self.rank,str(self.logits_dtype)):
+                buckets.append((abs(math.log((b*c)/(int(pb)*int(pc)))),value))
+        return min(buckets)[1] if buckets else 'fused'
 
     def start(self,model,batch,mapping,hidden_size,*,max_contexts,max_nodes,max_path,max_proposal_contexts):
         device=mapping.device;v=mapping.numel();k=min(v,self.requested_topk)
-        if k<min(v,max_proposal_contexts):raise ValueError('OPD_TOPK must cover max_draft_k')
         if self.requested_backend=='torch' and device.type=='cuda':
             raise ValueError('Torch OPD is CPU oracle only; production CUDA requires Triton')
         self.backend='triton' if device.type=='cuda' else 'torch'
         if self.requested_backend=='triton' and device.type!='cuda':raise ValueError('Triton OPD requires CUDA')
         self._kernels=importlib.import_module('helper.tree_kernels') if self.backend=='triton' else None
         self._opd_kernels=importlib.import_module('helper.opd_reflex_kernels') if self.backend=='triton' else None
-        if self.proposal_mode=='adaptive' and not self._validated_tuning:
+        if self.tuning is not None and not self._validated_tuning:
             if self.backend!='triton':raise ValueError('measured adaptive CUDA profile requires Triton')
             fingerprint=dict(gpu=torch.cuda.get_device_name(device),torch=torch.__version__,
                 triton=self._opd_kernels.triton.__version__,cuda=torch.version.cuda,
@@ -125,6 +162,7 @@ class OPDReflex:
             def alloc(shape,dtype=torch.float32):return torch.empty(shape,device=device,dtype=dtype)
             self.bitmap=alloc((v+31)//32,torch.int32)
             self.active_count=alloc(1,torch.int32)
+            self.dispatch_snapshot=alloc(1,torch.int32)
             self.B_fast=alloc((v,self.rank)) if self.enabled else None
             self.active_ids=alloc(v,torch.int32) if self.enabled else None
             self.proposal_u=alloc((batch*max_proposal_contexts,self.rank)) if self.enabled else None
@@ -138,7 +176,7 @@ class OPDReflex:
             self.proposal_tiles=[alloc(batch*max_proposal_contexts*tiles*(k if i>=2 else 1),torch.long if i==3 else torch.float32) for i in range(4)] if self.backend=='triton' else []
             self.path_workspace=[alloc((batch,max_path),torch.long) for _ in range(3)]+[alloc(batch,torch.long)]
             self.padded_path_workspace=[alloc((batch,max_path),torch.bool if i==2 else torch.long) for i in range(3)]+[alloc((batch,1),torch.long)]
-            self.scheduling_packet=alloc((batch,max_path+3),torch.long)
+            self.scheduling_packet=alloc((batch,max_path+4),torch.long)
             # Small tree-only lexicographic keys, reused even as the batch shrinks.
             full_nodes=max_proposal_contexts * max_contexts
             self.confidence_key_workspace=alloc(batch*full_nodes,torch.int64)
@@ -154,6 +192,7 @@ class OPDReflex:
                 # response. B*q is bounded by verification_capacity + B.
                 n=max_nodes;t=(v+255)//256
                 self.selected_weights=alloc(n);self.selected_kind=alloc(n,torch.int32)
+                self.selected_ids=alloc(n,torch.int32);self.selected_count=alloc(1,torch.int32)
                 self.teacher_p=alloc(n*k);self.teacher_ids=alloc(n*k,torch.long);self.teacher_mass=alloc(n)
                 self.teacher_q=alloc(n*k);self.union_ids=alloc(n*2*k,torch.long);self.union_g=alloc(n*2*k)
                 self.state_stats=alloc(n*10);self.round_weight=alloc(1)
@@ -163,7 +202,8 @@ class OPDReflex:
                     self.projector_head=alloc((n,hidden_size))
                     self.projector_v=alloc((n,self.rank))
                     self.projector_delta=alloc((hidden_size,self.rank))
-        self.bitmap.zero_();self.active_count.zero_()
+        self.bitmap.zero_();self.active_count.zero_();self.dispatch_snapshot.zero_()
+        self.host_active_count=0
         if self.enabled:self.B_fast.zero_();self.counters.zero_()
         self._ever_updated=False;self._events.clear()
 
@@ -186,6 +226,7 @@ class OPDReflex:
         """
         b,c,v=logits.shape;keep=self.topk
         self.logits_dtype=logits.dtype
+        if root and self.backend=='torch':self.dispatch_snapshot.copy_(self.active_count)
         if k>keep or v!=self.vocab:raise ValueError('proposal k/vocabulary mismatch')
         ticket=self.begin('opd_feature_ms')
         u=None
@@ -266,7 +307,9 @@ class OPDReflex:
             delta=torch.zeros_like(self.B_fast)
             delta.index_add_(0,ids.clamp_min(0).flatten(),(g[...,None]*u.reshape(-1,self.rank)[:,None,:]).reshape(-1,self.rank))
             self.B_fast.add_(delta,alpha=-self.fast_lr/float(total))
-            active=torch.nonzero(self.B_fast.abs().sum(-1)>0,as_tuple=False).flatten()
+            old=self.active_ids[:int(self.active_count)].long()
+            touched=torch.nonzero(self.B_fast.abs().sum(-1)>0,as_tuple=False).flatten()
+            active=torch.unique(torch.cat((old,touched)))
             self.active_count.fill_(active.numel());self.active_ids[:active.numel()].copy_(active)
         count=selected.sum();categories=kind.flatten()
         finite=torch.isfinite(kl)
@@ -276,6 +319,7 @@ class OPDReflex:
             ((weights>0)&~good).sum(),((total>0)&(self.fast_lr>0)).float(),self.active_count[0].float(),total.new_tensor(1.),
             (selected&~finite).sum()))
         self.counters[:13].add_(stats.to(torch.float64))
+        self.counters[15]=torch.maximum(self.counters[15],self.active_count[0].double())
 
     def remove_finished(self,indices):
         # B is shared, not row-owned. Current contexts are overwritten next tree.

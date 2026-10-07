@@ -11,6 +11,7 @@ import torch
 from helper.opd_reflex import OPDReflex,OPD_COUNTER_NAMES
 from helper.method_config import resolve_method
 from helper.rollout_history import RolloutHistory
+from helper.opd_history import ContiguousRolloutHistory
 from helper.tree_verification import pack_tree,trace_verified_path,select_confidence_nodes
 from helper.sampling import build_sampling_probs,sample_from_probs,sample_target_from_logits
 from helper.opd_scheduling import schedule,compact_suffix_inplace
@@ -86,7 +87,23 @@ class CountModel(TinyModel):
         return super().__call__(*args,**kwargs)
     def compact_to_target_ids(self,device=None):return self.mapping
 
-def load_rollout(device='cpu',history_type=RolloutHistory):
+def load_rollout(device='cpu',history_type=None):
+    historical_history=history_type or RolloutHistory
+    opd_history=history_type or ContiguousRolloutHistory
+    if not hasattr(opd_history,'finalize'):
+        parent=opd_history
+        class HistoryAdapter(parent):
+            def __init__(self,*args,**kwargs):
+                super().__init__(*args,**kwargs)
+                self.results={}
+                self.count=next(iter(args[0].values())).shape[0]*kwargs.get('repeats',1)
+            def append(self,rows,chunks,owners=None):super().append(rows,chunks)
+            def mark_finished(self,row):self.results[row]=super().finish(row)
+            def finalize(self):
+                for row in range(self.count):
+                    if row not in self.results:self.mark_finished(row)
+                return [self.results[row] for row in range(self.count)]
+        opd_history=HistoryAdapter
     path=Path(__file__).resolve().parents[1]/'helper/specualtive_generate.py'
     tree=ast.parse(path.read_text())
     for n in ast.walk(tree):
@@ -94,8 +111,8 @@ def load_rollout(device='cpu',history_type=RolloutHistory):
             n.args.defaults[1]=ast.Constant(device)
     fns=[n for n in tree.body if isinstance(n,ast.FunctionDef)]
     scope=dict(torch=torch,time=time,math=math,deepcopy=deepcopy,DynamicCache=Cache,
-               OPDReflex=OPDReflex,resolve_method=resolve_method,RolloutHistory=history_type,
-               OPD_COUNTER_NAMES=OPD_COUNTER_NAMES,historical_generate=load_historical(device,history_type),
+               OPDReflex=OPDReflex,resolve_method=resolve_method,RolloutHistory=opd_history,
+               OPD_COUNTER_NAMES=OPD_COUNTER_NAMES,historical_generate=load_historical(device,historical_history),
                schedule=schedule,compact_suffix_inplace=compact_suffix_inplace,
                pack_tree=pack_tree,trace_verified_path=trace_verified_path,
                select_confidence_nodes=select_confidence_nodes,

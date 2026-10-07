@@ -139,15 +139,15 @@ def test_feedback_improves_future_fixed_state_without_any_extra_transformer_forw
     assert (q4>.2).all()  # future-state teacher mass up, full KL=-log(q4) down
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(),reason='CUDA exact zero-row index compaction')
-def test_zero_rows_cancelled_after_update_are_pruned_and_restore_bitwise_off_identity():
+@pytest.mark.skipif(not torch.cuda.is_available(),reason='CUDA retained zero-row identity')
+def test_zero_rows_are_retained_without_changing_proposals():
     s,_,mapping=state('cuda:0',v=521)
     tokens=torch.arange(256,device='cuda')
     seed(s,tokens,torch.randn(256,8,device='cuda'))
     s.B_fast.zero_();s.round_weight.fill_(1.)
     from helper.opd_reflex_kernels import _round_end
     _round_end[(1,)](s.B_fast,s.bitmap,s.active_ids,s.active_count,s.round_weight,s.counters,8,.01,128,8,num_warps=4)
-    assert not s.bitmap.any() and s.active_count.item()==0
+    assert s.bitmap.any() and s.active_count.item()==256
     raw=torch.randn(3,4,521,device='cuda');h=torch.randn(3,4,32,device='cuda')
     off,_,_=state('cuda:0',v=521,enabled=False)
     for a,b in zip(s.propose(raw,h,8,mapping),off.propose(raw,h,8,mapping)):assert torch.equal(a,b)

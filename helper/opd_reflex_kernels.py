@@ -11,10 +11,11 @@ import triton.language as tl
 from helper.tree_kernels import _proposal_merge
 
 
-@triton.jit
-def _feature(H,A,U,HEAD_IN,HC,UC,HS0,HS1,HS2,NS0,NS1,NS2,C:tl.constexpr,HIDDEN:tl.constexpr,R:tl.constexpr,
-             CACHE:tl.constexpr,OFFSET:tl.constexpr,BH:tl.constexpr,BR:tl.constexpr):
+@triton.jit(do_not_specialize=["HS0","HS1","HS2","NS0","NS1","NS2","C","CACHE","OFFSET"])
+def _feature(H,A,U,HEAD_IN,HC,UC,COUNT,SNAPSHOT,HS0,HS1,HS2,NS0,NS1,NS2,C,HIDDEN:tl.constexpr,R:tl.constexpr,
+             CACHE,OFFSET,BH:tl.constexpr,BR:tl.constexpr):
     row=tl.program_id(0).to(tl.int64)
+    if (row==0)&(OFFSET==0):tl.store(SNAPSHOT,tl.load(COUNT))
     h,r=tl.arange(0,BH),tl.arange(0,BR)
     x=tl.load(H+row//C*HS0+row%C*HS1+h*HS2,h<HIDDEN,other=0).to(tl.float32)
     a=tl.load(A+h[:,None]*R+r[None,:],(h[:,None]<HIDDEN)&(r[None,:]<R),other=0)
@@ -28,14 +29,15 @@ def _feature(H,A,U,HEAD_IN,HC,UC,HS0,HS1,HS2,NS0,NS1,NS2,C:tl.constexpr,HIDDEN:t
 def feature(hidden,projector,out,head_inputs,state,offset):
     b,c,h=hidden.shape;r=projector.shape[1]
     _feature[(b*c,)](hidden,projector,out,head_inputs,state.head_cache,state.u_cache,
+        state.active_count,state.dispatch_snapshot,
         *hidden.stride(),*head_inputs.stride(),c,h,r,state.cache_contexts,offset,
         triton.next_power_of_2(h),triton.next_power_of_2(r),num_warps=8,enable_fp_fusion=False)
 
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["ZS0","ZS1","ZS2","C","THRESHOLD"])
 def _sparse_scores(Z,U,B,ACTIVE,COUNT,SCORES,COUNTERS,ZS0,ZS1,ZS2,
-                   C:tl.constexpr,V:tl.constexpr,R:tl.constexpr,THRESHOLD:tl.constexpr,
+                   C,V:tl.constexpr,R:tl.constexpr,THRESHOLD,
                    MODE:tl.constexpr,ROOT:tl.constexpr,BS:tl.constexpr):
     row=tl.program_id(0).to(tl.int64);count=tl.load(COUNT)
     use_sparse=(MODE==0)|((MODE==2)&(count<THRESHOLD))
@@ -53,10 +55,10 @@ def _sparse_scores(Z,U,B,ACTIVE,COUNT,SCORES,COUNTERS,ZS0,ZS1,ZS2,
         if ROOT:
             if row==0:tl.atomic_add(COUNTERS+13,1.)
 
-@triton.jit
+@triton.jit(do_not_specialize=["ZS0","ZS1","ZS2","N","C","THRESHOLD"])
 def _dense_gemm(Z,U,B,COUNT,SCORES,COUNTERS,ZS0,ZS1,ZS2,
-                N:tl.constexpr,C:tl.constexpr,V:tl.constexpr,R:tl.constexpr,
-                THRESHOLD:tl.constexpr,MODE:tl.constexpr,ROOT:tl.constexpr,
+                N,C,V:tl.constexpr,R:tl.constexpr,
+                THRESHOLD,MODE:tl.constexpr,ROOT:tl.constexpr,
                 BV:tl.constexpr,BC:tl.constexpr):
     # Tiled rank GEMM U @ B.T; reuse each B tile across BC contexts.
     # The explicit ordered FP32 multiply/add is IDENTICAL to sparse dot. No
@@ -77,24 +79,42 @@ def _dense_gemm(Z,U,B,COUNT,SCORES,COUNTERS,ZS0,ZS1,ZS2,
         if ROOT:
             if (tile==0)&(ct==0):tl.atomic_add(COUNTERS+14,1.)
 
-@triton.jit(do_not_specialize=['ENABLED'])
-def _corrected_scan(Z,SCORES,BITS,MAX,SUM,VALUES,IDS,ZS0,ZS1,ZS2,
-                     C:tl.constexpr,V:tl.constexpr,K:tl.constexpr,TILES:tl.constexpr,
-                     BV:tl.constexpr,ENABLED):
+@triton.jit(do_not_specialize=["ZS0","ZS1","ZS2","C","ENABLED"])
+def _corrected_scan(Z,SCORES,BITS,MAX,SUM,VALUES,IDS,U,B,COUNTERS,ZS0,ZS1,ZS2,
+                     C,V:tl.constexpr,K:tl.constexpr,TILES:tl.constexpr,
+                     BV:tl.constexpr,ENABLED,R:tl.constexpr,DENSE:tl.constexpr,ROOT:tl.constexpr):
     tile,context,batch=tl.program_id(0),tl.program_id(1),tl.program_id(2).to(tl.int64)
     v=tile*BV+tl.arange(0,BV)
     raw=tl.load(Z+batch*ZS0+context*ZS1+v*ZS2,v<V,other=0).to(tl.float32)
     if ENABLED:
-        bits=tl.load(BITS+v//32,v<V,other=0)
-        active=(v<V)&(((bits>>(v%32))&1)!=0)
-        corrected=tl.load(SCORES+(batch*C+context)*V+v,active,other=0)
-        raw=tl.where(active,corrected,raw)
+        if DENSE:
+            dot=tl.full((BV,),0.,tl.float32)
+            for r in tl.static_range(R):
+                w=tl.load(B+v*R+r,v<V,other=0)
+                u=tl.load(U+(batch*C+context)*R+r)
+                dot=dot+w*u
+            raw=raw+dot
+            if ROOT:
+                if (tile==0)&(context==0)&(batch==0):tl.atomic_add(COUNTERS+14,1.)
+        else:
+            bits=tl.load(BITS+v//32,v<V,other=0)
+            active=(v<V)&(((bits>>(v%32))&1)!=0)
+            corrected=tl.load(SCORES+(batch*C+context)*V+v,active,other=0)
+            raw=tl.where(active,corrected,raw)
     z=tl.where(v<V,raw,-float('inf'));live=v<V
     maximum=tl.max(z,axis=0)
     # An all-masked tile has mass zero, not exp(-inf - -inf)=NaN.
     # Finite tiles keep exactly the previous subtraction/reduction semantics.
     shift=tl.where(maximum==-float('inf'),0.,maximum)
-    total=tl.sum(tl.where(live,tl.exp(z-shift),0.),axis=0)
+    # Fixed pairwise FP32 tree: tl.sum alone changes association with Triton's
+    # elements-per-thread layout (strided B loads vs contiguous score loads).
+    # Pair reductions make strategy switching bitwise stable without another
+    # vocabulary pass or global workspace (also supported by Triton 3.1).
+    mass=tl.where(live,tl.exp(z-shift),0.)
+    tl.static_assert(BV==256)
+    for level in tl.static_range(8): # BV=256 in both proposal implementations
+        mass=tl.sum(tl.reshape(mass,(BV//(1<<(level+1)),2)),axis=1)
+    total=tl.sum(mass,axis=0)
     offset=(batch*C+context)*TILES+tile
     tl.store(MAX+offset,maximum);tl.store(SUM+offset,total)
     for j in range(K):
@@ -104,36 +124,37 @@ def _corrected_scan(Z,SCORES,BITS,MAX,SUM,VALUES,IDS,ZS0,ZS1,ZS2,
 
 def prepare_scores(logits,u,state,root=False):
     b,c,v=logits.shape
-    threshold=state.proposal_threshold(b,c)
-    mode={'sparse':0,'dense':1,'adaptive':2}[state.proposal_mode]
-    if mode in (0,2):
+    mode=0 if state.selected_proposal_backend(b,c)=='sparse' else 1
+    if mode==0:
         _sparse_scores[(b*c,)](logits,u,state.B_fast,state.active_ids,state.active_count,state.score_workspace,
-            state.counters,*logits.stride(),c,v,state.rank,threshold,mode,root,128,
+            state.counters,*logits.stride(),c,v,state.rank,0,mode,root,128,
             num_warps=4,enable_fp_fusion=False)
-    if mode in (1,2):
+    else:
         _dense_gemm[(triton.cdiv(v,128),triton.cdiv(b*c,4))](logits,u,state.B_fast,state.active_count,
-            state.score_workspace,state.counters,*logits.stride(),b*c,c,v,state.rank,threshold,mode,root,128,4,
+            state.score_workspace,state.counters,*logits.stride(),b*c,c,v,state.rank,0,mode,root,128,4,
             num_warps=4,enable_fp_fusion=False)
 
 def propose(logits,u,state,k,workspace,outputs,enabled,root=False):
     b,c,v=logits.shape;tiles=triton.cdiv(v,256)
     maxima,sums,values,ids=[p[:b*c*tiles*(k if i>=2 else 1)] for i,p in enumerate(workspace)]
     out,indices,norm=outputs
+    dense=enabled and state.selected_proposal_backend(b,c)=='dense' and state.selected_dense_implementation(b,c)=='fused'
     if enabled:
         ticket=state.begin('opd_proposal_extra_ms')
-        prepare_scores(logits,u,state,root)
+        if not dense:prepare_scores(logits,u,state,root)
         state.end(ticket)
     elif root and state.enabled:
         # Cold raw path has zero B. No correction preparation at all.
         state.counters[13:14].add_(1)
     _corrected_scan[(tiles,c,b)](logits,state.score_workspace,state.bitmap,maxima,sums,values,ids,
-        *logits.stride(),c,v,k,tiles,256,enabled,num_warps=4,enable_fp_fusion=False)
+        u,state.B_fast,state.counters if state.enabled else None,
+        *logits.stride(),c,v,k,tiles,256,enabled,state.rank,dense,root,num_warps=4,enable_fp_fusion=False)
     _proposal_merge[(b*c,)](maxima,sums,values,ids,out,indices,norm,c,v,k,tiles,
         triton.next_power_of_2(tiles),triton.next_power_of_2(tiles*k),num_warps=4,enable_fp_fusion=False)
 
-@triton.jit
-def _cache_proposal(Q,IDS,NORM,QC,IC,NC,C:tl.constexpr,CACHE:tl.constexpr,
-                    OFFSET:tl.constexpr,K:tl.constexpr,BK:tl.constexpr):
+@triton.jit(do_not_specialize=["C","CACHE","OFFSET"])
+def _cache_proposal(Q,IDS,NORM,QC,IC,NC,C,CACHE,
+                    OFFSET,K:tl.constexpr,BK:tl.constexpr):
     row=tl.program_id(0).to(tl.int64);k=tl.arange(0,BK);n=tl.arange(0,2)
     cached=row//C*CACHE+OFFSET+row%C
     tl.store(QC+cached*K+k,tl.load(Q+row*K+k,k<K,other=0),k<K)
@@ -147,8 +168,8 @@ def cache_proposal(q,ids,norm,state,offset):
         c,state.cache_contexts,offset,k,triton.next_power_of_2(k),num_warps=4)
 
 
-@triton.jit
-def _select(PARENTS,CONTEXTS,PATH,WEIGHTS,KIND,ROWS:tl.constexpr,WIDTH:tl.constexpr,
+@triton.jit(do_not_specialize=["ROWS","WIDTH","PS0","PS1"])
+def _select(PARENTS,CONTEXTS,PATH,WEIGHTS,KIND,ROWS,WIDTH,
             PS0,PS1,VW:tl.constexpr,FW:tl.constexpr,BR:tl.constexpr,BW:tl.constexpr):
     batch=tl.program_id(0).to(tl.int64)
     row,pathslot=tl.arange(0,BR),tl.arange(0,BW)
@@ -172,62 +193,83 @@ def select_states(tree,path,weights,kind,visited_weight,frontier_weight):
         triton.next_power_of_2(path.packed_indices.shape[1]),num_warps=4)
 
 
-@triton.jit
-def _teacher_scan(TARGET,MAP,W,MAX,SUM,VALUES,IDS,TS0,TS1,TS2,
-                  ROWS:tl.constexpr,V:tl.constexpr,K:tl.constexpr,TILES:tl.constexpr,
+@triton.jit(do_not_specialize=['N'])
+def _compact_selected(W,SELECTED,COUNT,N,BN:tl.constexpr):
+    row=tl.arange(0,BN)
+    live=tl.load(W+row,row<N,other=0)>0
+    offsets=tl.cumsum(live.to(tl.int32))-1
+    tl.store(SELECTED+tl.maximum(offsets,0),row,live)
+    tl.store(COUNT,tl.sum(live.to(tl.int32)))
+
+
+@triton.jit(do_not_specialize=["TS0","TS1","TS2","ROWS"])
+def _teacher_scan(TARGET,MAP,SELECTED,COUNT,MAX,SUM,VALUES,IDS,TS0,TS1,TS2,
+                  ROWS,V:tl.constexpr,K:tl.constexpr,TILES:tl.constexpr,
                   BV:tl.constexpr,GREEDY:tl.constexpr):
-    tile,state=tl.program_id(0),tl.program_id(1).to(tl.int64)
+    tile=tl.program_id(0)
     v=tile*BV+tl.arange(0,BV)
-    selected=tl.load(W+state)>0
-    if selected:
+    count=tl.load(COUNT)
+    for ordinal in range(tl.program_id(1),count,tl.num_programs(1)):
+        state=tl.load(SELECTED+ordinal).to(tl.int64)
         target_id=tl.load(MAP+v,v<V,other=0)
         if GREEDY:
             p=((target_id==tl.load(TARGET+state//ROWS*TS0+state%ROWS*TS1))&(v<V)).to(tl.float32)
         else:
             p=tl.load(TARGET+state//ROWS*TS0+state%ROWS*TS1+target_id*TS2,v<V,other=0).to(tl.float32)
-    else:p=tl.full((BV,),0.,tl.float32)
-    offset=state*TILES+tile
-    tl.store(MAX+offset,0.);tl.store(SUM+offset,tl.sum(p,axis=0))
-    live=(v<V)&(p>0)
-    score=tl.where(live,p,-float('inf'))
-    for j in range(K):
-        value=tl.max(score,axis=0);token=tl.min(tl.where((score==value)&live,v,V),axis=0)
-        tl.store(VALUES+offset*K+j,value);tl.store(IDS+offset*K+j,token)
-        score=tl.where(v==token,-float('inf'),score);live=live&(v!=token)
+        offset=state*TILES+tile
+        tl.store(MAX+offset,0.);tl.store(SUM+offset,tl.sum(p,axis=0))
+        live=(v<V)&(p>0)
+        score=tl.where(live,p,-float('inf'))
+        for j in range(K):
+            value=tl.max(score,axis=0);token=tl.min(tl.where((score==value)&live,v,V),axis=0)
+            tl.store(VALUES+offset*K+j,value);tl.store(IDS+offset*K+j,token)
+            score=tl.where(v==token,-float('inf'),score);live=live&(v!=token)
 
 
-def teacher(target,mapping,weights,topk,pools,outputs,greedy=False):
+def teacher(target,mapping,weights,topk,pools,outputs,greedy=False,selection=None):
     b,q=weights.shape;v=mapping.numel();tiles=triton.cdiv(v,256);n=b*q;k=min(topk,v)
     maxima,sums,values,ids=[p[:n*tiles*(k if i>=2 else 1)] for i,p in enumerate(pools)]
     probs,indices,norm=outputs
-    _teacher_scan[(tiles,n)](target,mapping,weights,maxima,sums,values,ids,
+    if selection is None: # standalone tests; production always reuses its pool
+        selected=torch.empty(n,device=weights.device,dtype=torch.int32)
+        count=torch.empty(1,device=weights.device,dtype=torch.int32)
+    else:selected,count=selection
+    _compact_selected[(1,)](weights,selected,count,n,triton.next_power_of_2(n),num_warps=4)
+    _teacher_scan[(tiles,min(n,32))](target,mapping,selected,count,maxima,sums,values,ids,
         target.stride(0),target.stride(1),0 if greedy else target.stride(2),q,v,k,tiles,256,greedy,num_warps=4)
     # _proposal_merge exponentiates score values; teacher top-k instead needs
     # literal probability ranking and division by compact mass.
-    _teacher_merge[(n,)](sums,values,ids,probs,indices,norm,n,v,k,tiles,
+    _teacher_merge[(n,)](weights,sums,values,ids,probs,indices,norm,n,v,k,tiles,
         triton.next_power_of_2(tiles),triton.next_power_of_2(tiles*k),num_warps=4)
 
 
-@triton.jit
-def _teacher_merge(SUM,VALUES,IDS,P,OUT_IDS,MASS,N:tl.constexpr,V:tl.constexpr,K:tl.constexpr,
+@triton.jit(do_not_specialize=["N"])
+def _teacher_merge(W,SUM,VALUES,IDS,P,OUT_IDS,MASS,N,V:tl.constexpr,K:tl.constexpr,
                    TILES:tl.constexpr,BT:tl.constexpr,BK:tl.constexpr):
     state=tl.program_id(0).to(tl.int64);t=tl.arange(0,BT);candidate=tl.arange(0,BK)
-    mass=tl.sum(tl.load(SUM+state*TILES+t,t<TILES,other=0),axis=0)
-    valid_mass=(mass>0)&(mass<float('inf'))
-    tl.store(MASS+state,mass)
-    value=tl.load(VALUES+state*TILES*K+candidate,candidate<TILES*K,other=-float('inf'))
-    ids=tl.load(IDS+state*TILES*K+candidate,candidate<TILES*K,other=V)
-    for j in range(K):
-        best=tl.max(value,axis=0);token=tl.min(tl.where(value==best,ids,V),axis=0)
-        positive=valid_mass&(best>0)&(token<V)
-        tl.store(P+state*K+j,tl.where(positive,tl.div_rn(best,tl.where(valid_mass,mass,1.)),0.))
-        tl.store(OUT_IDS+state*K+j,tl.where(positive,token,-1))
-        value=tl.where(ids==token,-float('inf'),value)
+    selected=tl.load(W+state)>0
+    if selected:
+        mass=tl.sum(tl.load(SUM+state*TILES+t,(t<TILES)&selected,other=0),axis=0)
+        valid_mass=(mass>0)&(mass<float('inf'))
+        tl.store(MASS+state,mass)
+        value=tl.load(VALUES+state*TILES*K+candidate,(candidate<TILES*K)&selected,other=-float('inf'))
+        ids=tl.load(IDS+state*TILES*K+candidate,(candidate<TILES*K)&selected,other=V)
+        for j in range(K):
+            best=tl.max(value,axis=0);token=tl.min(tl.where(value==best,ids,V),axis=0)
+            positive=valid_mass&(best>0)&(token<V)
+            tl.store(P+state*K+j,tl.where(positive,tl.div_rn(best,tl.where(valid_mass,mass,1.)),0.))
+            tl.store(OUT_IDS+state*K+j,tl.where(positive,token,-1))
+            value=tl.where(ids==token,-float('inf'),value)
+    else:
+        unused=tl.arange(0,triton.next_power_of_2(K))
+        tl.store(MASS+state,0.)
+        tl.store(P+state*K+unused,0.,unused<K)
+        tl.store(OUT_IDS+state*K+unused,-1,unused<K)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["ROWS","CACHE"])
 def _selected_head(H,HEAD,BIAS,U,B,D_IDS,D_Q,T_IDS,NORM,W,MASS,CONTEXTS,OUT,
-                   HEAD_DTYPE:tl.constexpr,ROWS:tl.constexpr,CACHE:tl.constexpr,
+                   HEAD_DTYPE:tl.constexpr,ROWS,CACHE,
                    HIDDEN:tl.constexpr,R:tl.constexpr,K:tl.constexpr,
                    HAS_BIAS:tl.constexpr,BH:tl.constexpr,BR:tl.constexpr,BK:tl.constexpr):
     j,state=tl.program_id(0),tl.program_id(1).to(tl.int64)
@@ -257,9 +299,9 @@ def _selected_head(H,HEAD,BIAS,U,B,D_IDS,D_Q,T_IDS,NORM,W,MASS,CONTEXTS,OUT,
     tl.store(OUT+state*K+j,q)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["TS0","TS1","TS2","ROWS","CACHE"])
 def _union(TARGET,MAP,W,KIND,CONTEXTS,D_IDS,D_Q,T_IDS,T_P,T_Q,MASS,
-            OUT_IDS,OUT_G,STATS,TS0,TS1,TS2,ROWS:tl.constexpr,CACHE:tl.constexpr,
+            OUT_IDS,OUT_G,STATS,TS0,TS1,TS2,ROWS,CACHE,
             V:tl.constexpr,K:tl.constexpr,FIELDS:tl.constexpr,BU:tl.constexpr,GREEDY:tl.constexpr):
     state=tl.program_id(0).to(tl.int64);j=tl.arange(0,BU);first=j<K
     context=tl.maximum(tl.load(CONTEXTS+state),0);cache=state//ROWS*CACHE+context
@@ -305,17 +347,17 @@ def _union(TARGET,MAP,W,KIND,CONTEXTS,D_IDS,D_Q,T_IDS,T_P,T_Q,MASS,
     tl.store(STATS+state*FIELDS+9,(selected&~finite).to(tl.float32))
 
 
-@triton.jit
-def _reduce(STATS,ROUND_WEIGHT,COUNTERS,N:tl.constexpr,FIELDS:tl.constexpr,BN:tl.constexpr):
+@triton.jit(do_not_specialize=["N"])
+def _reduce(STATS,ROUND_WEIGHT,COUNTERS,N,FIELDS:tl.constexpr,BN:tl.constexpr):
     field=tl.program_id(0);n=tl.arange(0,BN)
     total=tl.sum(tl.load(STATS+n*FIELDS+field,n<N,other=0),axis=0)
     if field==0:tl.store(ROUND_WEIGHT,total)
     tl.atomic_add(COUNTERS+tl.where(field==9,12,field),total.to(tl.float64))
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["ROWS","CACHE"])
 def _update(IDS,G,U,CONTEXTS,ROUND_WEIGHT,B,BITS,ACTIVE,COUNT,
-             ROWS:tl.constexpr,CACHE:tl.constexpr,K:tl.constexpr,R:tl.constexpr,
+             ROWS,CACHE,K:tl.constexpr,R:tl.constexpr,
              LR:tl.constexpr,BU:tl.constexpr,BR:tl.constexpr):
     state=tl.program_id(0).to(tl.int64);j,r=tl.arange(0,BU),tl.arange(0,BR)
     token=tl.load(IDS+state*2*K+j,j<2*K,other=-1)
@@ -334,32 +376,19 @@ def _update(IDS,G,U,CONTEXTS,ROUND_WEIGHT,B,BITS,ACTIVE,COUNT,
     tl.store(ACTIVE+slot,token,first)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=[])
 def _round_end(B,BITS,ACTIVE,COUNT,WEIGHT,COUNTERS,R:tl.constexpr,
                LR:tl.constexpr,BS:tl.constexpr,BR:tl.constexpr):
     weight=tl.load(WEIGHT);count=tl.load(COUNT)
-    s,r=tl.arange(0,BS),tl.arange(0,BR)
-    kept=tl.full((),0,tl.int32)
-    # Exact structural pruning, not gating: cancellation can make an adapter
-    # row identically zero. Keep index/bitmap consistent, including B=0 identity.
-    # ONE existing round-end CTA compacts in-place; no per-response state copy.
-    for start in range(0,count,BS):
-        token=tl.load(ACTIVE+start+s,start+s<count,other=0)
-        w=tl.load(B+token[:,None]*R+r[None,:],(start+s[:,None]<count)&(r[None,:]<R),other=0)
-        live=(tl.sum((w!=0).to(tl.int32),axis=1)>0)&(start+s<count)
-        destination=kept+tl.cumsum(live.to(tl.int32),axis=0)-1
-        tl.store(ACTIVE+tl.maximum(destination,0),token,live)
-        tl.atomic_and(BITS+token//32,~(1<<(token%32)),(start+s<count)&~live)
-        kept+=tl.sum(live.to(tl.int32),axis=0)
-    tl.store(COUNT,kept)
     tl.atomic_add(COUNTERS+9,((weight>0)&(LR>0)).to(tl.float64))
-    tl.atomic_add(COUNTERS+10,kept.to(tl.float64))
+    tl.atomic_add(COUNTERS+10,count.to(tl.float64))
     tl.atomic_add(COUNTERS+11,1.)
+    tl.atomic_max(COUNTERS+15,count.to(tl.float64))
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["ROWS","CACHE"])
 def _projector_terms(IDS,G,HEAD,B,CONTEXTS,H_OUT,V_OUT,
-                      ROWS:tl.constexpr,CACHE:tl.constexpr,K:tl.constexpr,HIDDEN:tl.constexpr,
+                      ROWS,CACHE,K:tl.constexpr,HIDDEN:tl.constexpr,
                       R:tl.constexpr,BU:tl.constexpr,BH:tl.constexpr,BR:tl.constexpr):
     state=tl.program_id(0).to(tl.int64)
     j,r,h=tl.arange(0,BU),tl.arange(0,BR),tl.arange(0,BH)
@@ -380,7 +409,8 @@ def feedback(state,tree,path,target,greedy=False):
     select_states(tree,path,weights,kind,state.visited_weight,state.frontier_weight)
     state.end(ticket);ticket=state.begin('opd_teacher_extract_ms')
     probs=state.teacher_p[:n*k].view(n,k);ids=state.teacher_ids[:n*k].view(n,k);mass=state.teacher_mass[:n]
-    teacher(target,state.mapping,weights,k,state.teacher_tiles,(probs,ids,mass),greedy)
+    teacher(target,state.mapping,weights,k,state.teacher_tiles,(probs,ids,mass),greedy,
+            selection=(state.selected_ids,state.selected_count))
     state.end(ticket);ticket=state.begin('opd_union_loss_ms')
     head=state.head.weight;bias=state.head.bias if state.head.bias is not None else head
     _selected_head[(k,n)](state.head_cache,head,bias,state.u_cache,state.B_fast,state.ids_cache,state.q_cache,
