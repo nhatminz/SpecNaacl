@@ -10,6 +10,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler
+from tqdm.auto import tqdm
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, get_scheduler
 from helper.fastgrpo_model import FastGRPOModel
 from helper.pretrain_data import DataCollator
@@ -119,9 +120,12 @@ def main(argv=None):
                 link=root/name;temporary=root/(name+'.tmp')
                 temporary.unlink(missing_ok=True);temporary.symlink_to(destination.resolve());temporary.replace(link)
     start=time.perf_counter()
+    progress_disabled=rank!=0 or os.environ.get('TQDM_DISABLE','').strip().lower() in {'1','true','yes','on'}
     for epoch in range(epoch_start,a.num_epochs):
         sampler.set_epoch(epoch)
-        for i,batch in enumerate(loader):
+        progress=tqdm(enumerate(loader),total=len(loader),desc=f'Pretrain epoch {epoch+1}/{a.num_epochs}',
+                      unit='batch',dynamic_ncols=True,disable=progress_disabled)
+        for i,batch in progress:
             if epoch==epoch_start and i<batch_start:continue
             has_labels=torch.any(batch['loss_mask']==1).to(device=model.device,dtype=torch.int32)
             if world>1:dist.all_reduce(has_labels,op=dist.ReduceOp.MIN)
@@ -138,13 +142,21 @@ def main(argv=None):
             optimizer.step();scheduler.step();optimizer.zero_grad(set_to_none=True);step+=1
             if rank==0:
                 row=dict(step=step,epoch=epoch,batch=i,loss=float(loss.detach()),loss1=float(loss1.detach()),loss2=float(loss2.detach()),wall_time_s=time.perf_counter()-start)
+                progress.set_postfix(step=step,loss=f"{row['loss']:.4f}",
+                    feature=f"{row['loss1']:.4f}",ce=f"{row['loss2']:.4f}",
+                    lr=f"{optimizer.param_groups[0]['lr']:.2e}",refresh=False)
                 for filename in ('metrics.jsonl',f'epoch_{epoch}.log'):
                     with (logs/filename).open('a') as f:f.write(json.dumps(row)+'\n')
             if step%a.save_interval==0:save(epoch,i+1)
             if a.max_steps>0 and step>=a.max_steps:
+                if not progress_disabled:
+                    progress.n=i+1
+                    progress.refresh()
+                progress.close()
                 save(epoch,i+1)
                 if world>1:dist.destroy_process_group()
                 return
+        progress.close()
         batch_start=0
     save(a.num_epochs,0)
     if rank==0:
