@@ -11,6 +11,7 @@ from torch import nn
 from helper.modeling_draft import (Model, DraftModel, DraftAttention,
                                     apply_rotary_pos_emb, repeat_kv)
 from helper.opd_static_cache import OPDStaticCache
+from helper.transformers_compat import prepare_target_decoder_api
 
 @dataclass
 class CacheSlot:
@@ -165,6 +166,10 @@ class CachedDraftModel(DraftModel):
         }
 
 class FastGRPOModel(Model):
+    def __init__(self, config, target_model, path=None):
+        prepare_target_decoder_api(target_model)
+        super().__init__(config, target_model, path=path)
+
     def enable_opd(self, rank=8):
         from helper.opd_reflex import initialize_projector
         if hasattr(self.draft_model, 'opd_projector'):

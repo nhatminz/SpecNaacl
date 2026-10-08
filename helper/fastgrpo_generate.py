@@ -15,7 +15,7 @@ from tqdm import tqdm
 from torch.nn.attention import SDPBackend, sdpa_kernel
 import datasets
 from transformers import get_cosine_schedule_with_warmup
-from transformers import DynamicCache
+from helper.transformers_compat import DynamicCache
 import json
 import pandas as pd
 import re

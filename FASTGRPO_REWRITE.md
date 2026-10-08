@@ -10,7 +10,7 @@ Không sửa `FastGRPO-main`.
 |---|---|---|
 | Draft architecture | `helper/modeling_draft.py` | Nguyên byte upstream: EagleFS, DraftDecoderLayer, states/logits MLP và norm |
 | Wrapper checkpoint | `helper/fastgrpo_model.py` | Shared target embedding/lm_head; thêm A và cache storage chỉ khi bật OPD |
-| Baseline rollout | `helper/fastgrpo_generate.py` | Source upstream; chỉ thêm host metric counters tại boundary có sẵn |
+| Baseline rollout | `helper/fastgrpo_generate.py` | Source upstream; host metric counters và cache API adapter cho Transformers 5.x |
 | Dispatch | `helper/specualtive_generate.py` | Hai method; baseline không khởi tạo OPD/kernel/tuner |
 | Pretrain | `train_draft.py`, `helper/pretrain_data.py` | Loss/collation upstream, thêm launcher, distributed coordination và resume |
 | Online draft / GRPO loss | `helper/fastgrpo_training.py` | Hàm lấy từ source gốc, truyền globals thành tham số |
@@ -159,3 +159,13 @@ Không có extra transformer forward trong phép chạy này. Số đo chỉ m�
 chưa profile-tune, draft mới học 2 bước; chênh lệch 0.09–0.42% wall time không
 đủ để kết luận speedup/regression. Chưa đo workload mặc định dài/batch lớn,
 B200 hay distributed nhiều GPU.
+
+## Tương thích môi trường đã có — 2026-10-08
+
+Validator hiện chấp nhận các version/API family được hỗ trợ, gồm stack server
+Transformers 5.12.1 / PEFT 0.21.1 / Torch 2.13.0, rồi kiểm tra import và execution
+thật thay vì chỉ so pin. `--strict-versions` vẫn dành cho môi trường cài đúng pin.
+HF 5.x được hỗ trợ bởi `helper/transformers_compat.py`; chỉ chuyển tiếp cache
+argument/decoder return type và key/value lists, không đổi thuật toán FastGRPO.
+Xem [ENVIRONMENT.md](ENVIRONMENT.md) cho lệnh giữ nguyên `.venv` và phạm vi
+kiểm thử CPU/CUDA.

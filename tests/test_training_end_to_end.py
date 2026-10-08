@@ -76,7 +76,7 @@ def test_pretrain_resume_weights_optimizer_scheduler_rng_and_paths(tmp_path):
         command=[sys.executable,str(ROOT/'train_draft.py'),'--model_dir',str(tmp_path/'model'),
             '--dataset_dir',str(tmp_path/'sharegpt.json'),'--saved_model_dir',str(out/'checkpoints'),
             '--log_dir',str(out/'logs'),'--model_output_root',str(out),'--version_name','tiny',
-            '--num_epochs','2','--batch_size','2','--num_workers','0','--max_length','128',
+            '--num_epochs','2','--batch_size','2','--num_workers','0','--max_length','256',
             '--save_interval','1',*extra]
         with (tmp_path/(name+'.log')).open('w') as log:
             result=subprocess.run(command,env=env,stdout=log,stderr=subprocess.STDOUT,timeout=120)

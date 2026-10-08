@@ -1,9 +1,11 @@
 """Synthetic entrypoint integration fixture; controlled rewards, no benchmark claims."""
 import sys,os,runpy,json
+os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
 from pathlib import Path
 REPO=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(REPO))
 import torch
+torch.use_deterministic_algorithms(True, warn_only=True)
 from transformers import Qwen2Config,Qwen2ForCausalLM,PreTrainedTokenizerFast
 from tokenizers import Tokenizer,models,pre_tokenizers,decoders
 from copy import deepcopy
@@ -16,8 +18,12 @@ if not (root/'sharegpt.json').exists():
     target=Qwen2ForCausalLM(config).bfloat16();target.save_pretrained(modeldir)
     dc=deepcopy(config);dc.num_hidden_layers=1;dc.rope_scaling=None;dc.torch_dtype=target.dtype
     FastGRPOModel(dc,target).save_model(root/'draft.pth')
-    vocab={'t'+str(i):i for i in range(97)}
-    tok=Tokenizer(models.WordLevel(vocab,unk_token='t0'));tok.pre_tokenizer=pre_tokenizers.Whitespace();tok.decoder=decoders.WordPiece(prefix='')
+    # Use the real Qwen ByteLevel/BPE format: HF 5 can infer Qwen2Tokenizer
+    # regardless of the generic tokenizer class saved by this tiny fixture.
+    vocab={'t0':0,**{chr(i):i-32 for i in range(33,127)},'Ġ':95,'t96':96}
+    tok=Tokenizer(models.BPE(vocab,merges=[],unk_token='t0'))
+    tok.pre_tokenizer=pre_tokenizers.ByteLevel(add_prefix_space=False)
+    tok.decoder=decoders.ByteLevel()
     tokenizer=PreTrainedTokenizerFast(tokenizer_object=tok,unk_token='t0',pad_token='t0',eos_token='t96')
     tokenizer.chat_template="{% for message in messages %}{{ message['role'] + ' ' + message['content'] + ' ' }}{% endfor %}{% if add_generation_prompt %}{{ 'assistant ' }}{% endif %}"
     tokenizer.save_pretrained(modeldir)
@@ -35,7 +41,7 @@ rewards.accuracy_reward_func=lambda completions,solution,**kw:[float(next(reward
 rewards.format_reward_func=lambda completions,**kw:[0.]*len(completions)
 sys.argv=['grpo_speculative.py','--method',method,'--model_dir',str(modeldir),'--adapter_path',str(root/'draft.pth'),
  '--dataset_path',str(root/'train.json'),'--train_data_fraction','1','--batch_size','2','--accumulation_steps','1','--repeated_generate_nums','2',
- '--num_epochs','1','--max_length','112','--max_prompt_length','96','--max_training_token','512','--max_training_padding_gap','512',
+ '--num_epochs','1','--max_length','48','--max_prompt_length','32','--max_training_token','512','--max_training_padding_gap','512',
  '--verification_capacity','28','--max_verification_num','7','--max_draft_k','2','--max_draft_token_length','3','--min_draft_token_length','3',
  '--num_workers','0','--persistent_workers','false','--dtype','bf16','--attn_implementation','sdpa',
  '--log_file',str(out/'logs/metrics.jsonl'),'--timing_file',str(out/'logs/timing.csv'),'--summary_file',str(out/'summary.json'),
@@ -84,5 +90,10 @@ def train(*a,**k):
     events.append('draft_backward');return old_train(*a,**k)
 generation.speculative_generate=generate;training.training_draft_model=train
 torch.optim.AdamW.__init__=init;torch.optim.AdamW.step=step
-runpy.run_path(str(REPO/'grpo_speculative.py'),run_name='__main__')
+# Resume trajectory comparisons require deterministic attention reductions.
+# The production runtime retains its normal SDPA dispatch; only this synthetic
+# subprocess uses the math backend to keep the bitwise restore check meaningful.
+from torch.nn.attention import SDPBackend, sdpa_kernel
+with sdpa_kernel(SDPBackend.MATH):
+    runpy.run_path(str(REPO/'grpo_speculative.py'),run_name='__main__')
 (out/'test_events.json').write_text(json.dumps(events))

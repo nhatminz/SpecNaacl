@@ -77,7 +77,7 @@ if [[ "${DRY_RUN:-false}" == true ]];then return 0 2>/dev/null || exit 0;fi
 [[ -f "$MODEL/config.json" ]] || { echo "Missing model: $MODEL" >&2; exit 2; }
 [[ -f "$PRETRAIN_DATASET_PATH" ]] || { echo "Missing dataset: $PRETRAIN_DATASET_PATH" >&2; exit 2; }
 export PYTHONPATH="$PROJECT_DIR${PYTHONPATH:+:$PYTHONPATH}"
-"$PYTHON_BIN" "$PROJECT_DIR/scripts/validate_environment.py" --requirements "$PROJECT_DIR/requirements.txt" --require-cuda
+env CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" "$PYTHON_BIN" "$PROJECT_DIR/scripts/validate_environment.py" --requirements "$PROJECT_DIR/requirements.txt" --require-cuda
 mkdir -p "$RUN_DIR/logs" "$RUN_DIR/checkpoints" "$MODEL_OUTPUT_ROOT"
 if [[ "$TRAIN_DATA_PATH" != "$PRETRAIN_DATASET_PATH" ]]; then
   "$PYTHON_BIN" "$PROJECT_DIR/scripts/prepare_local_pretrain_data.py" \

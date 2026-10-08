@@ -188,7 +188,7 @@ if [[ -n "$RESUME_CHECKPOINT" && ! -f "$RESUME_CHECKPOINT" ]]; then
 fi
 
 export PYTHONPATH="$PROJECT_DIR${PYTHONPATH:+:$PYTHONPATH}"
-"$PYTHON_BIN" "$PROJECT_DIR/scripts/validate_environment.py" \
+env CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" "$PYTHON_BIN" "$PROJECT_DIR/scripts/validate_environment.py" \
   --requirements "$PROJECT_DIR/requirements.txt" --require-cuda
 
 if [[ "$METHOD" == opd_reflex && "$OPD_PROPOSAL_MODE" == auto && "$DRAFT_INITIALIZATION_MODE" == pretrained ]];then

@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Fail-fast validation for the pinned SpecNaacl B200 environment."""
+"""Validate supported installed packages and execute the FastGRPO training APIs.
+
+requirements.txt remains the reproducible installation profile. Existing
+environments may use compatible versions after import/API/execution checks.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +13,10 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 import re
 import sys
+from packaging.specifiers import SpecifierSet
+from packaging.version import Version
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 IMPORT_NAMES = {
@@ -25,10 +33,23 @@ IMPORT_NAMES = {
 # a newer interpreter does not guarantee wheels/runtime support for that version.
 MIN_PYTHON_VERSION = (3, 10, 0)
 
-# Narrow patch compatibility exception, not an unbounded dependency range.
-# requirements.txt still specifies exactly one reproducible installation pin.
-COMPATIBLE_PATCH_VERSIONS = {}
+# Bounded API families, including the user's existing B200 stack. Admission is
+# followed by real import and execution checks; newer does not imply compatible.
+COMPATIBLE_VERSIONS = {
+    "torch": ">=2.5.1,<3", "transformers": ">=4.51.3,<6",
+    "peft": ">=0.17.1,<0.22", "datasets": ">=4,<6",
+    "accelerate": ">=1.10.1,<2", "safetensors": ">=0.6.2,<1",
+    "numpy": ">=2.2.6,<3", "pandas": ">=2.3.2,<4",
+    "tqdm": ">=4.67.1,<5", "math-verify": ">=0.8,<1",
+    "latex2sympy2-extended": ">=1.10.2,<2", "sympy": ">=1.13.1,<2",
+    "triton": ">=3.1,<4", "matplotlib": ">=3.10.6,<4",
+    "packaging": ">=25,<27", "pytest": ">=8.4.2,<10",
+}
 REQUIRED_APIS = {
+    "torch": ("save", "load", "_assert_async", "multinomial"),
+    "transformers": ("AutoConfig", "AutoTokenizer", "AutoModelForCausalLM", "get_scheduler"),
+    "triton": ("jit", "cdiv", "next_power_of_2"),
+    "datasets": ("load_dataset",),
     "peft": (
         "get_peft_config", "get_peft_model", "LoraConfig", "TaskType", "PeftType",
         "get_peft_model_state_dict", "set_peft_model_state_dict", "PeftModel",
@@ -36,12 +57,14 @@ REQUIRED_APIS = {
 }
 
 
-def version_matches(distribution, expected, actual):
+def version_matches(distribution, expected, actual, *, strict=False):
     actual = actual.split("+", 1)[0]
     if actual == expected:
         return True
-    allowed = COMPATIBLE_PATCH_VERSIONS.get(distribution.lower().replace("_", "-"), ())
-    return expected in allowed and actual in allowed
+    if strict:
+        return False
+    allowed = COMPATIBLE_VERSIONS.get(distribution.lower().replace("_", "-"))
+    return allowed is not None and Version(actual) in SpecifierSet(allowed)
 
 
 def validate_python_version():
@@ -73,13 +96,15 @@ def pinned_requirements(path: Path):
         yield match.group(1), match.group(2)
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--requirements", type=Path, default=Path("requirements.txt"))
+    parser.add_argument("--requirements", type=Path, default=REPO_ROOT / "requirements.txt")
+    parser.add_argument("--strict-versions", action="store_true",
+                        help="require the exact installation pins instead of compatible API families")
     parser.add_argument("--require-cuda", action="store_true")
     parser.add_argument("--python-only", action="store_true",
                         help="check the supported interpreter without importing dependencies")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     validate_python_version()
     if args.python_only:
         return
@@ -91,8 +116,9 @@ def main():
         except PackageNotFoundError:
             failures.append(f"{distribution}: not installed")
             continue
-        if not version_matches(distribution, expected, actual):
-            failures.append(f"{distribution}: expected {expected}, found {actual}")
+        if not version_matches(distribution, expected, actual, strict=args.strict_versions):
+            supported = expected if args.strict_versions else COMPATIBLE_VERSIONS.get(distribution, expected)
+            failures.append(f"{distribution}: supported {supported}, found {actual}")
             continue
         module_name = IMPORT_NAMES.get(distribution, distribution.replace("-", "_"))
         try:
@@ -108,7 +134,7 @@ def main():
             )
             continue
         if actual.split("+", 1)[0] != expected:
-            print(f"{distribution}: accepted compatible patch {actual} (install pin {expected})")
+            print(f"{distribution}: compatible version {actual} (install pin {expected}); checking runtime APIs")
     if failures:
         raise RuntimeError("environment validation failed:\n- " + "\n- ".join(failures))
 
@@ -116,6 +142,13 @@ def main():
     if args.require_cuda:
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is required but torch.cuda.is_available() is false")
+    sys.path.insert(0, str(REPO_ROOT))
+    try:
+        from helper.environment_checks import probe_training_runtime
+        result = probe_training_runtime('cuda' if args.require_cuda else 'cpu')
+    except Exception as exc:
+        raise RuntimeError(f"FastGRPO runtime compatibility probe failed: {type(exc).__name__}: {exc}") from exc
+    print(f"Runtime compatibility probe passed: {result}")
     print(
         "environment validation passed: "
         f"python={sys.version.split()[0]} torch={torch.__version__} "

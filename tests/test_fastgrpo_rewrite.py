@@ -18,6 +18,9 @@ def original(name):
     path=ROOT/'sources/FastGRPO'/name
     spec=importlib.util.spec_from_file_location('original_'+path.stem,path)
     module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+    if hasattr(module, 'DynamicCache'):
+        from helper.transformers_compat import DynamicCache
+        module.DynamicCache = DynamicCache
     return module
 
 
