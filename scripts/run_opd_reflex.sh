@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 export METHOD=opd_reflex
+export OPD_SAMPLER_MODE="${OPD_SAMPLER_MODE:-finite}"
 export MODEL_KEY="${MODEL_KEY:-qwen25_3b}"
 export DATASET="${DATASET:-simplelr}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"

@@ -1184,7 +1184,8 @@ rollout_metrics=RolloutMetricsWriter(rollout_timing_path,method,state=rollout_re
     flush_interval=args.rollout_log_flush_interval)
 
 def finish_rollout_iteration():
-    rollout_metrics.finish(iter_outputs,grpo_step=step,used_items=used_items,wall_time_s=_cumulative_wall_time())
+    rollout_metrics.finish(iter_outputs,grpo_step=step,used_items=used_items,
+        wall_time_s=_cumulative_wall_time(),draft_updates_cumulative=draft_step)
     batch_data['_rollout_metrics_state']=rollout_metrics.state.copy()
 
 # Flush host telemetry on torchrun termination too; never touch CUDA here.
@@ -1351,6 +1352,9 @@ for epoch in epoch_bar:
                     draft_step += 1
                     draft_update_committed = True
                 phase_timings.end(draft_phase_ticket)
+                # Reuse the host duration already recorded by the phase timer;
+                # do not resolve/read its CUDA events for iteration logging.
+                iter_outputs['iter_draft_train_time_s']=phase_timings.pending[-1][1]
 
             if draft_step % 1024 == 0 and step > 0 and is_train_draft:
                 with open(f"{saved_statistics_dir}/{step}.pkl","wb") as f:
@@ -1450,6 +1454,9 @@ for epoch in epoch_bar:
                 "draft_lr_multiplier": float(draft_lr_multiplier),
                 "fastgrpo_ablation": bool(fastgrpo_ablation),
             }
+            iter_outputs.update(iter_draft_sparse_kl=rollout_log['draft_sparse_kl'],
+                iter_draft_sparse_tv=rollout_log['draft_sparse_tv'],
+                iter_draft_update_committed=rollout_log['draft_update_committed'])
             batch=[]
 
             cur_acc_length = (
@@ -1641,6 +1648,8 @@ for epoch in epoch_bar:
                 optimizer_target.step()
                 optimizer_target.zero_grad(set_to_none=True)
                 phase_timings.end(target_phase_ticket)
+                iter_outputs['iter_target_train_time_s']=(
+                    iter_outputs.get('iter_target_train_time_s',0.)+phase_timings.pending[-1][1])
 
                 if (
                     analysis_enabled

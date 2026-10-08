@@ -4,6 +4,7 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export MODEL_KEY="${MODEL_KEY:-qwen25_3b}"
 export METHOD=opd_reflex
+export OPD_SAMPLER_MODE="${OPD_SAMPLER_MODE:-finite}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export DATASET="${DATASET:-simplelr}"
 export BATCH_SIZE="${BATCH_SIZE:-8}"

@@ -20,6 +20,9 @@ export OPD_AUTO_TUNE_IF_MISSING="${OPD_AUTO_TUNE_IF_MISSING:-0}"
 export OPD_UPDATE_STREAM="${OPD_UPDATE_STREAM:-1}"
 export OPD_FAST_LR="${OPD_FAST_LR:-${FAST_LR:-0.01}}"
 export OPD_KV_MAX_RETAINED_TOKENS="${OPD_KV_MAX_RETAINED_TOKENS:-0}"
+if [[ "$METHOD" == opd_reflex ]]; then
+  export OPD_SAMPLER_MODE="${OPD_SAMPLER_MODE:-finite}"
+fi
 if [[ ! "$ROLLOUT_LOG_FLUSH_INTERVAL" =~ ^0*[1-9][0-9]*$ ]]; then
   echo "ERROR: ROLLOUT_LOG_FLUSH_INTERVAL must be a positive integer; got: $ROLLOUT_LOG_FLUSH_INTERVAL" >&2
   exit 2

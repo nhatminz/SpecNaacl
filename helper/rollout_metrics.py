@@ -1,6 +1,7 @@
 """Buffered, host-only DataLoader iteration telemetry (including skipped batches)."""
 import atexit
 import csv
+import time
 from pathlib import Path
 
 OPD_FIELDS=('kl','selected_states','visited_states','frontier_states',
@@ -8,11 +9,15 @@ OPD_FIELDS=('kl','selected_states','visited_states','frontier_states',
     'sparse_rounds','dense_rounds','fused_rounds','gemm_rounds')
 KV_FIELDS=('iter_host_syncs','iter_host_syncs_per_round','iter_kv_cache_bytes',
            'iter_kv_full_reallocations','iter_kv_full_history_copies','iter_kv_history_copy_bytes','iter_kv_rows_moved','iter_kv_pool_allocations')
+ITER_TIME_FIELDS=('iter_wall_time_s','iter_generation_tokens_per_s','iter_end_to_end_tokens_per_s',
+                  'iter_draft_train_time_s','iter_target_train_time_s')
+DRAFT_UPDATE_FIELDS=('iter_draft_sparse_kl','iter_draft_sparse_tv',
+                     'iter_draft_update_committed','iter_draft_updates_cumulative')
 FIELDS=('global_iter','epoch','batch_iter','method','grpo_step','used_items','eligible_prompts','total_prompts',
     'iter_draft_feature_loss','iter_draft_distribution_loss','iter_draft_total_loss',
     'iter_aal','cumulative_aal','iter_generation_time_s','cumulative_generation_time_s','cumulative_wall_time_s',
     'iter_rollout_tokens','cumulative_rollout_tokens','iter_verification_rounds','cumulative_verification_rounds',
-    'iter_acceptance_rate','cumulative_acceptance_rate')+tuple('iter_opd_'+s for s in OPD_FIELDS)+KV_FIELDS
+    'iter_acceptance_rate','cumulative_acceptance_rate')+tuple('iter_opd_'+s for s in OPD_FIELDS)+KV_FIELDS+ITER_TIME_FIELDS+DRAFT_UPDATE_FIELDS
 
 
 class RolloutMetricsWriter:
@@ -49,7 +54,8 @@ class RolloutMetricsWriter:
 
     def begin(self,epoch,batch_iter,total_prompts,used_items):
         if self.pending is not None:raise RuntimeError('unfinished DataLoader iteration')
-        self.pending=dict(epoch=epoch,batch_iter=batch_iter,total_prompts=total_prompts,used_before=used_items)
+        self.pending=dict(epoch=epoch,batch_iter=batch_iter,total_prompts=total_prompts,
+                          used_before=used_items,started_at=time.perf_counter())
 
     @staticmethod
     def values(outputs):
@@ -65,8 +71,11 @@ class RolloutMetricsWriter:
             state['global_iter']=state.get('global_iter',0)+1
         return state
 
-    def finish(self,outputs,*,grpo_step,used_items,wall_time_s):
+    def finish(self,outputs,*,grpo_step,used_items,wall_time_s,draft_updates_cumulative=0):
         if self.pending is None:return
+        # Monotonic host wall time: only this DataLoader iteration, excluding
+        # startup and earlier iterations. No event query or stream wait here.
+        iter_wall_time_s=max(0.,time.perf_counter()-self.pending['started_at'])
         self.state=self.next_state(outputs)
         meta=self.pending;self.pending=None;o=outputs or {};values=self.values(o)
         def ratio(n,d):return n/d if d else 0.
@@ -79,6 +88,21 @@ class RolloutMetricsWriter:
             iter_verification_rounds=values['rounds'],cumulative_verification_rounds=self.state['rounds'],
             iter_acceptance_rate=ratio(values['accepted_draft'],values['proposed']),
             cumulative_acceptance_rate=ratio(self.state['accepted_draft'],self.state['proposed']))
+        row.update(iter_wall_time_s=iter_wall_time_s,
+            iter_generation_tokens_per_s=ratio(values['tokens'],values['generation']),
+            iter_end_to_end_tokens_per_s=ratio(values['tokens'],iter_wall_time_s))
+        # These values must already be Python scalars. Never coerce a tensor
+        # (including a scalar tensor) just to expose another CSV metric.
+        for field in ('iter_draft_train_time_s','iter_target_train_time_s'):
+            value=o.get(field,0.)
+            row[field]=value if isinstance(value,(int,float)) else ''
+        for field in ('iter_draft_sparse_kl','iter_draft_sparse_tv'):
+            value=o.get(field)
+            row[field]=value if isinstance(value,(int,float)) else ''
+        value=o.get('iter_draft_update_committed',False)
+        row['iter_draft_update_committed']=value if isinstance(value,(bool,int)) else ''
+        row['iter_draft_updates_cumulative']=(draft_updates_cumulative
+            if isinstance(draft_updates_cumulative,int) else '')
         for name in ('feature','distribution','total'):
             row['iter_draft_'+name+'_loss']=o.get('iter_draft_'+name+'_loss','')
         for field in OPD_FIELDS:row['iter_opd_'+field]=0.

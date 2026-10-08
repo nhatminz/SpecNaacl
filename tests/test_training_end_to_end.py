@@ -63,6 +63,19 @@ def test_train_resume_restores_weights_optimizers_rng_metrics_and_cadence(tmp_pa
     for filename,column in [('timing.csv','step'),('rollout_timing.csv','global_iter')]:
         rows=list(csv.DictReader((tmp_path/'resumed/logs'/filename).open()))
         assert [int(row[column]) for row in rows]==[1,2]
+        if filename=='rollout_timing.csv':
+            assert [int(row['iter_draft_updates_cumulative']) for row in rows]==[1,2]
+            for row in rows:
+                tokens=int(row['iter_rollout_tokens'])
+                generation=float(row['iter_generation_time_s'])
+                wall=float(row['iter_wall_time_s'])
+                draft=float(row['iter_draft_train_time_s'])
+                target=float(row['iter_target_train_time_s'])
+                assert wall>=draft+target>0
+                assert draft>0 and target>0
+                assert float(row['iter_generation_tokens_per_s'])==tokens/generation
+                assert float(row['iter_end_to_end_tokens_per_s'])==tokens/wall
+                assert row['iter_draft_update_committed']=='True'
     if method=='opd_reflex':assert 'opd_projector' in b['draft_model']
     else:assert 'opd_projector' not in b['draft_model']
 

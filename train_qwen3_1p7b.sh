@@ -3,6 +3,7 @@ set -euo pipefail
 # Paired launcher: all defaults are identical except METHOD / Reflex.
 export MODEL_KEY="qwen3_1p7b"
 export METHOD="opd_reflex"
+export OPD_SAMPLER_MODE="${OPD_SAMPLER_MODE:-finite}"
 export MODEL="${MODEL:-/workspace/storage-shared/models/Qwen3-1.7B}"
 export DATASET="${DATASET:-simplelr}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"

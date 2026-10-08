@@ -48,6 +48,9 @@ Có thể đặt `DRAFT_CHECKPOINT` về cùng một checkpoint cố định cho
 Data mặc định: `$DATA_ROOT/simplelr_abel_level3to5/train.parquet`.
 Target LR `1e-6`, draft LR `1e-4`, draft accumulation `1`.
 ReflexOPD mặc định rank `8`, TopK `16`, fast LR `0.01`, update stream `1`.
+Các launcher ReflexOPD mặc định export `OPD_SAMPLER_MODE=finite`.
+Để dùng validation/fallback sampler, override trước khi chạy:
+`OPD_SAMPLER_MODE=strict bash train_qwen25_1p5b.sh`.
 
 ```bash
 MAX_TRAIN_SAMPLES=128 bash train_qwen25_3b_fastgrpo.sh --max_grpo_steps 2
