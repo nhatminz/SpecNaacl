@@ -123,7 +123,7 @@ def test_final_filtered_rollouts_and_timers_are_accounted_before_last_flush(tmp_
                 total_rollout_tokens=64, total_acc_length=31, total_decoded_token_num=8,
                 total_accepted_draft_tokens=12, total_proposed_draft_tokens=30)
     scope = dict(torch=torch, dist=dist,OPD_COUNTER_NAMES=OPD_COUNTER_NAMES,GENERATION_COUNTER_NAMES=GENERATION_COUNTER_NAMES, model=SimpleNamespace(target_model=SimpleNamespace(device='cpu')),
-                 args=SimpleNamespace(opd_diagnostics='0', opd_profile='0'),
+                 args=SimpleNamespace(opd_diagnostics='0', opd_profile='0',max_target_optimizer_steps=0),
                  _as_bool=lambda value: value == '1', batch_data=data, phase_timings=timers,
                  step_metrics=writer, completed_step_snapshot=completed_step_snapshot,
                  _cumulative_wall_time=lambda: 18.0)
@@ -146,14 +146,14 @@ def test_real_training_logging_block_writes_every_unique_step_with_same_schema(t
     aggregate = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
                      and node.name == '_aggregate_job_metrics')
     block = next(node for node in ast.walk(tree) if isinstance(node, ast.If)
-                 and ast.unparse(node.test) == 'grpo_iteration == grpo_iteration_num - 1')
+                 and ast.unparse(node.test).startswith('grpo_iteration == grpo_iteration_num - 1'))
     scope = {'torch':torch,'dist':dist,'OPD_COUNTER_NAMES':OPD_COUNTER_NAMES,'GENERATION_COUNTER_NAMES':GENERATION_COUNTER_NAMES}
     exec(compile(ast.Module(body=[aggregate], type_ignores=[]), 'grpo_speculative.py', 'exec'), scope)
     writer = StepMetricsWriter(tmp_path / 'metrics.jsonl', tmp_path / 'timing.csv')
     timers = PhaseTimings('cpu')
     scope.update(
         model=SimpleNamespace(target_model=SimpleNamespace(device='cpu')),
-        args=SimpleNamespace(opd_diagnostics='0', opd_profile='0'),
+        args=SimpleNamespace(opd_diagnostics='0', opd_profile='0',max_target_optimizer_steps=0),
         _as_bool=lambda value: value == '1', step_metrics=writer, phase_timings=timers,
         completed_step_snapshot=completed_step_snapshot, grpo_iteration_num=2,
     )

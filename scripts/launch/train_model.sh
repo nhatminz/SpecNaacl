@@ -171,6 +171,7 @@ fi
 if [[ -n "$OPD_PROJECTOR_LR" && "$METHOD" == opd_reflex ]]; then
   cmd+=(--opd_projector_lr "$OPD_PROJECTOR_LR")
 fi
+cmd+=(--max_target_optimizer_steps "${MAX_TARGET_OPTIMIZER_STEPS:-0}" --max_rollout_prompts "${MAX_ROLLOUT_PROMPTS:-0}")
 if (($#)); then cmd+=("$@"); fi
 
 printf 'Run name : %s\nRun dir  : %s\nModel    : %s\nDataset  : %s\nDraft    : %s\nMethod   : %s\nEngine   : %s\nGPUs     : %s\n' \

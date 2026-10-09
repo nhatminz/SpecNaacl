@@ -6,3 +6,9 @@ wheelhouse-cp312-cu130/
 external-wheels-cp312-linux-x86_64/
 validation/
 reports/
+.venv/
+.venv-*/
+.cache/
+cache/
+*_cache/
+outputs/

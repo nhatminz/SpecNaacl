@@ -110,3 +110,16 @@ def test_pretrain_resume_weights_optimizer_scheduler_rng_and_paths(tmp_path):
     assert (resumed/'latest_target_config.json').exists()
     assert (resumed/'checkpoints/pretrain_complete.json').exists()
     assert [json.loads(line)['step'] for line in (resumed/'logs/metrics.jsonl').read_text().splitlines()]==[1,2,3,4]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(),reason='actual GRPO entrypoint requires CUDA')
+@pytest.mark.parametrize('method',['fastgrpo','opd_reflex'])
+def test_actual_optimizer_and_prompt_budget_with_multi_iteration_grpo(tmp_path,method):
+    command=[sys.executable,str(ROOT/'tests/tiny_training_runner.py'),str(tmp_path),method,'budget',
+             '--grpo_iteration_num','3','--max_target_optimizer_steps','1','--max_rollout_prompts','1']
+    result=subprocess.run(command,text=True,capture_output=True,timeout=120,env={**os.environ,'TQDM_DISABLE':'1'})
+    assert result.returncode==0,result.stdout[-4000:]+result.stderr[-4000:]
+    summary=json.loads((tmp_path/'budget/summary.json').read_text())
+    assert summary['target_optimizer_steps']==1 and summary['rollout_prompts_seen']==1
+    assert summary['optimizer_step_cadence']==[[1,1]]
+    assert summary['prompt_order_sha256']
