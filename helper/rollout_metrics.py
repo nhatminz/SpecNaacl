@@ -3,6 +3,7 @@ import atexit
 import csv
 import time
 from pathlib import Path
+from helper.opd_ablation import CONFIG_FIELDS, PROVENANCE_FIELDS, round_metrics
 
 OPD_FIELDS=('kl','selected_states','visited_states','frontier_states',
     'target_mass_in_draft_top16','target_compact_mass','active_rows_mean','active_rows_max',
@@ -13,11 +14,12 @@ ITER_TIME_FIELDS=('iter_wall_time_s','iter_generation_tokens_per_s','iter_end_to
                   'iter_draft_train_time_s','iter_target_train_time_s')
 DRAFT_UPDATE_FIELDS=('iter_draft_sparse_kl','iter_draft_sparse_tv',
                      'iter_draft_update_committed','iter_draft_updates_cumulative')
+ABLATION_METRIC_FIELDS=tuple('iter_'+name for name in round_metrics({}))+tuple('cumulative_'+name for name in round_metrics({}))
 FIELDS=('global_iter','epoch','batch_iter','method','grpo_step','used_items','eligible_prompts','total_prompts',
     'iter_draft_feature_loss','iter_draft_distribution_loss','iter_draft_total_loss',
     'iter_aal','cumulative_aal','iter_generation_time_s','cumulative_generation_time_s','cumulative_wall_time_s',
     'iter_rollout_tokens','cumulative_rollout_tokens','iter_verification_rounds','cumulative_verification_rounds',
-    'iter_acceptance_rate','cumulative_acceptance_rate')+tuple('iter_opd_'+s for s in OPD_FIELDS)+KV_FIELDS+ITER_TIME_FIELDS+DRAFT_UPDATE_FIELDS
+    'iter_acceptance_rate','cumulative_acceptance_rate')+tuple('iter_opd_'+s for s in OPD_FIELDS)+KV_FIELDS+ITER_TIME_FIELDS+DRAFT_UPDATE_FIELDS+CONFIG_FIELDS+PROVENANCE_FIELDS+ABLATION_METRIC_FIELDS
 
 
 class RolloutMetricsWriter:
@@ -30,9 +32,10 @@ class RolloutMetricsWriter:
         return {key:value for key,value in outputs.items() if key in names or
                 (key.startswith('opd_') and isinstance(value,(int,float)))}
 
-    def __init__(self,path,method,*,state=None,flush_interval=1):
+    def __init__(self,path,method,*,state=None,flush_interval=1,metadata=None):
         if flush_interval<1:raise ValueError('rollout flush interval must be positive')
         self.state=dict(state or {});self.method=method;self.pending=None
+        self.metadata={k:v for k,v in (metadata or {}).items() if k in CONFIG_FIELDS+PROVENANCE_FIELDS}
         self.flush_interval=flush_interval;self.unflushed=0
         path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
         # Resume at the checkpoint's iterator position, removing future rows.
@@ -62,7 +65,8 @@ class RolloutMetricsWriter:
         o=outputs or {}
         return dict(accepted=float(o.get('total_acc_length',0)),rounds=int(o.get('total_decoded_token_num',0)),
             tokens=sum(o.get('response_generated_tokens',[])),generation=float(o.get('total_time_cost',0)),
-            accepted_draft=int(o.get('total_accepted_draft_tokens',0)),proposed=int(o.get('total_proposed_draft_tokens',0)))
+            accepted_draft=int(o.get('total_accepted_draft_tokens',0)),proposed=int(o.get('total_proposed_draft_tokens',0)),
+            **{name:o.get(name,0.) for name in ('verification_batches','opd_feedback_rounds','opd_skipped_rounds','opd_updates')})
 
     def next_state(self,outputs):
         state=dict(self.state)
@@ -91,6 +95,9 @@ class RolloutMetricsWriter:
         row.update(iter_wall_time_s=iter_wall_time_s,
             iter_generation_tokens_per_s=ratio(values['tokens'],values['generation']),
             iter_end_to_end_tokens_per_s=ratio(values['tokens'],iter_wall_time_s))
+        row.update(self.metadata)
+        for prefix,counters in (('iter',o),('cumulative',self.state)):
+            row.update({prefix+'_'+name:value for name,value in round_metrics(counters).items()})
         # These values must already be Python scalars. Never coerce a tensor
         # (including a scalar tensor) just to expose another CSV metric.
         for field in ('iter_draft_train_time_s','iter_target_train_time_s'):

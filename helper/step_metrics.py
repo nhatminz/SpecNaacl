@@ -9,6 +9,7 @@ import time
 import torch
 import torch.distributed as dist
 from helper.opd_reflex import OPD_COUNTER_NAMES,GENERATION_COUNTER_NAMES
+from helper.opd_ablation import CONFIG_FIELDS, PROVENANCE_FIELDS
 
 
 COUNTERS = (
@@ -20,14 +21,16 @@ DERIVED_OPD_FIELDS=tuple(f'{prefix}_{name}' for prefix in ('step','cumulative') 
     'opd_kl','opd_mean_union_size','opd_target_compact_mass','opd_target_mass_in_draft_top16',
     'opd_active_token_rows','opd_active_rows_mean','opd_active_rows_max','opd_sparse_rounds','opd_dense_rounds','opd_fused_rounds','opd_gemm_rounds',
     'mean_active_responses_per_verify_round','mean_verified_tree_nodes',
-    'mean_verified_path_length','mean_frontier_per_visited_state'))
+    'mean_verified_path_length','mean_frontier_per_visited_state',
+    'opd_actual_update_frequency','opd_feedback_frequency'))
 MEMORY_FIELDS = ('gpu_allocated_gb', 'gpu_reserved_gb', 'gpu_peak_allocated_gb', 'gpu_free_gb')
 STEP_FIELDS = ('step', 'method', 'grpo_step', 'phase_time_basis') + tuple(
     f'{prefix}_{name}' for prefix in ('cumulative', 'step') for name in COUNTERS
 ) + (
     'step_generation_tokens_per_s', 'cumulative_generation_tokens_per_s',
     'step_aal', 'cumulative_aal', 'step_acceptance_rate', 'cumulative_acceptance_rate',
-) + DERIVED_OPD_FIELDS + MEMORY_FIELDS + ('rollout_tokens', 'tokens_per_s', 'aal', 'acceptance_rate')
+) + DERIVED_OPD_FIELDS + MEMORY_FIELDS + ('rollout_tokens', 'tokens_per_s', 'aal', 'acceptance_rate') + CONFIG_FIELDS + PROVENANCE_FIELDS + (
+    'step_end_to_end_tokens_per_s','cumulative_end_to_end_tokens_per_s')
 
 
 class PhaseTimings:
@@ -130,6 +133,8 @@ def step_record(step, current, previous, extras=None):
         tokens = result[f'{prefix}_rollout_tokens']
         elapsed = result[f'{prefix}_generation_time_s']
         result[f'{prefix}_generation_tokens_per_s'] = tokens / elapsed if elapsed > 0 else 0.0
+        wall = result[f'{prefix}_wall_time_s']
+        result[f'{prefix}_end_to_end_tokens_per_s'] = tokens / wall if wall > 0 else 0.0
         rounds = result[f'{prefix}_verification_rounds']
         result[f'{prefix}_aal'] = result[f'{prefix}_accepted_tokens'] / rounds if rounds > 0 else 0.0
         proposed = result[f'{prefix}_proposed_draft_tokens']
@@ -149,8 +154,12 @@ def step_record(step, current, previous, extras=None):
             ('mean_verified_tree_nodes','verified_tree_nodes','verification_rounds'),
             ('mean_verified_path_length','accepted_tokens','verification_rounds'),
             ('mean_frontier_per_visited_state','opd_frontier_states','opd_visited_states'),
+            ('opd_actual_update_frequency','opd_updates','verification_batches'),
+            ('opd_feedback_frequency','opd_feedback_rounds','verification_batches'),
         ):result[f'{prefix}_{name}']=ratio(numerator,denominator)
         if result[f'{prefix}_opd_nonfinite_kl_states']>0:result[f'{prefix}_opd_kl']=None
+        for name in ('opd_actual_update_frequency','opd_feedback_frequency'):
+            if result[f'{prefix}_{name}'] is None:result[f'{prefix}_{name}']=0.
         result[f'{prefix}_opd_sparse_rounds']=result[f'{prefix}_opd_proposal_mode_sparse_rounds']
         result[f'{prefix}_opd_dense_rounds']=result[f'{prefix}_opd_proposal_mode_dense_rounds']
         for mode in ('fused','gemm'):

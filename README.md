@@ -20,6 +20,7 @@ Checkpoint SpecForge cũ cần được thay bằng checkpoint pretrain FastGRPO
 - [Kiến trúc, đối chiếu source và kết quả kiểm thử](FASTGRPO_REWRITE.md)
 - [Chi tiết ReflexOPD](METHOD_OPD_REFLEX.md)
 - [Autotuning proposal](OPD_AUTOTUNING.md)
+- [SPARK ablations: learned/frozen A và update interval](SPARK_ABLATIONS.md)
 
 Các bản runtime, test và tài liệu trước rewrite được giữ riêng trong
 `legacy_tests/specforge/`; chúng không thuộc bộ test hay runtime hiện tại.

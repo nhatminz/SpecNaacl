@@ -19,7 +19,7 @@ def validate_training_sources(repo_root: Path, backend: str):
         "fastgrpo_generate.py", "opd_generate.py", "fastgrpo_model.py", "fastgrpo_training.py", "opd_scheduling.py", "opd_static_cache.py",
         "opd_kv_kernels.py", "opd_attention.py", "opd_attention_kernels.py",
         "opd_sampling.py", "opd_history.py", "rollout_metrics.py",
-        "opd_profiles.py",
+        "opd_profiles.py", "opd_ablation.py",
         "shared_rollout.py", "modeling_draft.py", "transformers_compat.py",
     ]
     paths = [Path(repo_root) / "helper" / name for name in required]

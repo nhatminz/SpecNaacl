@@ -4,8 +4,13 @@ import torch
 
 
 def draft_optimizer(draft,lr,projector_lr=None):
+    if projector_lr is not None and projector_lr<0:raise ValueError('OPD_PROJECTOR_LR must be nonnegative')
+    projector=getattr(draft,'opd_projector',None)
+    if projector is not None and not projector.requires_grad:
+        # Frozen/inactive A is absent from optimizer state and weight decay,
+        # even if an accidental external gradient were assigned to it.
+        return torch.optim.AdamW([p for p in draft.parameters() if p is not projector],lr=lr)
     if projector_lr is None:return torch.optim.AdamW(draft.parameters(),lr=lr)
-    if projector_lr<0:raise ValueError('OPD_PROJECTOR_LR must be nonnegative')
     projector=draft.opd_projector
     return torch.optim.AdamW([
         {'params':[p for p in draft.parameters() if p is not projector],'lr':lr,'name':'draft'},

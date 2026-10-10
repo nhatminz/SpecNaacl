@@ -29,6 +29,7 @@ from helper.opd_reflex import OPD_COUNTER_NAMES, GENERATION_COUNTER_NAMES
 from helper.step_metrics import PhaseTimings, StepMetricsWriter, completed_step_snapshot
 from helper.rollout_metrics import RolloutMetricsWriter
 from helper.opd_optimizer import draft_optimizer,load_draft_optimizer
+from helper.opd_ablation import ablation_config, initialize_provenance, final_provenance, round_metrics
 from policy_lag_analysis import (
     BranchSummary,
     bootstrap_delta_by_prompt,
@@ -229,6 +230,9 @@ def save_training_checkpoint(
         "opd_projector_pending_sum": getattr(model,'opd_projector_grad_sum',None),
         "opd_projector_pending_weight": getattr(model,'opd_projector_grad_weight',None),
         "method": getattr(model,"_training_method","fastgrpo"),
+        "opd_ablation_config": getattr(model,"_opd_ablation_config",None),
+        "opd_projector_initial": getattr(model,"_opd_initial_projector",None),
+        "opd_initial_a_sha256": getattr(model,"_opd_initial_a_sha256",None),
         "optimizer_target": optimizer_target.state_dict(),
         "optimizer_draft": optimizer_draft.state_dict(),
         "scheduler_target": None,
@@ -277,9 +281,14 @@ def load_training_checkpoint(path, *, model, optimizer_target, optimizer_draft):
             'resume checkpoint predates the learned draft projector; start a new '
             'run using its draft weights as initialization, not optimizer resume'
         )
+    from helper.opd_ablation import validate_resume_config
+    validate_resume_config(checkpoint.get('opd_ablation_config'), getattr(model,'_opd_ablation_config',None))
     current_initial=getattr(model.target_model,'_shared_initialization',{}).get('loaded_tensor_sha256')
     if checkpoint.get('initial_target_tensor_sha256') != current_initial:
         raise ValueError('resume initial target tensor hash mismatch')
+    if checkpoint.get('opd_projector_initial') is not None:
+        model._opd_initial_projector = checkpoint['opd_projector_initial'].float().clone()
+        model._opd_initial_a_sha256 = checkpoint['opd_initial_a_sha256']
     model.draft_model.load_state_dict(checkpoint["draft_model"])
     if checkpoint.get("opd_projector") is not None:model.load_opd_projector(checkpoint["opd_projector"])
     for key, attribute in (
@@ -317,6 +326,10 @@ parser.add_argument('--opd_profile',default='0',choices=['0','1'])
 parser.add_argument('--opd_diagnostics',default='0',choices=['0','1'])
 parser.add_argument('--opd_backend',default='triton',choices=['auto','torch','triton'])
 parser.add_argument('--opd_train_projector',default='1',choices=['0','1'])
+parser.add_argument('--opd_projector_init',default=os.environ.get('OPD_PROJECTOR_INIT','head_aligned'),choices=['head_aligned','random_orthogonal'])
+parser.add_argument('--opd_projector_seed',type=int,default=int(os.environ.get('OPD_PROJECTOR_SEED','42')))
+parser.add_argument('--opd_update_interval_rounds',type=int,default=int(os.environ.get('OPD_UPDATE_INTERVAL_ROUNDS','1')),choices=[0,1,5,10,15])
+parser.add_argument('--opd_ablation_name',default=os.environ.get('OPD_ABLATION_NAME',''))
 parser.add_argument('--draft_train_profile', default='0', choices=['0', '1'])
 parser.add_argument('--kv_gather_strategy', default='stacked', choices=['stacked', 'per_layer'])
 parser.add_argument('--dtype', type=str, default='auto', choices=['auto', 'bf16', 'fp16', 'fp32'])
@@ -561,7 +574,9 @@ opd_kwargs={"method":method,"opd_rank":args.opd_rank,"opd_topk":args.opd_topk,
     "opd_frontier_weight":args.opd_frontier_weight,"opd_update_stream":_as_bool(args.opd_update_stream),
     "opd_profile":_as_bool(args.opd_profile),"opd_diagnostics":_as_bool(args.opd_diagnostics),
     "opd_backend":args.opd_backend,"kv_gather_strategy":args.kv_gather_strategy,
-    "opd_train_projector":_as_bool(args.opd_train_projector) and is_train_draft}
+    "opd_train_projector":_as_bool(args.opd_train_projector) and is_train_draft and args.opd_update_interval_rounds > 0,
+    "opd_update_interval_rounds":args.opd_update_interval_rounds}
+ablation_metadata = ablation_config(args) if method=='opd_reflex' else {}
 effective_opd_backend = 'off'
 opd_eval_kwargs=dict(opd_kwargs,opd_train_projector=False)
 reset_rng_on_resume = _as_bool(args.reset_rng_on_resume)
@@ -674,7 +689,10 @@ model=Model(config,target_model=target_model).cuda()
 if args.draft_initialization_mode == 'pretrained':
     model.load_model(adapter_path)
 if method == 'opd_reflex':
-    model.enable_opd(args.opd_rank)
+    model.enable_opd(args.opd_rank, args.opd_projector_init, args.opd_projector_seed)
+    model._opd_ablation_config = ablation_metadata
+    initialize_provenance(model)
+    ablation_metadata = dict(ablation_metadata, opd_initial_a_sha256=model._opd_initial_a_sha256)
 print(adapter_path)
 model._training_method=method
 tokenizer = AutoTokenizer.from_pretrained(model_dir,padding_side="left")
@@ -713,7 +731,7 @@ for param in model.embed_tokens.parameters():
     param.requires_grad=False
 if getattr(model, 'opd_projector', None) is not None:
     model.opd_projector.requires_grad_(
-        method == 'opd_reflex' and _as_bool(args.opd_train_projector) and is_train_draft
+        method == 'opd_reflex' and _as_bool(args.opd_train_projector) and is_train_draft and args.opd_update_interval_rounds > 0
     )
     
 
@@ -950,8 +968,13 @@ for param_group in optimizer_draft.param_groups:
         param_group['lr']=args.opd_projector_lr
 effective_draft_lrs = [float(group['lr']) for group in optimizer_draft.param_groups]
 
+if method == 'opd_reflex':
+    ablation_metadata['opd_initial_a_sha256'] = model._opd_initial_a_sha256
+    print('SPARK ablation: ' + json.dumps(ablation_metadata, sort_keys=True))
+
 run_config_log = {
     **opd_kwargs,
+    **ablation_metadata,
     "phase": "run_config",
     "run_name": version_name,
     "method": method,
@@ -1199,7 +1222,7 @@ if rollout_resume_state is None and resume_checkpoint:
         tokens=batch_data['total_rollout_tokens'],generation=batch_data['generate_time_cost'],
         accepted_draft=batch_data['total_accepted_draft_tokens'],proposed=batch_data['total_proposed_draft_tokens'])
 rollout_metrics=RolloutMetricsWriter(rollout_timing_path,method,state=rollout_resume_state,
-    flush_interval=args.rollout_log_flush_interval)
+    flush_interval=args.rollout_log_flush_interval, metadata=ablation_metadata)
 
 def finish_rollout_iteration():
     rollout_metrics.finish(iter_outputs,grpo_step=step,used_items=used_items,
@@ -1361,7 +1384,7 @@ for epoch in epoch_bar:
                 batch_data['draft_sparse_count'] += int(draft_sparse_count)
                 draft_accumulated_step += 1
                 if is_train_draft and draft_accumulated_step % draft_accumulation_steps == 0:
-                    if method=='opd_reflex' and _as_bool(args.opd_train_projector):
+                    if method=='opd_reflex' and opd_kwargs['opd_train_projector']:
                         model.apply_opd_projector_gradient()
                     _sync_gradients(model.draft_model)
                     if _as_bool(args.draft_train_profile):
@@ -1946,6 +1969,7 @@ for epoch in epoch_bar:
                     "draft_lr_multiplier": float(draft_lr_multiplier),
                     "fastgrpo_ablation": bool(fastgrpo_ablation),
                     "method": method,
+                    **ablation_metadata,
                     "opd_updates": int(batch_data['opd_updates']),
 
                     "draft_train_time_cost":round(batch_data['draft_train_time_cost']/60,3) if is_train_draft else 0,
@@ -2108,9 +2132,10 @@ training_end_metrics = _aggregate_job_metrics(
 training_end_snapshot = completed_step_snapshot(
     training_end_metrics, batch_data, phase_timings, model.target_model.device,
     _cumulative_wall_time())
+projector_final_log = final_provenance(model)
 if step_metrics.pending is not None:
     step_metrics.submit(step_metrics.pending['step'], training_end_snapshot,
-                        step_metrics.pending['extras'])
+                        dict(step_metrics.pending['extras'], **projector_final_log))
 step_metrics.flush()
 batch_data['_step_metrics_state'] = step_metrics.state_dict()
 if is_main_process:
@@ -2147,6 +2172,9 @@ final_average_accept_length = final_metrics['average_accept_length']
 final_medusa_acceptance_rate = final_metrics['draft_acceptance_rate']
 final_accepted_tokens_per_medusa_step = final_metrics['accepted_tokens_per_medusa_step']
 summary = {
+    **ablation_metadata,
+    **projector_final_log,
+    **round_metrics(final_metrics),
     "run_name": version_name,
     "final_step": int(step),
     "used_items": int(final_metrics['used_items']),
@@ -2222,6 +2250,8 @@ summary = {
         final_metrics['total_rollout_tokens'] / final_metrics['generate_time_cost']
         if final_metrics['generate_time_cost'] > 0 else 0.0
     ),
+    "end_to_end_tokens_per_s": final_metrics['total_rollout_tokens'] / total_wall_time if total_wall_time > 0 else 0.,
+    "cumulative_end_to_end_tokens_per_s": final_metrics['total_rollout_tokens'] / total_wall_time if total_wall_time > 0 else 0.,
     "cumulative_aal": float(final_average_accept_length),
     "cumulative_acceptance_rate": float(final_medusa_acceptance_rate),
     "timing_csv": str(timing_file),

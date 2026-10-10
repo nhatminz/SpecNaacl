@@ -102,6 +102,7 @@ def test_resume_can_extend_last_flushed_label_without_duplicate(tmp_path):
 
 
 def test_final_filtered_rollouts_and_timers_are_accounted_before_last_flush(tmp_path):
+    from helper.opd_ablation import final_provenance
     # Execute the production finalization, without loading model weights or
     # importing the GPU-only training entrypoint. The second rollout is reward
     # filtered, so it contributed draft work/counters but no target update.
@@ -126,7 +127,7 @@ def test_final_filtered_rollouts_and_timers_are_accounted_before_last_flush(tmp_
                  args=SimpleNamespace(opd_diagnostics='0', opd_profile='0',max_target_optimizer_steps=0),
                  _as_bool=lambda value: value == '1', batch_data=data, phase_timings=timers,
                  step_metrics=writer, completed_step_snapshot=completed_step_snapshot,
-                 _cumulative_wall_time=lambda: 18.0)
+                 _cumulative_wall_time=lambda: 18.0, final_provenance=final_provenance)
     exec(compile(ast.Module(body=[aggregate, *tree.body[begin:end + 1]], type_ignores=[]),
                  'grpo_speculative.py', 'exec'), scope)
     rows, csv_rows = read_rows(tmp_path)

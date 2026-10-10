@@ -170,13 +170,14 @@ class FastGRPOModel(Model):
         prepare_target_decoder_api(target_model)
         super().__init__(config, target_model, path=path)
 
-    def enable_opd(self, rank=8):
+    def enable_opd(self, rank=8, projector_init='head_aligned', projector_seed=42):
         from helper.opd_reflex import initialize_projector
         if hasattr(self.draft_model, 'opd_projector'):
             raise ValueError('OPD already initialized')
         device = self.lm_head.weight.device
         self.draft_model.register_parameter('opd_projector', nn.Parameter(
-            initialize_projector(self.draft_model.hidden_size, rank, head=self.lm_head.weight).to(device)))
+            initialize_projector(self.draft_model.hidden_size, rank, seed=projector_seed,
+                                 head=self.lm_head.weight, init=projector_init).to(device)))
         self.draft_model.register_buffer('opd_projector_grad_sum', torch.zeros_like(self.opd_projector), persistent=False)
         self.draft_model.register_buffer('opd_projector_grad_weight', torch.zeros(1,device=device), persistent=False)
         self.register_buffer('full_vocabulary_ids', torch.arange(self.draft_model.vocab_size,device=device), persistent=False)
@@ -197,6 +198,9 @@ class FastGRPOModel(Model):
 
     @torch.no_grad()
     def apply_opd_projector_gradient(self):
+        if not self.opd_projector.requires_grad:
+            self.opd_projector.grad = None
+            return
         self.opd_projector.grad = (self.opd_projector_grad_sum / self.opd_projector_grad_weight.clamp_min(1.)).clone()
         self.opd_projector_grad_sum.zero_()
         self.opd_projector_grad_weight.zero_()

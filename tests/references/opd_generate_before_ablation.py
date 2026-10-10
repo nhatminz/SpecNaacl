@@ -12,7 +12,6 @@ from helper.fastgrpo_generate import get_adaptive_hyperparameters
 from helper.opd_reflex import OPD_COUNTER_NAMES
 from helper.opd_scheduling import schedule,compact_suffix_inplace
 from helper.opd_sampling import sample_target_with_metadata
-from helper.opd_ablation import feedback_due, UPDATE_INTERVALS
 from helper.opd_static_cache import OPDStaticCache,persistent_cache,swap_remove_plan
 import os
 from helper.opd_attention import AttentionWorkspace
@@ -77,16 +76,13 @@ def _cache_seq_length(cache):
     return int(key.shape[-2])
 
 @torch.inference_mode()
-def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=False, repeated_generate_nums=None, temperature=0.8, top_p=0.9, top_k=None, verification_capacity=160, max_draft_token_length=5, max_draft_k=8, max_verification_num=160, min_draft_token_length=3, draft_token_length_c=0.75, statistical_time=False, return_all_draft_input=False, max_length=2048, method='opd_reflex', opd_rank=8, opd_topk=16, opd_fast_lr=0.01, opd_visited_weight=1.0, opd_frontier_weight=1.0, opd_update_stream=True, opd_profile=False, opd_diagnostics=False, opd_backend='auto', opd_train_projector=False, kv_gather_strategy='stacked', opd_update_interval_rounds=1):
+def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=False, repeated_generate_nums=None, temperature=0.8, top_p=0.9, top_k=None, verification_capacity=160, max_draft_token_length=5, max_draft_k=8, max_verification_num=160, min_draft_token_length=3, draft_token_length_c=0.75, statistical_time=False, return_all_draft_input=False, max_length=2048, method='opd_reflex', opd_rank=8, opd_topk=16, opd_fast_lr=0.01, opd_visited_weight=1.0, opd_frontier_weight=1.0, opd_update_stream=True, opd_profile=False, opd_diagnostics=False, opd_backend='auto', opd_train_projector=False, kv_gather_strategy='stacked'):
     (method, _) = resolve_method(method)
     if method != 'opd_reflex':
         raise ValueError('use the upstream dispatcher for fastgrpo')
     if kv_gather_strategy not in {'stacked', 'per_layer'}:
         raise ValueError('invalid KV gather strategy')
-    if opd_update_interval_rounds not in UPDATE_INTERVALS:
-        raise ValueError('invalid OPD update interval')
     enabled = method == 'opd_reflex'
-    adaptation_enabled = enabled and opd_update_interval_rounds > 0
     opd = None
     vocabulary_ids = None
 
@@ -254,7 +250,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
     attention_workspace=getattr(model,'_opd_attention_workspace',None)
     if attention_workspace is None or attention_workspace.device!=torch.device(device):
         attention_workspace=AttentionWorkspace(device);model._opd_attention_workspace=attention_workspace
-    update_stream = torch.cuda.Stream(device) if adaptation_enabled and opd_update_stream and (torch.device(device).type == 'cuda') else None
+    update_stream = torch.cuda.Stream(device) if enabled and opd_update_stream and (torch.device(device).type == 'cuda') else None
     source_ready = update_done = None
     if update_stream is not None:
         source_ready = torch.cuda.Event()
@@ -265,8 +261,6 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
         torch.cuda.current_stream(device).wait_event(update_done)
         opd.end(ticket)
     verification_batches = active_response_rounds = verified_tree_nodes = 0
-    feedback_rounds = 0
-    round_feedback_due = False
     prefill_time_start = time.time()
     target_time_start = time.time()
     global total_target_time, total_draft_time, total_check_time
@@ -363,12 +357,12 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
     if enabled:
         cache = getattr(model, '_opd_runtime_cache', None)
         if cache is None:cache={};model._opd_runtime_cache=cache
-        key=(enabled,opd_rank,opd_topk,opd_fast_lr,opd_visited_weight,opd_frontier_weight,opd_profile,opd_diagnostics,opd_backend,opd_train_projector,opd_update_interval_rounds)
+        key=(enabled,opd_rank,opd_topk,opd_fast_lr,opd_visited_weight,opd_frontier_weight,opd_profile,opd_diagnostics,opd_backend,opd_train_projector)
         opd=cache.get(key)
         if opd is None:
             cache.clear()
             opd=OPDReflex(opd_rank,opd_topk,opd_fast_lr,opd_visited_weight,opd_frontier_weight,
-                         opd_profile,opd_diagnostics,adaptation_enabled,opd_backend,opd_train_projector and adaptation_enabled)
+                         opd_profile,opd_diagnostics,enabled,opd_backend,opd_train_projector)
             cache[key]=opd
     opd.start(model, bsz, vocabulary_ids, draft_hidden_states.shape[-1], max_contexts=1 + max_draft_k * (max_draft_token_length - 1), max_nodes=max(verification_capacity+bsz,2*bsz), max_path=max_draft_token_length + 1, max_proposal_contexts=max_draft_k)
     opd.async_updates=update_stream is not None
@@ -406,7 +400,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
         feedback_path=trace_verified_path(feedback_tree,tokens,eos_token_id,kernels=opd._kernels,workspace=opd.path_workspace)
         path=feedback_path if physical_to_canonical is None else VerifiedPath(
             *[x.index_select(0,physical_to_canonical) for x in (feedback_path.tokens,feedback_path.packed_indices,feedback_path.feedback_contexts,feedback_path.lengths)])
-        if round_feedback_due:
+        if enabled:
             return opd.prepare_compact_teacher(feedback_tree,feedback_path,probs if do_sample else tokens,sorted_metadata,greedy=not do_sample)
         return None
     for token_num in range(1, max_length):
@@ -414,7 +408,6 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
         kv_length = past_kv_len + draft_total_token + 1
         q_length = draft_total_token + 1
         verification_batches += 1
-        round_feedback_due = feedback_due(verification_batches, opd_update_interval_rounds)
         active_response_rounds += bsz
         verified_tree_nodes += bsz * q_length
         target_trees = draft_trees
@@ -460,8 +453,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
             total_target_time += time.time() - target_time_start
         if path is None:
             path = trace_verified_path(tensor_tree, target_next_token_tree, eos_token_id, kernels=opd._kernels, workspace=opd.path_workspace)
-        if round_feedback_due:
-            feedback_rounds += 1
+        if enabled:
             teacher = None # compact metadata owns every teacher coordinate needed
             if update_stream is not None:
                 source_ready.record(torch.cuda.current_stream(device))
@@ -672,8 +664,6 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
     opd.clear()
     result = {'generated_token_ids': filtered_generated_token_ids, 'max_sequence_length': max_sequence_length, 'total_acc_length': avg_acc_length[0], 'total_acc': max_sequence_length / token_num, 'total_decoded_token_num': avg_acc_length[1], 'total_accepted_draft_tokens': total_accepted_draft_tokens, 'total_proposed_draft_tokens': total_proposed_draft_tokens, 'total_accepted_medusa_tokens': total_accepted_draft_tokens, 'total_proposed_medusa_tokens': total_proposed_draft_tokens, 'draft_acceptance_rate': draft_acceptance_rate, 'medusa_acceptance_rate': draft_acceptance_rate, 'total_time_cost': time.perf_counter() - start_time, 'target_time_cost': total_target_time, 'draft_time_cost': total_draft_time, 'check_time_cost': total_check_time, 'prefill_time_cost': total_prefill_time, 'post_time_cost': time.time() - post_time_start, 'all_draft_input_states': all_draft_input_states, 'all_draft_input_ids': all_draft_input_ids, 'response_accepted_length_sum': response_accepted_length_sum, 'response_verification_rounds': response_verification_rounds, 'response_generated_tokens': [len(item) for item in filtered_generated_token_ids], 'batch_verification_rounds': verification_batches, 'verification_batches': verification_batches, 'active_response_rounds': active_response_rounds, 'verified_tree_nodes': verified_tree_nodes}
     result.update(opd_statistics)
-    result.update(opd_feedback_rounds=feedback_rounds,
-                  opd_skipped_rounds=verification_batches-feedback_rounds)
     if not enabled:result.update({name:0. for name in OPD_COUNTER_NAMES})
     result['opd_host_syncs']=opd.host_sync_count
     result['opd_host_syncs_per_round']=opd.host_sync_count/max(verification_batches,1)

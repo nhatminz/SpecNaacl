@@ -13,6 +13,10 @@ source "$MODEL_ENV"
 # An explicit environment/config override always takes precedence.
 export ROLLOUT_LOG_FLUSH_INTERVAL="${ROLLOUT_LOG_FLUSH_INTERVAL:-1}"
 export OPD_PROJECTOR_LR="${OPD_PROJECTOR_LR:-}"
+export OPD_PROJECTOR_INIT="${OPD_PROJECTOR_INIT:-head_aligned}"
+export OPD_PROJECTOR_SEED="${OPD_PROJECTOR_SEED:-42}"
+export OPD_UPDATE_INTERVAL_ROUNDS="${OPD_UPDATE_INTERVAL_ROUNDS:-1}"
+export OPD_ABLATION_NAME="${OPD_ABLATION_NAME:-}"
 export OPD_PROPOSAL_PROFILE="${OPD_PROPOSAL_PROFILE:-}"
 export OPD_PROPOSAL_MODE="${OPD_PROPOSAL_MODE:-auto}"
 export OPD_DENSE_IMPLEMENTATION="${OPD_DENSE_IMPLEMENTATION:-auto}"
@@ -66,6 +70,27 @@ DRAFT_INITIALIZATION_MODE="${DRAFT_INITIALIZATION_MODE:-pretrained}"
 export OPD_PROPOSAL_PROFILE_DIR="${OPD_PROPOSAL_PROFILE_DIR:-$OUTPUT_ROOT/benchmarks/opd_proposals}"
 
 TRAIN_MODEL_ROOT="${TRAIN_MODEL_ROOT:-$OUTPUT_ROOT/train/$MODEL_KEY}"
+# Each ablation owns its active/latest pointers. Parallel configurations never
+# discover or overwrite another configuration's auto-resume run.
+if [[ "$METHOD" == opd_reflex ]]; then
+  case "$OPD_PROJECTOR_INIT" in head_aligned|random_orthogonal) ;; *) echo 'ERROR: invalid OPD_PROJECTOR_INIT' >&2;exit 2;; esac
+  case "$OPD_UPDATE_INTERVAL_ROUNDS" in 0|1|5|10|15) ;; *) echo 'ERROR: invalid OPD_UPDATE_INTERVAL_ROUNDS' >&2;exit 2;; esac
+  case "$OPD_TRAIN_PROJECTOR" in 0|1) ;; *) echo 'ERROR: invalid OPD_TRAIN_PROJECTOR' >&2;exit 2;; esac
+  if [[ -z "$OPD_ABLATION_NAME" ]];then
+    if [[ "$OPD_PROJECTOR_INIT" == random_orthogonal ]];then
+      if [[ "$OPD_TRAIN_PROJECTOR" == 1 ]];then OPD_ABLATION_NAME=learned_random;else OPD_ABLATION_NAME=frozen_random;fi
+    elif [[ "$OPD_TRAIN_PROJECTOR" == 0 ]];then OPD_ABLATION_NAME=frozen_head_aligned
+    else OPD_ABLATION_NAME=main;fi
+    if [[ "$OPD_UPDATE_INTERVAL_ROUNDS" != 1 ]];then OPD_ABLATION_NAME+="_interval$OPD_UPDATE_INTERVAL_ROUNDS";fi
+  fi
+  [[ "$OPD_ABLATION_NAME" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo 'ERROR: invalid ablation name' >&2;exit 2; }
+  if [[ "$OPD_UPDATE_INTERVAL_ROUNDS" == 0 ]];then OPD_PROJECTOR_MODE=inactive
+  elif [[ "$OPD_TRAIN_PROJECTOR" == 1 ]];then OPD_PROJECTOR_MODE=learned
+  else OPD_PROJECTOR_MODE=frozen;fi
+  if [[ "$OPD_ABLATION_NAME" != main || "$OPD_PROJECTOR_INIT" != head_aligned || "$OPD_TRAIN_PROJECTOR" != 1 || "$OPD_UPDATE_INTERVAL_ROUNDS" != 1 || "$OPD_PROJECTOR_SEED" != 42 ]];then
+    TRAIN_MODEL_ROOT="$TRAIN_MODEL_ROOT/ablations/${OPD_ABLATION_NAME}__init-${OPD_PROJECTOR_INIT}__seed${OPD_PROJECTOR_SEED}__train${OPD_TRAIN_PROJECTOR}__interval${OPD_UPDATE_INTERVAL_ROUNDS}"
+  fi
+fi
 REQUESTED_RUN_DIR="${RUN_DIR:-}"
 timestamp="$(date -u +%Y%m%dT%H%M%S)"
 short_uuid="$($PYTHON_BIN -c 'import uuid; print(uuid.uuid4().hex[:8])')"
@@ -165,6 +190,8 @@ if [[ "$METHOD" == opd_reflex ]]; then
   --opd_update_stream "$OPD_UPDATE_STREAM" --opd_backend "$OPD_BACKEND"
   --opd_profile "$OPD_PROFILE" --opd_diagnostics "$OPD_DIAGNOSTICS"
   --opd_train_projector "$OPD_TRAIN_PROJECTOR"
+  --opd_projector_init "$OPD_PROJECTOR_INIT" --opd_projector_seed "$OPD_PROJECTOR_SEED"
+  --opd_update_interval_rounds "$OPD_UPDATE_INTERVAL_ROUNDS" --opd_ablation_name "$OPD_ABLATION_NAME"
   --kv_gather_strategy "${KV_GATHER_STRATEGY:-stacked}"
   )
 fi
@@ -226,6 +253,9 @@ ln -sfn "$RUN_DIR" "$TRAIN_MODEL_ROOT/active_run"
   --item "opd_visited_weight=$OPD_VISITED_WEIGHT" --item "opd_frontier_weight=$OPD_FRONTIER_WEIGHT" \
   --item "opd_profile=$OPD_PROFILE" --item "opd_diagnostics=$OPD_DIAGNOSTICS" \
   --item "opd_backend=$OPD_BACKEND" \
+  --item "opd_ablation_name=$OPD_ABLATION_NAME" --item "opd_projector_init=$OPD_PROJECTOR_INIT" \
+  --item "opd_projector_seed=$OPD_PROJECTOR_SEED" --item "opd_update_interval_rounds=$OPD_UPDATE_INTERVAL_ROUNDS" \
+  --item "opd_projector_mode=${OPD_PROJECTOR_MODE:-off}" \
   --item "opd_train_projector=$OPD_TRAIN_PROJECTOR" --item "opd_proposal_mode=$OPD_PROPOSAL_MODE" \
   --item "opd_dense_implementation=$OPD_DENSE_IMPLEMENTATION" \
   --item "opd_proposal_profile=$OPD_PROPOSAL_PROFILE" \

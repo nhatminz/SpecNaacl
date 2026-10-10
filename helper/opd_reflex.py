@@ -15,6 +15,7 @@ import warnings
 from pathlib import Path
 import torch
 from helper.opd_attention import AttentionWorkspace
+from helper.opd_ablation import HOST_COUNTER_NAMES
 from helper.shared_rollout import allocate_tree_buffers
 from helper.opd_profiles import execution_key,fingerprint,discover_profile,validate_profile
 
@@ -27,16 +28,23 @@ OPD_COUNTER_NAMES=(
     'opd_active_rows_max',
     'opd_proposal_mode_fused_rounds','opd_proposal_mode_gemm_rounds',
 )
-GENERATION_COUNTER_NAMES=('verification_batches','active_response_rounds','verified_tree_nodes')
+GENERATION_COUNTER_NAMES=('verification_batches','active_response_rounds','verified_tree_nodes')+HOST_COUNTER_NAMES
 
 
-def initialize_projector(hidden,rank,seed=42,head=None):
+def initialize_projector(hidden,rank,seed=42,head=None,init='head_aligned'):
     if not 1<=rank<=64:raise ValueError('OPD rank must be in [1,64]')
+    if init not in ('head_aligned','random_orthogonal'):raise ValueError('invalid OPD projector initialization')
+    if init=='random_orthogonal':
+        if rank>hidden:raise ValueError('orthogonal projector rank exceeds hidden size')
+        # A local CPU generator makes learned/frozen starts identical and never
+        # advances global CPU/CUDA sampling RNG. QR runs once at initialization.
+        rows=torch.randn(hidden,rank,generator=torch.Generator(device='cpu').manual_seed(seed),dtype=torch.float32)
+        return torch.linalg.qr(rows,mode='reduced').Q.contiguous()
     if head is not None:
         ids=torch.linspace(0,head.shape[0]-1,rank,device=head.device).long()
         rows=head.detach().index_select(0,ids).float().t().cpu()
         return torch.linalg.qr(rows,mode='reduced').Q.contiguous()
-    # Oracle fixtures only. Production uses a deterministic head-aligned basis.
+    # Legacy oracle fallback when neither a head nor explicit random QR is supplied.
     return torch.randn(hidden,rank,generator=torch.Generator().manual_seed(seed),dtype=torch.float32)/math.sqrt(hidden)
 
 
