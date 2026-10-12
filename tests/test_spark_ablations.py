@@ -125,7 +125,8 @@ def test_optimizer_boundary_learned_changes_frozen_and_inactive_never_decay(trai
 
 
 @pytest.mark.parametrize('field,value', [('opd_train_projector','0'), ('opd_update_interval_rounds',5),
-    ('opd_projector_seed',43), ('opd_projector_init','head_aligned'), ('opd_rank',4), ('opd_fast_lr',.02)])
+    ('opd_projector_seed',43), ('opd_projector_init','head_aligned'), ('opd_rank',4), ('opd_fast_lr',.02),
+    ('opd_b_sharing_scope','per_prompt_group'),('opd_b_reset_mode','carry'),('opd_frontier_weight',0.)])
 def test_resume_rejects_different_ablation(field, value):
     with pytest.raises(ValueError, match='ablation configuration mismatch'):
         validate_resume_config(config(), config(**{field:value}))
@@ -135,8 +136,8 @@ def test_resume_rejects_different_ablation(field, value):
     validate_resume_config(None, config(opd_projector_init='head_aligned'))
 
 
-@pytest.mark.parametrize('name,interval,train', [('learned_random',1,'1'),('frozen_random',1,'0'),
-    ('interval5',5,'1'),('interval10',10,'1'),('interval15',15,'1'),('interval0',0,'1')])
+@pytest.mark.parametrize('name,interval,train', [('interval5',5,'1'),('interval10',10,'1'),('per_prompt_group',1,'1'),
+    ('carry_b',1,'1'),('accepted_only',1,'1')])
 def test_ablation_launcher_dry_run_and_independent_roots(name, interval, train, tmp_path):
     env = {k:v for k,v in os.environ.items() if k not in ('RUN_DIR','RUN_NAME','OPD_ABLATION_NAME')}
     env.update(DRY_RUN='true', OUTPUT_ROOT=str(tmp_path), PYTHON_BIN=sys.executable,
@@ -152,7 +153,10 @@ def test_ablation_launcher_dry_run_and_independent_roots(name, interval, train, 
     assert opts['--max_target_optimizer_steps'] == '1000'
     assert opts['--train_option'] == 'simplelr_abel_level3to5'
     assert opts['--adapter_path'] == '/fixed/pretrained-draft'
-    assert f'__train{train}__interval{interval}/' in opts['--log_file']
+    assert f'__train{train}__interval{interval}' in opts['--log_file']
+    assert opts['--opd_b_sharing_scope']==('per_prompt_group' if name=='per_prompt_group' else 'rollout_batch')
+    assert opts['--opd_b_reset_mode']==('carry' if name=='carry_b' else 'rollout')
+    assert opts['--opd_frontier_weight']==('0.0' if name=='accepted_only' else '1.0')
     assert '/ablations/' in opts['--log_file']
     assert opts['--resume_checkpoint'] == ''
 
@@ -277,3 +281,26 @@ def test_training_pipeline_logs_projector_and_resume_guard(tmp_path, train, inte
     assert resumed['opd_initial_a_sha256']==summary['opd_initial_a_sha256']
     assert (resumed['opd_a_change_norm']>0)==changed
     assert resumed['opd_feedback_rounds']>=summary['opd_feedback_rounds']
+
+
+def test_five_configuration_auto_resume_paths_are_isolated(tmp_path):
+    from test_launchers_rewrite import flags
+    env={k:v for k,v in os.environ.items() if k not in ('RUN_DIR','RUN_NAME','OPD_ABLATION_NAME')}
+    env.update(DRY_RUN='true',PYTHON_BIN=sys.executable,TRAIN_MODEL_ROOT=str(tmp_path),RESUME='auto')
+    def launch(name):
+        out=subprocess.check_output(['bash',str(ROOT/'scripts/run_spark_ablation.sh'),name],env=env,text=True)
+        tokens=shlex.split(next(line.split(':',1)[1] for line in out.splitlines() if line.startswith('Command')))
+        return flags(tokens)
+    options={name:launch(name) for name in ('interval5','interval10','per_prompt_group','carry_b','accepted_only')}
+    folders={name:Path(o['--log_file']).parents[2] for name,o in options.items()}
+    assert len(set(folders.values()))==5
+    for name,o in options.items():
+        run=Path(o['--log_file']).parents[1]
+        checkpoint=run/'checkpoints/resume/latest.pt';checkpoint.parent.mkdir(parents=True);checkpoint.touch()
+        (run/'summary.json').write_text(json.dumps({'stopped_by_max_grpo_steps':True}))
+        (folders[name]/'active_run').symlink_to(run)
+    for name in options:
+        resumed=launch(name)
+        assert resumed['--log_file']==options[name]['--log_file']
+        assert resumed['--resume_checkpoint']==str(Path(options[name]['--log_file']).parents[1]/'checkpoints/resume/latest.pt')
+        assert resumed['--is_train_draft']=='True'

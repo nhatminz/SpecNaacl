@@ -2,8 +2,9 @@
 
 A is a persistent learned projector owned/saved by the FastGRPO draft. Its
 analytical gradients accumulate here, but only the existing draft optimizer
-boundary updates A. B_fast is ONE shared full-vocabulary adapter, reset every
-rollout. No optimizer/autograd or extra model forward runs here. CUDA production
+boundary updates A. B_fast defaults to one shared full-vocabulary adapter,
+reset every rollout. Ablations optionally group B by original prompt or carry
+the shared B across rollouts. No optimizer/autograd or extra model forward runs here. CUDA production
 requires Triton; Torch is CPU oracle.
 """
 from contextlib import nullcontext
@@ -77,12 +78,38 @@ def union_reference(p,q,target_ids,draft_ids):
     return ids,valid,pu,qu,pt,qt,kl
 
 
+PERSISTENT_B_FIELDS=('B_fast','bitmap','active_ids','active_count','ever_updated','host_active_count')
+
+
+def capture_persistent_b(model):
+    """Checkpoint-only D2H copy of rank-local carry state."""
+    state=getattr(model,'_opd_persistent_b',None)
+    if state is None:return None
+    event=state.get('pending_event')
+    if event is not None:torch.cuda.current_stream(state['B_fast'].device).wait_event(event)
+    return {key:(value.detach().cpu().clone() if isinstance(value,torch.Tensor) else value)
+            for key in PERSISTENT_B_FIELDS for value in (state[key],)}
+
+
+def restore_persistent_b(model,state):
+    # Materialize on the rollout device only when the next runtime attaches.
+    if state is not None and (not isinstance(state,dict) or set(state)!=set(PERSISTENT_B_FIELDS)):
+        raise ValueError('invalid rank-local carry B checkpoint fields')
+    model._opd_persistent_b=state
+
+
 class OPDReflex:
     def __init__(self,rank=8,topk=16,fast_lr=.01,visited_weight=1.,frontier_weight=1.,
-                 profile=False,diagnostics=False,enabled=True,backend='auto',train_projector=False):
+                 profile=False,diagnostics=False,enabled=True,backend='auto',train_projector=False,
+                 b_sharing_scope='rollout_batch', b_reset_mode='rollout'):
         if not 1<=rank<=64 or topk<1 or fast_lr<0 or min(visited_weight,frontier_weight)<0:
             raise ValueError('invalid OPD rank/topk/lr/state weights')
         if backend not in ('auto','torch','triton'):raise ValueError('invalid OPD backend')
+        if b_sharing_scope not in ('rollout_batch','per_prompt_group') or b_reset_mode not in ('rollout','carry'):
+            raise ValueError('invalid B sharing/reset mode')
+        self.grouped = b_sharing_scope == 'per_prompt_group'
+        self.carry_b = b_reset_mode == 'carry'
+        if self.grouped and self.carry_b:raise ValueError('grouped and carry B are separate ablations')
         self.rank,self.requested_topk,self.fast_lr=int(rank),int(topk),float(fast_lr)
         self.visited_weight,self.frontier_weight=float(visited_weight),float(frontier_weight)
         self.profile,self.diagnostics,self.enabled=bool(profile),bool(diagnostics),bool(enabled)
@@ -158,7 +185,8 @@ class OPDReflex:
                 buckets.append((abs(math.log((b*c)/(int(pb)*int(pc)))),value))
         return min(buckets)[1] if buckets else 'fused'
 
-    def start(self,model,batch,mapping,hidden_size,*,max_contexts,max_nodes,max_path,max_proposal_contexts):
+    def start(self,model,batch,mapping,hidden_size,*,max_contexts,max_nodes,max_path,max_proposal_contexts,
+              prompt_groups=None,responses_per_prompt=1):
         device=mapping.device;v=mapping.numel();k=min(v,self.requested_topk)
         if not hasattr(self,'attention_workspace') or self.attention_workspace.device!=device:
             self.attention_workspace=AttentionWorkspace(device)
@@ -170,8 +198,14 @@ class OPDReflex:
         self._opd_kernels=importlib.import_module('helper.opd_reflex_kernels') if self.backend=='triton' else None
         self.mapping,self.vocab,self.topk,self.max_batch=mapping,v,k,batch
         self.cache_contexts=max_contexts
+        self.num_groups = (prompt_groups if prompt_groups is not None else batch) if self.grouped else 1
+        self.responses_per_prompt = responses_per_prompt
+        if self.grouped:
+            if self.num_groups*responses_per_prompt != batch:raise ValueError('prompt/response group layout mismatch')
+            self.row_groups=torch.arange(self.num_groups,device=device,dtype=torch.long).repeat_interleave(responses_per_prompt)
+            self.group_first=torch.arange(self.num_groups,device=device,dtype=torch.long)*responses_per_prompt
         self.head=model.lm_head
-        layout=(batch,v,hidden_size,max_contexts,max_nodes,max_path,max_proposal_contexts,k,str(device),self.enabled,self.head.weight.dtype)
+        layout=(batch,v,hidden_size,max_contexts,max_nodes,max_path,max_proposal_contexts,k,str(device),self.enabled,self.head.weight.dtype,self.num_groups)
         execution_shape=(str(device),v,self.rank,self.head.weight.dtype,k)
         if self._profile_execution_shape is not None and execution_shape!=self._profile_execution_shape:
             self._validated_tuning=False;self._profile_shape_checked=False
@@ -204,11 +238,12 @@ class OPDReflex:
         if layout!=self._layout:
             self._layout=layout
             def alloc(shape,dtype=torch.float32):return torch.empty(shape,device=device,dtype=dtype)
-            self.bitmap=alloc((v+31)//32,torch.int32)
-            self.active_count=alloc(1,torch.int32)
+            self.bitmap=alloc((self.num_groups,(v+31)//32) if self.grouped else ((v+31)//32,),torch.int32)
+            self.active_count=alloc(self.num_groups,torch.int32)
+            self.dispatch_count=alloc(1,torch.int32) if self.grouped else self.active_count
             self.dispatch_snapshot=alloc(1,torch.int32)
-            self.B_fast=alloc((v,self.rank)) if self.enabled else None
-            self.active_ids=alloc(v,torch.int32) if self.enabled else None
+            self.B_fast=alloc((self.num_groups,v,self.rank) if self.grouped else (v,self.rank)) if self.enabled else None
+            self.active_ids=alloc((self.num_groups,v) if self.grouped else (v,),torch.int32) if self.enabled else None
             self.proposal_u=alloc((batch*max_proposal_contexts,self.rank)) if self.enabled else None
             self.proposal_q=alloc(batch*max_proposal_contexts*k)
             self.proposal_ids=alloc(batch*max_proposal_contexts*k,torch.long)
@@ -217,7 +252,7 @@ class OPDReflex:
             # scalars; dense GEMM writes all. Not a feedback probability cache.
             self.sparse_capacity=min(v,256)
             self.sparse_scores=alloc(batch*max_proposal_contexts*self.sparse_capacity if self.enabled else 1)
-            self.active_slots=alloc(v,torch.int32)
+            self.active_slots=alloc((self.num_groups,v) if self.grouped else (v,),torch.int32)
             # Dense GEMM workspace is lazy, never allocated by sparse/fused runs.
             self.score_workspace=alloc(1)
             self.proposal_capacity=batch*max_proposal_contexts
@@ -239,19 +274,59 @@ class OPDReflex:
                 self.teacher_q=alloc(n*k);self.union_ids=alloc(n*2*k,torch.long);self.union_g=alloc(n*2*k)
                 self.teacher_draft_p=alloc(n*k)
                 self.state_stats=alloc(n*10);self.round_weight=alloc(1)
+                if self.grouped:self.group_weight=alloc(self.num_groups)
                 self.teacher_tiles=[alloc(n*t*(k if i>=2 else 1),torch.long if i==3 else torch.float32) for i in range(4)] if self.backend=='triton' else []
                 self.counters=alloc(len(OPD_COUNTER_NAMES),torch.float64)
                 if self.train_projector:
                     self.projector_head=alloc((n,hidden_size))
                     self.projector_v=alloc((n,self.rank))
                     self.projector_delta=alloc((hidden_size,self.rank))
-        self.bitmap.zero_();self.active_count.zero_();self.dispatch_snapshot.zero_()
-        self.host_active_count=0
+        if self.carry_b and self.enabled:
+            self._attach_persistent_b(model, device)
+        else:
+            self.bitmap.zero_();self.active_count.zero_()
+            if self.grouped:self.dispatch_count.zero_()
+            if self.enabled:self.B_fast.zero_()
+            self.host_active_count=0
+            self._ever_updated=False
+        self.dispatch_snapshot.zero_()
         self.host_sync_count=0
         self.feedback_row_map=None
         self.host_fused_rounds=self.host_gemm_rounds=0
-        if self.enabled:self.B_fast.zero_();self.counters.zero_()
-        self._ever_updated=False;self._events.clear()
+        if self.enabled:self.counters.zero_()
+        self._events.clear()
+
+    def _attach_persistent_b(self,model,device):
+        state=getattr(model,'_opd_persistent_b',None)
+        if state is None:
+            self.B_fast.zero_();self.bitmap.zero_();self.active_count.zero_();self.active_ids.zero_()
+            state=dict(B_fast=self.B_fast,bitmap=self.bitmap,active_ids=self.active_ids,
+                       active_count=self.active_count,ever_updated=False,host_active_count=0)
+            model._opd_persistent_b=state
+        for key,shape,dtype in (
+            ('B_fast',(self.vocab,self.rank),torch.float32),
+            ('bitmap',((self.vocab+31)//32,),torch.int32),
+            ('active_ids',(self.vocab,),torch.int32),('active_count',(1,),torch.int32)):
+            value=state[key]
+            if tuple(value.shape)!=shape or value.dtype!=dtype:raise ValueError('carry B checkpoint layout mismatch: '+key)
+            if value.device!=device:state[key]=value.to(device)
+            setattr(self,key,state[key])
+        event=state.get('pending_event')
+        if event is not None:torch.cuda.current_stream(device).wait_event(event)
+        self.dispatch_count=self.active_count
+        self._ever_updated=bool(state['ever_updated'])
+        self.host_active_count=int(state['host_active_count'])
+
+    def compact_group_rows(self,keep,original_responses):
+        """Keep physical owners aligned with cache swap-remove, without D2H."""
+        if not self.grouped:return
+        self.row_groups=self.row_groups.index_select(0,keep)
+        first=[0]*self.num_groups
+        seen=set()
+        for physical,original in enumerate(original_responses):
+            group=original//self.responses_per_prompt
+            if group not in seen:first[group]=physical;seen.add(group)
+        self.group_first=torch.tensor(first,device=self.mapping.device,dtype=torch.long)
 
     def prepare_proposal_workspace(self,b,c,selected=None):
         selected=selected or ('sparse' if self.selected_proposal_backend(b,c)=='sparse' else self.selected_dense_implementation(b,c))
@@ -313,7 +388,7 @@ class OPDReflex:
             if not any(key.endswith(suffix) for key in self.tuning.get('thresholds',{})):
                 raise ValueError('proposal profile does not cover actual full vocabulary/rank/dtype; retune for this target')
             self._profile_shape_checked=True
-        if root and self.backend=='torch':self.dispatch_snapshot.copy_(self.active_count)
+        if root and self.backend=='torch':self.dispatch_snapshot.copy_(self.dispatch_count)
         if k>keep or v!=self.vocab:raise ValueError('proposal k/vocabulary mismatch')
         ticket=self.begin('opd_feature_ms')
         u=None
@@ -331,8 +406,11 @@ class OPDReflex:
         else:
             z=logits.float().clone()
             if self.enabled and self._ever_updated:
-                active=self.active_ids[:int(self.active_count)]
-                z[...,active.long()]+=u.matmul(self.B_fast[active.long()].t())
+                if self.grouped:
+                    z+=torch.bmm(u,self.B_fast[self.row_groups[:b]].transpose(1,2))
+                else:
+                    active=self.active_ids[:int(self.active_count)]
+                    z[...,active.long()]+=u.matmul(self.B_fast[active.long()].t())
             maximum=z.amax(-1);total=(z-maximum[...,None]).exp().sum(-1)
             norm[...,0].copy_(maximum);norm[...,1].copy_(total)
             # Deterministic low-ID tie convention for the OPD CPU oracle.
@@ -368,7 +446,8 @@ class OPDReflex:
         if self.feedback_row_map is not None:batch=self.feedback_row_map[batch]
         head_inputs=self.head_cache[batch,context];u=self.u_cache[batch,context]
         raw=torch.nn.functional.linear(head_inputs,self.head.weight,self.head.bias).float()
-        corrected=raw+u.matmul(self.B_fast.t())
+        groups=self.row_groups[batch[:,0]] if self.grouped else None
+        corrected=raw+(torch.bmm(u,self.B_fast[groups].transpose(1,2)) if self.grouped else u.matmul(self.B_fast.t()))
         norm=self.norm_cache[batch,context]
         draft=((corrected-norm[...,0,None]).exp()/norm[...,1,None])
         di=self.ids_cache[batch,context].reshape(-1,k)
@@ -398,27 +477,49 @@ class OPDReflex:
         selected=w>0;g=torch.where(valid,(qq-p)*w[:,None],0.)
         total=w.sum()
         if self.train_projector and self._ever_updated:
-            rows=self.B_fast[ids.clamp_min(0)]
+            rows=self.B_fast[groups.repeat_interleave(q)[:,None],ids.clamp_min(0)] if self.grouped else self.B_fast[ids.clamp_min(0)]
             v=((g[...,None]*rows)*valid[...,None]).sum(1)
             self.model.opd_projector_grad_sum.add_(head_inputs.reshape(-1,head_inputs.shape[-1]).float().t().matmul(v))
         if self.train_projector:self.model.opd_projector_grad_weight.add_(total)
-        if self.fast_lr>0 and total>0:
-            delta=torch.zeros_like(self.B_fast)
-            delta.index_add_(0,ids.clamp_min(0).flatten(),(g[...,None]*u.reshape(-1,self.rank)[:,None,:]).reshape(-1,self.rank))
-            self.B_fast.add_(delta,alpha=-self.fast_lr/float(total))
-            old=self.active_ids[:int(self.active_count)].long()
-            touched=torch.nonzero(self.B_fast.abs().sum(-1)>0,as_tuple=False).flatten()
-            active=torch.unique(torch.cat((old,touched)))
-            self.active_count.fill_(active.numel());self.active_ids[:active.numel()].copy_(active)
+        actual_updates=((total>0)&(self.fast_lr>0)).float()
+        active_rows=self.active_count.sum().float()
+        if self.grouped:
+            flat_groups=groups.repeat_interleave(q)
+            group_weight=torch.zeros(self.num_groups,device=w.device).index_add_(0,flat_groups,w)
+            self.group_weight.copy_(group_weight)
+            actual_updates=((group_weight>0)&(self.fast_lr>0)).sum().float()
+            if self.fast_lr>0:
+                delta=torch.zeros_like(self.B_fast).view(-1,self.rank)
+                coordinates=flat_groups[:,None]*self.vocab+ids.clamp_min(0)
+                weighted=g[...,None]*u.reshape(-1,self.rank)[:,None,:]
+                delta.index_add_(0,coordinates.flatten(),weighted.reshape(-1,self.rank))
+                self.B_fast.add_(delta.view_as(self.B_fast)/group_weight.clamp_min(1e-30)[:,None,None],alpha=-self.fast_lr)
+                for group in range(self.num_groups):  # CPU oracle only
+                    old=self.active_ids[group,:int(self.active_count[group])].long()
+                    touched=torch.nonzero(self.B_fast[group].abs().sum(-1)>0,as_tuple=False).flatten()
+                    active=torch.unique(torch.cat((old,touched)))
+                    self.active_count[group]=active.numel();self.active_ids[group,:active.numel()].copy_(active)
+            active_rows=self.active_count.sum().float()
+            self.dispatch_count.copy_(self.active_count.max().view(1))
+        else:
+            if self.fast_lr>0 and total>0:
+                delta=torch.zeros_like(self.B_fast)
+                delta.index_add_(0,ids.clamp_min(0).flatten(),(g[...,None]*u.reshape(-1,self.rank)[:,None,:]).reshape(-1,self.rank))
+                self.B_fast.add_(delta,alpha=-self.fast_lr/float(total))
+                old=self.active_ids[:int(self.active_count)].long()
+                touched=torch.nonzero(self.B_fast.abs().sum(-1)>0,as_tuple=False).flatten()
+                active=torch.unique(torch.cat((old,touched)))
+                self.active_count.fill_(active.numel());self.active_ids[:active.numel()].copy_(active)
+            active_rows=self.active_count[0].float()
         count=selected.sum();categories=kind.flatten()
         finite=torch.isfinite(kl)
         stats=torch.stack((total,count,(selected&(categories==1)).sum(),(selected&(categories==2)).sum(),
             torch.where(selected&finite,w*kl,0.).sum(),(valid&selected[:,None]).sum(),
             torch.where(selected,mass.flatten(),0.).sum(),torch.where(selected,p[:,:k].sum(-1),0.).sum(),
-            ((weights>0)&~good).sum(),((total>0)&(self.fast_lr>0)).float(),self.active_count[0].float(),total.new_tensor(1.),
+            ((weights>0)&~good).sum(),actual_updates,active_rows,total.new_tensor(1.),
             (selected&~finite).sum()))
         self.counters[:13].add_(stats.to(torch.float64))
-        self.counters[15]=torch.maximum(self.counters[15],self.active_count[0].double())
+        self.counters[15]=torch.maximum(self.counters[15],active_rows.double())
 
     def remove_finished(self,indices):
         # B is shared, not row-owned. Current contexts are overwritten next tree.
@@ -428,7 +529,7 @@ class OPDReflex:
         if self.enabled:
             payload=self.counters
             if self.diagnostics:
-                extra=torch.stack((self.B_fast.norm().double(),self.B_fast.abs().amax().double(),self.active_count[0].double()))
+                extra=torch.stack((self.B_fast.norm().double(),self.B_fast.abs().amax().double(),(self.active_count.sum() if self.grouped else self.active_count[0]).double()))
                 payload=torch.cat((payload,extra))
             packet=payload.cpu().tolist()  # exactly ONE counter/diagnostic packet
         else:packet=[0.]*len(OPD_COUNTER_NAMES)
@@ -455,5 +556,13 @@ class OPDReflex:
         # Runtime pools are deliberately retained by model cache. No per-round
         # teacher or batch hidden references survive the feedback call.
         self._events.clear()
-        if self.enabled:self.B_fast.zero_();self.bitmap.zero_();self.active_count.zero_()
-        self._ever_updated=False
+        if self.carry_b and self.enabled:
+            state=self.model._opd_persistent_b
+            state['ever_updated']=self._ever_updated
+            # The dispatch snapshot can lag the last asynchronous update by one
+            # round. Retain a safe upper bound, without another GPU scalar read.
+            state['host_active_count']=min(self.vocab,self.host_active_count+2*self.max_feedback_rows*self.topk)
+        else:
+            if self.enabled:self.B_fast.zero_();self.bitmap.zero_();self.active_count.zero_()
+            self._ever_updated=False
+        self.feedback_row_map=None

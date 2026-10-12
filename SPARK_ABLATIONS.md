@@ -1,122 +1,211 @@
-# SPARK ablations: Qwen2.5-3B-Instruct / SimpleLR
+# SPARK: năm ablation trên Qwen2.5-3B-Instruct / SimpleLR
 
-Các cấu hình dùng `grpo_speculative.py` và launcher train hiện tại. Không có
-pipeline training riêng. Defaults của training chính vẫn là head-aligned A,
-train A và interval 1. FastGRPO, GRPO objective, sampler, verifier và Triton
-kernels không đổi.
+Cả năm dùng training pipeline `grpo_speculative.py` hiện tại. Reference là
+`learned_random` của study trước: A `random_orthogonal`, local seed 42, train A,
+rank 8, top-k 16, fast LR 0.01, visited/frontier weights 1/1, interval 1,
+shared B toàn rollout batch và reset B mỗi rollout. Reference được mô tả để
+so sánh; launcher study này chỉ nhận đúng năm tên bên dưới.
 
-| Configuration | A init | Train A | Update interval |
-|---|---|---:|---:|
-| learned_random | random_orthogonal | 1 | 1 |
-| frozen_random | random_orthogonal | 0 | 1 |
-| interval5 | random_orthogonal | 1 | 5 |
-| interval10 | random_orthogonal | 1 | 10 |
-| interval15 | random_orthogonal | 1 | 15 |
-| interval0 | random_orthogonal | 1 (inactive) | 0 |
+| Tên | Interval | B sharing | B lifecycle | Visited/frontier |
+|---|---:|---|---|---|
+| interval5 | 5 | rollout_batch | reset mỗi rollout | 1/1 |
+| interval10 | 10 | rollout_batch | reset mỗi rollout | 1/1 |
+| per_prompt_group | 1 | original prompt group | reset mỗi rollout | 1/1 |
+| carry_b | 1 | rollout_batch | carry qua rollout/optimizer boundary | 1/1 |
+| accepted_only | 1 | rollout_batch | reset mỗi rollout | 1/0 |
 
-`learned_random` là reference chung của cả hai studies. A có rank 8, QR trên
-FP32 Gaussian với CPU generator cục bộ, seed 42. Learned/frozen có A ban đầu
-bitwise identical và không tiêu thụ global CPU/CUDA sampling RNG. Frozen A
-không có analytical gradient hay optimizer membership/weight decay.
+Mỗi nhánh chỉ thay biến trong bảng. Không đổi GRPO, teacher sampling/verifier,
+backbone training, precision hoặc decoding budgets. Defaults của training chính
+vẫn head-aligned A, interval 1, shared/reset B; FastGRPO không đổi. Các flags
+interval/frozen cũ vẫn được hỗ trợ bởi CLI chính để resume, nhưng không tạo thêm
+configuration trong launcher năm ablation này.
 
-Verification round ở đây là **một batch verification / một lần target verify**,
-vì B được dùng chung cho các responses. Không dùng response-weighted round
-counter hay GRPO step để điều khiển lịch. Round 1 reset tại mỗi rollout:
-interval 5 cập nhật 1,6,11,...; interval 10 cập nhật 1,11,21,...; interval 15
-cập nhật 1,16,31,... . Các round khác giữ B hiện tại, không extract OPD teacher,
-không feedback/KL, không tích lũy gradient A và không catch up. Interval 0
-dùng proposal engine với adapter disabled (B hiệu dụng bằng zero, không cấp
-phát B/correction workspace), không feedback hay learning A; draft và target
-vẫn train. A learned chỉ step ở draft optimizer boundary; B reset mỗi rollout.
+Interval dùng verification **batch** rounds, reset về 1 mỗi rollout: 5 cập nhật
+1,6,11,...; 10 cập nhật 1,11,21,... . Round bỏ qua vẫn verify/propose và dùng B
+hiện tại; không teacher extraction, feedback, A gradients hay catch-up update.
+Accepted-only tái sử dụng selection hiện tại với frontier weight bằng zero:
+chỉ visited states có proposal context hợp lệ được chọn.
 
-Online trajectories của learned/frozen có thể phân kỳ sau optimizer updates.
-Test fixed verification trace kiểm tra selection và teacher parity; không
-tuyên bố verified states của các run online luôn giống nhau.
+Per-prompt B có shape `[original_prompt_count,V,rank]`; G responses dùng chung
+B của prompt gốc. Owner IDs bám theo swap-remove/residual response identity,
+không tính lại bằng physical row / G. Canonical teacher rows được ánh xạ về
+physical cache row rồi mới tra owner. CUDA sparse/fused/gemm proposal, selected
+head, B update và gradient A đều đọc đúng group. Mỗi B update chia cho tổng
+valid selected-state weight **của group đó**; group không có valid feedback giữ
+nguyên B. A vẫn dùng tổng gradient/weight toàn bộ selected states như trước và
+chỉ optimizer-step ở draft boundary. Không thêm target forward/chạy generation
+riêng từng group.
 
-Chạy từ thư mục `SpecNaacl`, trong môi trường training đã cài:
+Carry-B giữ B/bitmap/active IDs/count/ever-updated/dispatch bound trên model,
+riêng từng process/rank. Chỉ những buffers này đi qua rollout boundary; teacher,
+hidden states và proposal contexts cũ không được đưa vào persistent state.
+Runtime scratch vẫn tái sử dụng như trước và ghi lại trước khi đọc. Existing
+update-done event bảo vệ reuse/checkpoint; không thêm host wait mỗi round.
+Checkpoint lưu fast state trong `rank_states[rank]`, cùng A/pending A gradients,
+optimizers, iterator, RNG và telemetry. Load kiểm tra configuration và world-size
+trước khi load weights. Không suy diễn carry state từ checkpoint legacy thiếu
+state. Fresh model/run bắt đầu B=0, kể cả dùng cùng draft initialization file.
+
+## Chuẩn bị chung, chạy một lần
+
+Chạy từ `SpecNaacl` trong venv training trên máy B200. Snapshot một draft cho
+cả năm để tránh pretraining tiếp tục đổi `latest_checkpoint`. Giữ study root
+và file `study.env` này khi resume; không tạo root/snapshot mới khi resume.
 
 ```bash
-# Tạo một experiment root mới, giữ nguyên đường dẫn này khi resume.
-export TRAIN_MODEL_ROOT="$PWD/outputs/ablations/spark_qwen25_3b_simplelr_$(date -u +%Y%m%dT%H%M%S)_$RANDOM"
+export TRAIN_MODEL_ROOT="$PWD/outputs/ablations/spark_3b_simplelr_five_$(date -u +%Y%m%dT%H%M%S)_$RANDOM"
 mkdir -p "$TRAIN_MODEL_ROOT"
-
-# Snapshot đúng một draft cho cả sáu runs. latest_checkpoint có thể được
-# pretraining cập nhật tiếp nên không để sáu processes tự đọc symlink riêng.
-cp "$PWD/outputs/pretrain/qwen25_3b/latest_checkpoint/draft.pth" \
-   "$TRAIN_MODEL_ROOT/initial_draft.pth"
+cp outputs/pretrain/qwen25_3b/latest_checkpoint/draft.pth "$TRAIN_MODEL_ROOT/initial_draft.pth"
 export DRAFT_CHECKPOINT="$TRAIN_MODEL_ROOT/initial_draft.pth"
 export MODEL=/workspace/storage-shared/models/Qwen2.5-3B-Instruct
 export DATASET_PATH=/workspace/storage-shared/nlp/minhpn19/data/simplelr_abel_level3to5/train.parquet
 export TARGET_ADAPTER="" RESUME=""
-export TRAIN_SUBSET_SEED=42 OPD_PROJECTOR_SEED=42
 export MAX_TARGET_OPTIMIZER_STEPS=1000 NUM_EPOCHS=100
 export TARGET_LR=1e-6 DRAFT_LR=1e-4 OPD_PROJECTOR_LR=1e-4
-export OPD_FAST_LR=0.01 OPD_TOPK=16
-export OPD_VISITED_WEIGHT=1.0 OPD_FRONTIER_WEIGHT=1.0
-export OPD_UPDATE_STREAM=1
+export BATCH_SIZE=8 ACCUMULATION_STEPS=4 DRAFT_ACCUMULATION_STEPS=1
+export RESPONSES_PER_PROMPT=8 GRPO_ITERATION_NUM=1 BETA=0.04 EPSILON=0.1
+export TEMPERATURE=1.0 TOP_P=0.95 GEN_MAX_LENGTH=2048 MAX_PROMPT_LENGTH=2048
+export VERIFICATION_CAPACITY=512 MAX_VERIFICATION_NUM=160
+export MAX_DRAFT_K=8 MAX_DRAFT_TOKEN_LENGTH=5 MIN_DRAFT_TOKEN_LENGTH=3 DRAFT_TOKEN_LENGTH_C=0.75
+export MODEL_DTYPE=bf16 ATTENTION_IMPLEMENTATION=sdpa IS_TRAIN_DRAFT=True
+export OPD_UPDATE_STREAM=1 OPD_BACKEND=triton OPD_SAMPLER_MODE=finite
+export OPD_PROPOSAL_MODE=auto OPD_DENSE_IMPLEMENTATION=auto OPD_AUTO_TUNE_IF_MISSING=0
+export OPD_PROPOSAL_PROFILE=""
+export OPD_PROFILE=0 OPD_DIAGNOSTICS=0 STATISTICAL_TIME=False
+unset RUN_DIR RUN_NAME
+# Lưu các exports của study, không lưu các biến môi trường khác.
+declare -p TRAIN_MODEL_ROOT DRAFT_CHECKPOINT MODEL DATASET_PATH TARGET_ADAPTER \
+  MAX_TARGET_OPTIMIZER_STEPS NUM_EPOCHS TARGET_LR DRAFT_LR OPD_PROJECTOR_LR \
+  BATCH_SIZE ACCUMULATION_STEPS DRAFT_ACCUMULATION_STEPS RESPONSES_PER_PROMPT \
+  GRPO_ITERATION_NUM BETA EPSILON TEMPERATURE TOP_P GEN_MAX_LENGTH MAX_PROMPT_LENGTH \
+  VERIFICATION_CAPACITY MAX_VERIFICATION_NUM MAX_DRAFT_K MAX_DRAFT_TOKEN_LENGTH \
+  MIN_DRAFT_TOKEN_LENGTH DRAFT_TOKEN_LENGTH_C MODEL_DTYPE ATTENTION_IMPLEMENTATION \
+  IS_TRAIN_DRAFT OPD_UPDATE_STREAM OPD_BACKEND OPD_SAMPLER_MODE OPD_PROPOSAL_MODE \
+  OPD_DENSE_IMPLEMENTATION OPD_AUTO_TUNE_IF_MISSING OPD_PROPOSAL_PROFILE OPD_PROFILE OPD_DIAGNOSTICS \
+  STATISTICAL_TIME > "$TRAIN_MODEL_ROOT/study.env"
+echo "$TRAIN_MODEL_ROOT/study.env"
+```
 
-CUDA_VISIBLE_DEVICES=0 bash scripts/run_spark_ablation.sh learned_random &
-CUDA_VISIBLE_DEVICES=1 bash scripts/run_spark_ablation.sh frozen_random &
-CUDA_VISIBLE_DEVICES=2 bash scripts/run_spark_ablation.sh interval5 &
-CUDA_VISIBLE_DEVICES=3 bash scripts/run_spark_ablation.sh interval10 &
-CUDA_VISIBLE_DEVICES=4 bash scripts/run_spark_ablation.sh interval15 &
-CUDA_VISIBLE_DEVICES=5 bash scripts/run_spark_ablation.sh interval0 &
+Seed 42, A initialization/seed, rank/top-k/fast LR, interval/sharing/reset/weights
+được launcher thiết lập tường minh. Budget 1000 là actual target optimizer steps;
+100 epochs là ceiling, không bảo đảm budget nếu dataset hết trước. Kiểm tra
+actual counter trong summary. Nếu reference dùng budget khác, đổi chung budget
+trước khi bắt đầu cả năm. Không retune riêng từng nhánh. Kernel hash mới làm
+profile cũ không còn tương thích; cùng cơ chế fallback chính xác hiện tại áp
+dụng nếu không có profile phù hợp, không tự tune trong các lệnh này.
+
+## Dry-run cả năm
+
+In command mà không load model hoặc chạy training:
+
+```bash
+for name in interval5 interval10 per_prompt_group carry_b accepted_only; do
+  DRY_RUN=true RESUME= bash scripts/run_spark_ablation.sh "$name"
+done
+```
+
+## Đúng năm lệnh training
+
+Dấu `&` chạy đồng thời, mỗi process một GPU; `wait` chờ cả năm. Muốn chạy tuần
+tự, bỏ `&` và đổi tất cả `CUDA_VISIBLE_DEVICES` về GPU muốn dùng.
+
+```bash
+RESUME= CUDA_VISIBLE_DEVICES=0 bash scripts/run_spark_ablation.sh interval5 &
+RESUME= CUDA_VISIBLE_DEVICES=1 bash scripts/run_spark_ablation.sh interval10 &
+RESUME= CUDA_VISIBLE_DEVICES=2 bash scripts/run_spark_ablation.sh per_prompt_group &
+RESUME= CUDA_VISIBLE_DEVICES=3 bash scripts/run_spark_ablation.sh carry_b &
+RESUME= CUDA_VISIBLE_DEVICES=4 bash scripts/run_spark_ablation.sh accepted_only &
 wait
 ```
 
-Budget 1000 là ví dụ và được override qua `MAX_TARGET_OPTIMIZER_STEPS` (đếm
-actual target optimizer steps). Ablation launcher dùng tối đa 100 epochs để
-không hết một epoch trước budget. Kiểm tra `summary.json.target_optimizer_steps`
-để xác nhận từng run hoàn thành budget; không thay bằng inherited GRPO labels.
-Batch/accumulation, draft training, model, data, seed, optimizer LRs, selection
-weights và decoding settings dùng chung qua wrapper Qwen2.5-3B. Nếu muốn dùng
-checkpoint pretrain cụ thể đã bất biến, export thẳng file `checkpoints/stepN.pth`
-thay cho bước copy. `DRY_RUN=true` in đầy đủ command mà không chạy training.
+Mỗi configuration có root riêng dưới `$TRAIN_MODEL_ROOT/ablations/`, chứa
+`active_run`/`latest_run` riêng. Mỗi run có timestamp/UUID. Không dùng chung
+`RUN_DIR` hoặc chạy hai process của cùng configuration/root cùng lúc.
 
-Mỗi cấu hình có root riêng:
-`$TRAIN_MODEL_ROOT/ablations/<name>__init-...__seed42__train...__interval.../`.
-Mỗi run có timestamp/UUID và các con trỏ `active_run`/`latest_run` chỉ nằm trong
-root cấu hình đó. Để resume, giữ common exports và snapshot draft cũ, rồi:
+## Resume từng configuration
+
+Trong terminal mới, source **đường dẫn study.env đã in ở bước chuẩn bị**, kích
+hoạt cùng venv, unset RUN_DIR/RUN_NAME. Không chạy lại bước copy draft.
 
 ```bash
-RESUME=auto CUDA_VISIBLE_DEVICES=2 bash scripts/run_spark_ablation.sh interval5
+source /DUONG_DAN_STUDY_CU/study.env
+unset RUN_DIR RUN_NAME
+RESUME=auto CUDA_VISIBLE_DEVICES=0 bash scripts/run_spark_ablation.sh interval5
+RESUME=auto CUDA_VISIBLE_DEVICES=1 bash scripts/run_spark_ablation.sh interval10
+RESUME=auto CUDA_VISIBLE_DEVICES=2 bash scripts/run_spark_ablation.sh per_prompt_group
+RESUME=auto CUDA_VISIBLE_DEVICES=3 bash scripts/run_spark_ablation.sh carry_b
+RESUME=auto CUDA_VISIBLE_DEVICES=4 bash scripts/run_spark_ablation.sh accepted_only
 ```
 
-Checkpoint lưu/verify init, seed, train/frozen, interval, name, rank, topK,
-LRs, visited/frontier weights và selection policy **trước khi load weights hay
-optimizer state**. Lưu cả A ban đầu, A hiện tại, pending A gradients rank-local,
-optimizers, iterator, RNG và telemetry state; B là rollout-local, không resume.
-Checkpoint legacy không có ablation metadata chỉ được chấp nhận cho cấu hình
-head-aligned learned interval 1, seed 42.
+Chọn dòng tương ứng run bị ngắt. Thêm `&` nếu muốn resume nhiều GPU đồng thời.
+`RESUME=auto` tìm checkpoint trong đúng configuration root, giữ logs/resume
+rewind hiện tại và báo lỗi nếu không có checkpoint, không âm thầm bắt đầu mới.
+Có thể dùng `RUN_DIR=/path/to/original/run RESUME=auto` để chọn một run cũ cụ thể.
+Các flags OPD/A/sharing/reset/selection/LRs không khớp checkpoint sẽ bị từ chối.
+
+## Logs và completion
 
 Toàn bộ `metrics.jsonl`, `timing.csv`, `rollout_timing.csv`, `summary.json`,
-statistics, console.log và tqdm tiếp tục qua writers hiện tại. Cột cũ không
-bị xóa; CSV append/resume giữ schema migration và iterator rewind hiện có.
-Metadata init/mode/seed/interval/name và initial A SHA256 có trên step/iteration
-logs. Counter feedback/skipped dùng Python integers; actual B updates dùng
-counter GPU đã có trong packet cuối rollout. Actual update frequency là
-`actual B updates / verification_batches`; feedback frequency đếm cả feedback
-attempts không có valid selected states. Tất cả zero denominators trả zero.
+statistics, console logs/tqdm và CSV migration/append được giữ. Config identifier,
+init/seed/mode, interval, B scope/lifecycle và feedback selection có trong
+metadata, iteration/step logs và summary. Counter lấy từ packet aggregated có
+sẵn; không có sync hoặc copy GPU→CPU mới mỗi round để logging.
 
-Selected/visited/frontier, AAL, acceptance và generation throughput giữ định
-nghĩa hiện tại. Bổ sung generation/E2E throughput theo step/iteration/cumulative.
-Initial/final A SHA256 và change norm tính trên CPU ở startup/termination;
-final fields ghi ở final completed-step log và summary, các row trước đó để
-trống final fields. Không copy/hash A từng round hay từng optimizer step chỉ
-để logging. Snapshot A ban đầu trong checkpoint giúp norm vẫn tính từ đầu
-experiment khi resume, không reset ở đầu session mới.
+`opd_updates` đếm số **ma trận B được update với valid feedback**. Trong grouped
+mode một verification batch có thể update nhiều B; actual update frequency =
+B updates / verification batch rounds có thể >1. Feedback frequency = feedback
+rounds / verification batch rounds; không nhầm hai tỷ lệ này. Các counter
+selected/visited/frontier, AAL, acceptance, generation/E2E throughput giữ định
+nghĩa hiện tại. Hash/change norm A chỉ đọc ở startup/checkpoint/termination.
 
-Kiểm thử nằm ở `tests/test_spark_ablations.py`, bao gồm CPU oracle, CUDA/Triton,
-async streams, fixed trace, short/EOS rollouts, interval=1 đối chiếu snapshot
-engine trước sửa, optimizer exclusion, actual training CLI, logs và resume.
-Tokens/RNG parity kiểm tra bitwise; gradient GPU dùng tolerance FP32 do atomic
-feedback accumulation có thứ tự không xác định như implementation hiện tại.
-Không thêm CUDA synchronization/events/kernels/transfers trong verification
-round để logging. Chưa chạy sáu training studies đầy đủ trên B200 tại workspace
-này; validation CUDA sử dụng RTX 3090.
+```bash
+# Chọn một cấu hình, ví dụ carry_b:
+config_root=$(find "$TRAIN_MODEL_ROOT/ablations" -mindepth 1 -maxdepth 1 -type d -name 'carry_b__*' -print -quit)
+run_dir=$(readlink -f "$config_root/active_run")
+tail -f "$run_dir/logs/console.log"
+# Các lệnh độc lập để xem CSV/JSONL hoặc checkpoint đã lưu:
+tail -n 3 "$run_dir/logs/rollout_timing.csv"
+tail -n 3 "$run_dir/logs/timing.csv"
+tail -n 2 "$run_dir/logs/metrics.jsonl"
+ls -lh "$run_dir/checkpoints/resume/latest.pt"
+```
 
-Kết quả validation: toàn bộ active suite **446 passed, 0 failed** trên CUDA
-(Torch 2.5.1/cu124, Transformers 5.12.1); focused CPU Torch 2.13: **74 passed,
-27 skipped** do cần CUDA; focused Transformers 4.51.3: **20 passed**. Compileall,
-37 shell syntax checks và dry-run đủ sáu launcher configurations đều pass.
-Artifacts và smoke summaries: [validation/spark_ablations_20261010/results.json](validation/spark_ablations_20261010/results.json).
+Kiểm tra cả năm bằng CPU, không load tensors/model:
+
+```bash
+python3 - <<'PY'
+import json, os
+from pathlib import Path
+root=Path(os.environ['TRAIN_MODEL_ROOT'])/'ablations'
+budget=int(os.environ['MAX_TARGET_OPTIMIZER_STEPS'])
+for name in ('interval5','interval10','per_prompt_group','carry_b','accepted_only'):
+    folders=list(root.glob(name+'__*'))
+    if len(folders)!=1:
+        print(name, 'MISSING/AMBIGUOUS ROOT');continue
+    path=folders[0]/'active_run'/'summary.json'
+    if not path.exists():
+        print(name, 'RUNNING/INTERRUPTED (no final summary)');continue
+    s=json.loads(path.read_text())
+    print(name, 'BUDGET REACHED' if s['target_optimizer_steps']>=budget else 'BELOW BUDGET',
+          {k:s.get(k) for k in ('target_optimizer_steps','average_accept_length',
+           'generation_tokens_per_s','cumulative_end_to_end_tokens_per_s',
+           'total_verification_rounds','opd_feedback_rounds','opd_skipped_rounds',
+           'opd_actual_b_updates','opd_actual_update_frequency','opd_b_sharing_scope',
+           'opd_b_reset_mode','opd_feedback_selection','opd_a_change_norm')})
+PY
+```
+
+Summary của session cũ có thể vẫn còn trong lúc resume đang chạy; đối chiếu
+console/checkpoint timestamp và actual steps. Summary dưới budget không được
+coi là đã hoàn thành experimental budget.
+
+## Validation
+
+Tests mới ở `tests/test_spark_five.py`; tests scheduler/default parity/checkpoint/
+logging/launcher hiện có được mở rộng, không chạy full training study. CPU oracle
+và CUDA/Triton smoke dùng tiny Qwen, gồm grouped sparse/fused/gemm, invalid group,
+canonical↔physical mapping, EOS compaction, async streams, lifecycle carry,
+rank-local checkpoint, bitwise restore và train/resume/logs của cả năm variants.
+Kết quả cụ thể của lần sửa này xem `validation/spark_five_20261012/results.json`.
+Không suy diễn throughput B200 từ GPU khác; chưa chạy full Qwen3B/SimpleLR hoặc
+full study trên B200 tại workspace này.

@@ -201,6 +201,9 @@ def save_training_checkpoint(
     ):
         value = getattr(model, attribute, None)
         local_state[key] = None if value is None else value.detach().cpu().clone()
+    if (getattr(model,'_opd_ablation_config',None) or {}).get('opd_b_reset_mode')=='carry':
+        from helper.opd_reflex import capture_persistent_b
+        local_state['opd_fast_state']=capture_persistent_b(model)
     if dist.is_initialized():
         rank_states = [None] * current_world_size
         dist.all_gather_object(rank_states, local_state)
@@ -283,6 +286,13 @@ def load_training_checkpoint(path, *, model, optimizer_target, optimizer_draft):
         )
     from helper.opd_ablation import validate_resume_config
     validate_resume_config(checkpoint.get('opd_ablation_config'), getattr(model,'_opd_ablation_config',None))
+    if (getattr(model,'_opd_ablation_config',None) or {}).get('opd_b_reset_mode')=='carry':
+        if 'opd_fast_state' not in local_state:
+            raise ValueError('carry B checkpoint is missing rank-local fast state')
+        if local_state['opd_fast_state'] is None and local_state.get('batch_data',{}).get('trace_rollout_count',0)>0:
+            raise ValueError('carry B checkpoint lost state after generation')
+        from helper.opd_reflex import restore_persistent_b
+        restore_persistent_b(model,local_state['opd_fast_state'])
     current_initial=getattr(model.target_model,'_shared_initialization',{}).get('loaded_tensor_sha256')
     if checkpoint.get('initial_target_tensor_sha256') != current_initial:
         raise ValueError('resume initial target tensor hash mismatch')
@@ -329,6 +339,8 @@ parser.add_argument('--opd_train_projector',default='1',choices=['0','1'])
 parser.add_argument('--opd_projector_init',default=os.environ.get('OPD_PROJECTOR_INIT','head_aligned'),choices=['head_aligned','random_orthogonal'])
 parser.add_argument('--opd_projector_seed',type=int,default=int(os.environ.get('OPD_PROJECTOR_SEED','42')))
 parser.add_argument('--opd_update_interval_rounds',type=int,default=int(os.environ.get('OPD_UPDATE_INTERVAL_ROUNDS','1')),choices=[0,1,5,10,15])
+parser.add_argument('--opd_b_sharing_scope',default=os.environ.get('OPD_B_SHARING_SCOPE','rollout_batch'),choices=['rollout_batch','per_prompt_group'])
+parser.add_argument('--opd_b_reset_mode',default=os.environ.get('OPD_B_RESET_MODE','rollout'),choices=['rollout','carry'])
 parser.add_argument('--opd_ablation_name',default=os.environ.get('OPD_ABLATION_NAME',''))
 parser.add_argument('--draft_train_profile', default='0', choices=['0', '1'])
 parser.add_argument('--kv_gather_strategy', default='stacked', choices=['stacked', 'per_layer'])
@@ -575,7 +587,8 @@ opd_kwargs={"method":method,"opd_rank":args.opd_rank,"opd_topk":args.opd_topk,
     "opd_profile":_as_bool(args.opd_profile),"opd_diagnostics":_as_bool(args.opd_diagnostics),
     "opd_backend":args.opd_backend,"kv_gather_strategy":args.kv_gather_strategy,
     "opd_train_projector":_as_bool(args.opd_train_projector) and is_train_draft and args.opd_update_interval_rounds > 0,
-    "opd_update_interval_rounds":args.opd_update_interval_rounds}
+    "opd_update_interval_rounds":args.opd_update_interval_rounds,
+    "opd_b_sharing_scope":args.opd_b_sharing_scope,"opd_b_reset_mode":args.opd_b_reset_mode}
 ablation_metadata = ablation_config(args) if method=='opd_reflex' else {}
 effective_opd_backend = 'off'
 opd_eval_kwargs=dict(opd_kwargs,opd_train_projector=False)

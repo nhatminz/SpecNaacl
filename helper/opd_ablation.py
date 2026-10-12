@@ -9,7 +9,8 @@ import torch
 UPDATE_INTERVALS = (0, 1, 5, 10, 15)
 HOST_COUNTER_NAMES = ('opd_feedback_rounds', 'opd_skipped_rounds')
 CONFIG_FIELDS = ('opd_ablation_name', 'opd_projector_init', 'opd_projector_mode',
-                 'opd_projector_seed', 'opd_train_projector', 'opd_update_interval_rounds')
+                 'opd_projector_seed', 'opd_train_projector', 'opd_update_interval_rounds',
+                 'opd_b_sharing_scope', 'opd_b_reset_mode', 'opd_feedback_selection')
 PROVENANCE_FIELDS = ('opd_initial_a_sha256', 'opd_final_a_sha256', 'opd_a_change_norm')
 
 
@@ -22,6 +23,11 @@ def ablation_config(args):
     train = str(args.opd_train_projector).lower() in ('1', 'true')
     interval = int(args.opd_update_interval_rounds)
     init = args.opd_projector_init
+    sharing = getattr(args, 'opd_b_sharing_scope', 'rollout_batch')
+    reset = getattr(args, 'opd_b_reset_mode', 'rollout')
+    selection = 'accepted_only' if args.opd_frontier_weight == 0 else 'visited_frontier'
+    if sharing == 'per_prompt_group' and reset == 'carry':
+        raise ValueError('per_prompt_group and carry_b are independent ablations')
     name = args.opd_ablation_name
     if not name:
         name = ('learned_random' if train else 'frozen_random') if init == 'random_orthogonal' else ('main' if train else 'frozen_head_aligned')
@@ -35,7 +41,9 @@ def ablation_config(args):
                 opd_fast_lr=float(args.opd_fast_lr), opd_projector_lr=args.opd_projector_lr,
                 opd_visited_weight=float(args.opd_visited_weight),
                 opd_frontier_weight=float(args.opd_frontier_weight),
-                opd_state_selection='visited_and_expanded_one_hop_frontier')
+                opd_b_sharing_scope=sharing, opd_b_reset_mode=reset,
+                opd_feedback_selection=selection,
+                opd_state_selection=('visited_only' if selection == 'accepted_only' else 'visited_and_expanded_one_hop_frontier'))
 
 
 def validate_resume_config(saved, current):
@@ -45,9 +53,16 @@ def validate_resume_config(saved, current):
         # Legacy runs used head alignment, learned A, and feedback every round.
         if (current['opd_projector_init'] != 'head_aligned' or
                 current['opd_update_interval_rounds'] != 1 or
-                not current['opd_train_projector'] or current['opd_projector_seed'] != 42):
+                not current['opd_train_projector'] or current['opd_projector_seed'] != 42 or
+                current['opd_b_sharing_scope'] != 'rollout_batch' or current['opd_b_reset_mode'] != 'rollout'):
             raise ValueError('resume ablation configuration missing in legacy checkpoint')
         return
+    # Checkpoints from the initial A/interval study implicitly used shared,
+    # rollout-reset B. Never infer carry/grouped state for an older checkpoint.
+    saved = dict(saved)
+    saved.setdefault('opd_b_sharing_scope', 'rollout_batch')
+    saved.setdefault('opd_b_reset_mode', 'rollout')
+    saved.setdefault('opd_feedback_selection', 'accepted_only' if saved.get('opd_frontier_weight') == 0 else 'visited_frontier')
     differences = [key for key in current if saved.get(key) != current[key]]
     if differences:
         raise ValueError('resume ablation configuration mismatch: ' + ', '.join(differences))

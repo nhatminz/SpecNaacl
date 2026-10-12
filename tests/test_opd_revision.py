@@ -131,7 +131,8 @@ def test_projector_gradient_accumulates_no_round_parameter_update_then_boundary(
     optimizer.step()
     assert not torch.equal(p, old_a)
 
-def test_training_checkpoint_restores_rank_local_pending_projector_gradient(tmp_path):
+@pytest.mark.parametrize('carry',[False,True])
+def test_training_checkpoint_restores_rank_local_pending_projector_gradient(tmp_path,carry):
     """Exercise real checkpoint functions without importing the training CLI."""
 
     class Model(torch.nn.Module):
@@ -167,6 +168,7 @@ def test_training_checkpoint_restores_rank_local_pending_projector_gradient(tmp_
         rows[1]['rank'] = 1
         rows[1]['opd_projector_pending_sum'].fill_(7)
         rows[1]['opd_projector_pending_weight'].fill_(3)
+        if carry:rows[1]['opd_fast_state']['B_fast'].fill_(9)
     scope = dict(torch=torch, Path=Path, dist=SimpleNamespace(is_initialized=lambda : True, get_world_size=lambda : 2, get_rank=lambda : rank[0], all_gather_object=gather), capture_rng_state=lambda : None, restore_rng_state=lambda x: None, _atomic_torch_save=lambda state, path: torch.save(state, path), _prune_checkpoints=lambda *a: None, get_peft_model_state_dict=None, set_peft_model_state_dict=None)
     from helper.opd_optimizer import load_draft_optimizer
     scope['load_draft_optimizer'] = load_draft_optimizer
@@ -175,6 +177,11 @@ def test_training_checkpoint_restores_rank_local_pending_projector_gradient(tmp_
     nodes = [n for n in source.body if isinstance(n, ast.FunctionDef) and n.name in names]
     exec(compile(ast.Module(body=nodes, type_ignores=[]), 'checkpoint-functions', 'exec'), scope)
     model = Model()
+    if carry:
+        model._opd_ablation_config={'opd_b_reset_mode':'carry'}
+        model._opd_persistent_b=dict(B_fast=torch.ones(8,8),bitmap=torch.ones(1,dtype=torch.int32),
+            active_ids=torch.arange(8,dtype=torch.int32),active_count=torch.tensor([8],dtype=torch.int32),
+            ever_updated=True,host_active_count=8)
     target = torch.optim.SGD(model.target_model.parameters(), lr=0.01)
     draft = torch.optim.SGD(model.draft_model.parameters(), lr=0.01)
     checkpoint = scope['save_training_checkpoint'](tmp_path, model=model, optimizer_target=target, optimizer_draft=draft, epoch=0, next_batch=1, step=1, used_items=1, draft_step=0, draft_accumulated_step=1, batch_data={}, keep_last=1, cumulative_elapsed_time_s=1.0)
@@ -184,6 +191,18 @@ def test_training_checkpoint_restores_rank_local_pending_projector_gradient(tmp_
     scope['load_training_checkpoint'](checkpoint, model=model, optimizer_target=target, optimizer_draft=draft)
     assert torch.equal(model.opd_projector_grad_sum, torch.full((8, 8), 7.0))
     assert torch.equal(model.opd_projector_grad_weight, torch.tensor([3.0]))
+    if carry:
+        assert torch.equal(model._opd_persistent_b['B_fast'],torch.full((8,8),9.))
+        state=torch.load(checkpoint,weights_only=False)
+        state['rank_states'][1]['opd_fast_state']=None
+        state['rank_states'][1]['batch_data']['trace_rollout_count']=1
+        torch.save(state,checkpoint)
+        with pytest.raises(ValueError,match='lost state'):
+            scope['load_training_checkpoint'](checkpoint,model=model,optimizer_target=target,optimizer_draft=draft)
+        del state['rank_states'][1]['opd_fast_state']
+        torch.save(state,checkpoint)
+        with pytest.raises(ValueError,match='missing rank-local'):
+            scope['load_training_checkpoint'](checkpoint,model=model,optimizer_target=target,optimizer_draft=draft)
 
 def test_fastgrpo_checkpoint_resume_with_none_projector_property(tmp_path):
 

@@ -77,7 +77,7 @@ def _cache_seq_length(cache):
     return int(key.shape[-2])
 
 @torch.inference_mode()
-def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=False, repeated_generate_nums=None, temperature=0.8, top_p=0.9, top_k=None, verification_capacity=160, max_draft_token_length=5, max_draft_k=8, max_verification_num=160, min_draft_token_length=3, draft_token_length_c=0.75, statistical_time=False, return_all_draft_input=False, max_length=2048, method='opd_reflex', opd_rank=8, opd_topk=16, opd_fast_lr=0.01, opd_visited_weight=1.0, opd_frontier_weight=1.0, opd_update_stream=True, opd_profile=False, opd_diagnostics=False, opd_backend='auto', opd_train_projector=False, kv_gather_strategy='stacked', opd_update_interval_rounds=1):
+def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=False, repeated_generate_nums=None, temperature=0.8, top_p=0.9, top_k=None, verification_capacity=160, max_draft_token_length=5, max_draft_k=8, max_verification_num=160, min_draft_token_length=3, draft_token_length_c=0.75, statistical_time=False, return_all_draft_input=False, max_length=2048, method='opd_reflex', opd_rank=8, opd_topk=16, opd_fast_lr=0.01, opd_visited_weight=1.0, opd_frontier_weight=1.0, opd_update_stream=True, opd_profile=False, opd_diagnostics=False, opd_backend='auto', opd_train_projector=False, kv_gather_strategy='stacked', opd_update_interval_rounds=1, opd_b_sharing_scope='rollout_batch', opd_b_reset_mode='rollout'):
     (method, _) = resolve_method(method)
     if method != 'opd_reflex':
         raise ValueError('use the upstream dispatcher for fastgrpo')
@@ -363,14 +363,16 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
     if enabled:
         cache = getattr(model, '_opd_runtime_cache', None)
         if cache is None:cache={};model._opd_runtime_cache=cache
-        key=(enabled,opd_rank,opd_topk,opd_fast_lr,opd_visited_weight,opd_frontier_weight,opd_profile,opd_diagnostics,opd_backend,opd_train_projector,opd_update_interval_rounds)
+        key=(enabled,opd_rank,opd_topk,opd_fast_lr,opd_visited_weight,opd_frontier_weight,opd_profile,opd_diagnostics,opd_backend,opd_train_projector,opd_update_interval_rounds,opd_b_sharing_scope,opd_b_reset_mode)
         opd=cache.get(key)
         if opd is None:
             cache.clear()
             opd=OPDReflex(opd_rank,opd_topk,opd_fast_lr,opd_visited_weight,opd_frontier_weight,
-                         opd_profile,opd_diagnostics,adaptation_enabled,opd_backend,opd_train_projector and adaptation_enabled)
+                         opd_profile,opd_diagnostics,adaptation_enabled,opd_backend,opd_train_projector and adaptation_enabled,
+                         b_sharing_scope=opd_b_sharing_scope,b_reset_mode=opd_b_reset_mode)
             cache[key]=opd
-    opd.start(model, bsz, vocabulary_ids, draft_hidden_states.shape[-1], max_contexts=1 + max_draft_k * (max_draft_token_length - 1), max_nodes=max(verification_capacity+bsz,2*bsz), max_path=max_draft_token_length + 1, max_proposal_contexts=max_draft_k)
+    opd.start(model, bsz, vocabulary_ids, draft_hidden_states.shape[-1], max_contexts=1 + max_draft_k * (max_draft_token_length - 1), max_nodes=max(verification_capacity+bsz,2*bsz), max_path=max_draft_token_length + 1, max_proposal_contexts=max_draft_k,
+              prompt_groups=input_ids.shape[0],responses_per_prompt=repeated_generate_nums or 1)
     opd.async_updates=update_stream is not None
     mask_columns_capacity = input_ids.shape[-1] + max_length * (max_draft_token_length + 1) + max_verification_num
     model._opd_initial_batch=bsz;model._opd_max_path_capacity=max_draft_token_length+1
@@ -469,11 +471,13 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
                 for shared in (feedback_tree.parents, feedback_tree.feedback_contexts):
                     shared.record_stream(update_stream)
                 if canonical_to_physical is not None:canonical_to_physical.record_stream(update_stream)
+                if opd.grouped:opd.row_groups.record_stream(update_stream)
                 if sampling_metadata is not None:
                     for shared in sampling_metadata:shared.record_stream(update_stream)
                 with torch.cuda.stream(update_stream):
                     opd.feedback(feedback_tree, feedback_path, teacher, greedy=not do_sample,sampling_metadata=sampling_metadata)
                     update_done.record(update_stream)
+                    if opd.carry_b:opd.model._opd_persistent_b['pending_event']=update_done
             else:
                 opd.feedback(feedback_tree, feedback_path, teacher, greedy=not do_sample,sampling_metadata=sampling_metadata)
             # record_stream above keeps asynchronous readers safe. Drop this
@@ -539,6 +543,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
             padding_positions_tensor=padding_positions_tensor.index_select(0,keep)
             past_position_ids_tensor=past_position_ids_tensor.index_select(0,keep)
             residual_index = [residual_index[row] for row in keep_rows]
+            opd.compact_group_rows(keep,residual_index)
             chosen_index = chosen_index.index_select(0, keep)
             if static_kv:
                 target_past_key_values.swap_remove(len(keep_rows),sources,destinations)

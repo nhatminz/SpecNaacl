@@ -76,6 +76,9 @@ def generate(*a,**k):
             if isinstance(value,dict):return {key:cpu(v) for key,v in value.items()}
             if isinstance(value,list):return [cpu(v) for v in value]
             return value
+        if (restore_pending.get('opd_ablation_config') or {}).get('opd_b_reset_mode')=='carry':
+            from helper.opd_reflex import capture_persistent_b
+            assert_nested_equal(capture_persistent_b(model),restore_pending['rank_states'][0]['opd_fast_state'])
         assert_nested_equal(cpu(model.draft_model.state_dict()),restore_pending['draft_model'])
         assert_nested_equal(cpu(get_peft_model_state_dict(model.target_model)),restore_pending['target_lora'])
         for opt,key in zip(optimizers,('optimizer_target','optimizer_draft')):

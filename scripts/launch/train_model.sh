@@ -16,6 +16,10 @@ export OPD_PROJECTOR_LR="${OPD_PROJECTOR_LR:-}"
 export OPD_PROJECTOR_INIT="${OPD_PROJECTOR_INIT:-head_aligned}"
 export OPD_PROJECTOR_SEED="${OPD_PROJECTOR_SEED:-42}"
 export OPD_UPDATE_INTERVAL_ROUNDS="${OPD_UPDATE_INTERVAL_ROUNDS:-1}"
+export OPD_B_SHARING_SCOPE="${OPD_B_SHARING_SCOPE:-rollout_batch}"
+export OPD_B_RESET_MODE="${OPD_B_RESET_MODE:-rollout}"
+export OPD_FEEDBACK_SELECTION=visited_frontier
+[[ "$OPD_FRONTIER_WEIGHT" != 0 && "$OPD_FRONTIER_WEIGHT" != 0.0 ]] || OPD_FEEDBACK_SELECTION=accepted_only
 export OPD_ABLATION_NAME="${OPD_ABLATION_NAME:-}"
 export OPD_PROPOSAL_PROFILE="${OPD_PROPOSAL_PROFILE:-}"
 export OPD_PROPOSAL_MODE="${OPD_PROPOSAL_MODE:-auto}"
@@ -75,6 +79,11 @@ TRAIN_MODEL_ROOT="${TRAIN_MODEL_ROOT:-$OUTPUT_ROOT/train/$MODEL_KEY}"
 if [[ "$METHOD" == opd_reflex ]]; then
   case "$OPD_PROJECTOR_INIT" in head_aligned|random_orthogonal) ;; *) echo 'ERROR: invalid OPD_PROJECTOR_INIT' >&2;exit 2;; esac
   case "$OPD_UPDATE_INTERVAL_ROUNDS" in 0|1|5|10|15) ;; *) echo 'ERROR: invalid OPD_UPDATE_INTERVAL_ROUNDS' >&2;exit 2;; esac
+  case "$OPD_B_SHARING_SCOPE" in rollout_batch|per_prompt_group) ;; *) echo 'ERROR: invalid OPD_B_SHARING_SCOPE' >&2;exit 2;; esac
+  case "$OPD_B_RESET_MODE" in rollout|carry) ;; *) echo 'ERROR: invalid OPD_B_RESET_MODE' >&2;exit 2;; esac
+  if [[ "$OPD_B_SHARING_SCOPE" == per_prompt_group && "$OPD_B_RESET_MODE" == carry ]];then
+    echo 'ERROR: grouped/carry B are separate ablations' >&2;exit 2
+  fi
   case "$OPD_TRAIN_PROJECTOR" in 0|1) ;; *) echo 'ERROR: invalid OPD_TRAIN_PROJECTOR' >&2;exit 2;; esac
   if [[ -z "$OPD_ABLATION_NAME" ]];then
     if [[ "$OPD_PROJECTOR_INIT" == random_orthogonal ]];then
@@ -87,8 +96,11 @@ if [[ "$METHOD" == opd_reflex ]]; then
   if [[ "$OPD_UPDATE_INTERVAL_ROUNDS" == 0 ]];then OPD_PROJECTOR_MODE=inactive
   elif [[ "$OPD_TRAIN_PROJECTOR" == 1 ]];then OPD_PROJECTOR_MODE=learned
   else OPD_PROJECTOR_MODE=frozen;fi
-  if [[ "$OPD_ABLATION_NAME" != main || "$OPD_PROJECTOR_INIT" != head_aligned || "$OPD_TRAIN_PROJECTOR" != 1 || "$OPD_UPDATE_INTERVAL_ROUNDS" != 1 || "$OPD_PROJECTOR_SEED" != 42 ]];then
+  if [[ "$OPD_ABLATION_NAME" != main || "$OPD_PROJECTOR_INIT" != head_aligned || "$OPD_TRAIN_PROJECTOR" != 1 || "$OPD_UPDATE_INTERVAL_ROUNDS" != 1 || "$OPD_PROJECTOR_SEED" != 42 || "$OPD_B_SHARING_SCOPE" != rollout_batch || "$OPD_B_RESET_MODE" != rollout || "$OPD_FEEDBACK_SELECTION" != visited_frontier ]];then
     TRAIN_MODEL_ROOT="$TRAIN_MODEL_ROOT/ablations/${OPD_ABLATION_NAME}__init-${OPD_PROJECTOR_INIT}__seed${OPD_PROJECTOR_SEED}__train${OPD_TRAIN_PROJECTOR}__interval${OPD_UPDATE_INTERVAL_ROUNDS}"
+  fi
+  if [[ "$OPD_B_SHARING_SCOPE" != rollout_batch || "$OPD_B_RESET_MODE" != rollout || "$OPD_FEEDBACK_SELECTION" != visited_frontier ]];then
+    TRAIN_MODEL_ROOT+="__scope-${OPD_B_SHARING_SCOPE}__reset-${OPD_B_RESET_MODE}__selection-${OPD_FEEDBACK_SELECTION}"
   fi
 fi
 REQUESTED_RUN_DIR="${RUN_DIR:-}"
@@ -192,6 +204,7 @@ if [[ "$METHOD" == opd_reflex ]]; then
   --opd_train_projector "$OPD_TRAIN_PROJECTOR"
   --opd_projector_init "$OPD_PROJECTOR_INIT" --opd_projector_seed "$OPD_PROJECTOR_SEED"
   --opd_update_interval_rounds "$OPD_UPDATE_INTERVAL_ROUNDS" --opd_ablation_name "$OPD_ABLATION_NAME"
+  --opd_b_sharing_scope "$OPD_B_SHARING_SCOPE" --opd_b_reset_mode "$OPD_B_RESET_MODE"
   --kv_gather_strategy "${KV_GATHER_STRATEGY:-stacked}"
   )
 fi
@@ -206,6 +219,9 @@ printf 'Run name : %s\nRun dir  : %s\nModel    : %s\nDataset  : %s\nDraft    : %
 printf 'Command  :'; printf ' %q' "${cmd[@]}"; printf '\n'
 if [[ "${DRY_RUN:-false}" == "true" ]]; then return 0 2>/dev/null || exit 0; fi
 
+if [[ "$RESUME" == auto && -z "$RESUME_CHECKPOINT" && "${REQUIRE_RESUME:-0}" == 1 ]];then
+  echo "ERROR: no checkpoint for this configuration under $TRAIN_MODEL_ROOT; use RESUME= for a fresh run" >&2;exit 2
+fi
 "$PYTHON_BIN" "$PROJECT_DIR/scripts/validate_environment.py" --python-only
 "$PYTHON_BIN" "$PROJECT_DIR/scripts/check_training_sources.py" --backend fastgrpo
 
@@ -255,6 +271,8 @@ ln -sfn "$RUN_DIR" "$TRAIN_MODEL_ROOT/active_run"
   --item "opd_backend=$OPD_BACKEND" \
   --item "opd_ablation_name=$OPD_ABLATION_NAME" --item "opd_projector_init=$OPD_PROJECTOR_INIT" \
   --item "opd_projector_seed=$OPD_PROJECTOR_SEED" --item "opd_update_interval_rounds=$OPD_UPDATE_INTERVAL_ROUNDS" \
+  --item "opd_b_sharing_scope=$OPD_B_SHARING_SCOPE" --item "opd_b_reset_mode=$OPD_B_RESET_MODE" \
+  --item "opd_feedback_selection=$OPD_FEEDBACK_SELECTION" \
   --item "opd_projector_mode=${OPD_PROJECTOR_MODE:-off}" \
   --item "opd_train_projector=$OPD_TRAIN_PROJECTOR" --item "opd_proposal_mode=$OPD_PROPOSAL_MODE" \
   --item "opd_dense_implementation=$OPD_DENSE_IMPLEMENTATION" \
