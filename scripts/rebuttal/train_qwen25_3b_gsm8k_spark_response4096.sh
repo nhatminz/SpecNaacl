@@ -1,3 +1,3 @@
 #!/usr/bin/env bash
 set -euo pipefail
-exec bash "$(dirname "${BASH_SOURCE[0]}")/train.sh" long_context qwen25_3b opd_reflex 42 8 "4096"
+exec bash "$(dirname "${BASH_SOURCE[0]}")/train_qwen25_3b_gsm8k_specnaacl_response4096.sh"

@@ -24,6 +24,14 @@ opd_rank opd_topk opd_fast_lr opd_visited_weight opd_frontier_weight opd_backend
 opd_train_projector opd_projector_init opd_projector_seed opd_projector_lr opd_update_interval_rounds
 opd_b_sharing_scope opd_b_reset_mode kv_gather_strategy
 '''.split()
+FASTLK_ARGS = """
+reflex_feature_dim reflex_lr reflex_weight_decay reflex_seed reflex_backend reflex_feedback_scope
+reflex_proposal_strategy reflex_correction_strategy reflex_feedback_strategy reflex_feature_strategy reflex_update_stream
+""".split()
+EAGLE_ARGS = """
+draft_backend draft_initialization_mode draft_train_mode draft_train_max_batch_size draft_train_max_tokens
+draft_train_max_padding_ratio eagle_ttt_length eagle_feature_layers eagle_lk_loss_type eagle_kl_scale eagle_kl_decay
+""".split()
 OPD_ENV = '''
 OPD_PROPOSAL_MODE OPD_DENSE_IMPLEMENTATION OPD_SAMPLER_MODE OPD_KV_MAX_RETAINED_TOKENS
 '''.split()
@@ -75,13 +83,25 @@ def signature(config, method, *, ar=False):
         # A fixed AR reference has no speculative budget or online drafter.
         base_keys = [key for key in base_keys if not key.startswith(('draft_', 'verification_', 'max_verification',
                      'max_draft_', 'min_draft_', 'generation_profile', 'is_train_draft'))]
+    engine = args.get('draft_backend','full_vocabulary_fastgrpo')
+    if engine == 'eagle3' and not ar:
+        base_keys.extend(EAGLE_ARGS)
     shared = require_fields(args, base_keys)
+    if not ar:
+        shared['draft_engine'] = engine
+        shared['draft_initialization_mode'] = args.get('draft_initialization_mode','pretrained')
     shared['assets'] = {}
-    for name in ('target', 'target_adapter', 'train_dataset', 'draft'):
+    assets = ['target','target_adapter','train_dataset','draft']
+    if engine == 'eagle3' and not ar:
+        assets.extend(('draft_config','vocab_mapping'))
+    for name in assets:
         if name == 'draft' and ar:
             continue
         source = config['inputs'][name]
-        if not source and name != 'target_adapter':
+        optional = ('target_adapter','vocab_mapping')
+        if args.get('draft_initialization_mode') == 'random':
+            optional += ('draft',)
+        if not source and name not in optional:
             raise ValueError(f'missing stable {name} identity')
         shared['assets'][name] = source['sha256'] if source else None
     shared['dataset'] = require_fields(config['dataset'],
@@ -94,6 +114,8 @@ def signature(config, method, *, ar=False):
                                        ('transformers','peft','triton','math-verify'))
     shared['basis'] = config.get('metric_protocol', 'rebuttal_v1')
     method_specific = {}
+    if method == 'specnaacl':
+        method_specific = require_fields(args,FASTLK_ARGS)
     if method == 'opd_reflex':
         method_specific = require_fields(args, OPD_ARGS)
         proposal = config['proposal_env']
@@ -220,16 +242,18 @@ class Run:
             generation_time_s=number(row,'cumulative_generation_time_s'),training_wall_time_s=number(row,T))
 
 
-def comparison(runs, ar_run=None):
+def comparison(runs, ar_run=None, treatment="opd_reflex"):
+    methods = ("fastgrpo",treatment)
+    speedup_label = "specnaacl_over_fastgrpo" if treatment == "specnaacl" else "spark_over_fastgrpo"
     by_method = defaultdict(dict)
     for run in runs:
         if run.seed in by_method[run.method]:
             raise ValueError(f'duplicate {run.method} run for seed {run.seed}. Select the intended directories explicitly')
         by_method[run.method][run.seed] = run
-    seeds = sorted(set(by_method['fastgrpo']).intersection(by_method['opd_reflex']))
+    seeds = sorted(set(by_method['fastgrpo']).intersection(by_method[treatment]))
     if not seeds:
         raise ValueError('no paired seed has both methods')
-    paired = [by_method[method][seed] for method in ('fastgrpo','opd_reflex') for seed in seeds]
+    paired = [by_method[method][seed] for method in methods for seed in seeds]
     eval_configs = {json.dumps(run.eval_signature, sort_keys=True) for run in paired if run.eval_signature is not None}
     if len(eval_configs) > 1:
         raise ValueError('incompatible held-out evaluation dataset, protocol, or decoding settings')
@@ -238,7 +262,7 @@ def comparison(runs, ar_run=None):
         raise ValueError('no common observed actual target optimizer update')
     matched = exact[-1]
     report, per_seed = [], []
-    for method in ('fastgrpo','opd_reflex'):
+    for method in methods:
         individual = []
         for seed in seeds:
             run = by_method[method][seed]
@@ -249,7 +273,7 @@ def comparison(runs, ar_run=None):
         per_seed.extend(individual)
         for metric in (*METRICS,'full_training_wall_s'):
             paired_values = []
-            other = 'opd_reflex' if method == 'fastgrpo' else 'fastgrpo'
+            other = treatment if method == 'fastgrpo' else 'fastgrpo'
             for row in individual:
                 run = by_method[other][row['seed']]
                 other_value = run.final_wall if metric == 'full_training_wall_s' else run.metrics_at(matched)[metric]
@@ -261,16 +285,16 @@ def comparison(runs, ar_run=None):
         speedups = []
         for seed in seeds:
             baseline = by_method['fastgrpo'][seed].metrics_at(matched)[metric]
-            spark = by_method['opd_reflex'][seed].metrics_at(matched)[metric]
+            spark = by_method[treatment][seed].metrics_at(matched)[metric]
             ratio = baseline/spark if baseline is not None and spark else None
             speedups.append(ratio)
-            per_seed.append(dict(seed=seed, method='spark_over_fastgrpo', matched_target_optimizer_steps=matched,
+            per_seed.append(dict(seed=seed, method=speedup_label, matched_target_optimizer_steps=matched,
                                  metric=metric, speedup=ratio))
-        report.append(dict(method='spark_over_fastgrpo', metric=metric, matched_target_optimizer_steps=matched,
+        report.append(dict(method=speedup_label, metric=metric, matched_target_optimizer_steps=matched,
                            **stat(speedups)))
     if ar_run is not None and matched in ar_run.updates:
         per_ar = ar_run.metrics_at(matched)
-        for method in ('fastgrpo','opd_reflex'):
+        for method in methods:
             for metric in SPEED_METRICS:
                 values = [by_method[method][seed].metrics_at(matched)[metric] for seed in seeds]
                 ratios = [per_ar[metric]/value for value in values if value and per_ar[metric] is not None]
@@ -278,7 +302,7 @@ def comparison(runs, ar_run=None):
                     matched_target_optimizer_steps=matched, **stat(ratios)))
 
     curves = []
-    pair_map = {seed: [by_method[method][seed] for method in ('fastgrpo','opd_reflex')] for seed in seeds}
+    pair_map = {seed: [by_method[method][seed] for method in methods] for seed in seeds}
     accuracy_seeds = [seed for seed, pair in pair_map.items() if all(run.evaluations for run in pair)]
     time_seeds = [seed for seed, pair in pair_map.items() if all(run.final_wall is not None for run in pair)]
     accuracy_time_seeds = [seed for seed in accuracy_seeds if seed in time_seeds]
@@ -293,7 +317,7 @@ def comparison(runs, ar_run=None):
     def aggregate_curve(axis, point, method, metric, values):
         curves.append(dict(axis=axis, point=point, method=method, metric=metric, **stat(values)))
 
-    for method in ('fastgrpo','opd_reflex'):
+    for method in methods:
         for index in exact:
             reward_seeds = [seed for seed,pair in pair_map.items()
                             if all(number(run.updates[index],'reward_mean') is not None for run in pair)]
@@ -353,7 +377,7 @@ def plots(directory, cohort, rows):
         for metric, ylabel in (('reward','Mean training reward'), ('accuracy','GSM8K accuracy')):
             fig, ax = plt.subplots(figsize=(5.4,3.1), layout='constrained')
             available = False
-            for method,label,color in (('fastgrpo','FastGRPO','#3D5D86'), ('opd_reflex','SPARK','#AD4E38')):
+            for method,label,color in (('fastgrpo','FastGRPO','#3D5D86'), ('opd_reflex','SPARK','#AD4E38'), ('specnaacl','SpecNaacl','#AD4E38')):
                 points = sorted((row for row in rows if row['axis']==axis and row['metric']==metric
                     and row['method']==method and row['mean'] is not None), key=lambda row: row['point'])
                 if not points:
@@ -400,7 +424,7 @@ def main():
     for run in runs:
         if run.method == 'ar':
             ar.append(run)
-        elif run.method in ('fastgrpo','opd_reflex'):
+        elif run.method in ('fastgrpo','opd_reflex','specnaacl'):
             shared_groups[json.dumps(run.shared,sort_keys=True)].append(run)
     if len(ar) > 1:
         raise ValueError('provide at most one compatible fixed AR reference per invocation')
@@ -409,17 +433,17 @@ def main():
         fast = [run for run in group if run.method == 'fastgrpo']
         variants = defaultdict(list)
         for run in group:
-            if run.method == 'opd_reflex':
-                variants[json.dumps(run.specific,sort_keys=True)].append(run)
+            if run.method in ('opd_reflex','specnaacl'):
+                variants[run.method,json.dumps(run.specific,sort_keys=True)].append(run)
         if not fast or not variants:
             errors.extend(dict(run_dir=run.path, reason='no other method with compatible shared configuration') for run in group)
             continue
         applicable_ar = ar[0] if ar and signature(fast[0].config,'fastgrpo',ar=True)[0] == ar[0].shared else None
         if ar and applicable_ar is None:
             errors.append(dict(run_dir=ar[0].path, reason='fixed AR reference is incompatible with the cohort'))
-        for spark in variants.values():
+        for (treatment,_),spark in variants.items():
             try:
-                result = comparison(fast+spark,applicable_ar)
+                result = comparison(fast+spark,applicable_ar,treatment)
                 paired_seeds = set(result['seeds'])
                 errors.extend(dict(run_dir=run.path, reason='no compatible paired run for the same seed')
                               for run in fast+spark if run.seed not in paired_seeds)
@@ -427,7 +451,7 @@ def main():
                 errors.append(dict(run_dir=', '.join(run.path for run in fast+spark), reason=str(failure)))
             else:
                 cohorts.append(dict(cohort=f'cohort_{len(cohorts)+1}', **result, compatibility=fast[0].shared,
-                                    spark_configuration=spark[0].specific,
+                                    treatment_configuration=spark[0].specific,
                                     entered_run_dirs=[run.path for run in fast+spark if run.seed in paired_seeds]))
     args.output.mkdir(parents=True)
     with (args.output / 'summary.json').open('x') as stream:

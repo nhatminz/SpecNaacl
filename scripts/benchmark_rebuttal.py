@@ -24,6 +24,19 @@ def parse_args(argv):
     parser.add_argument('--sweep', choices=('concurrency', 'prompt_groups', 'long_context'), required=True)
     parser.add_argument('--target-adapter', default='')
     parser.add_argument('--projector-checkpoint', default='')
+    parser.add_argument('--engine', choices=('eagle3','full_vocab'), default='full_vocab')
+    parser.add_argument('--draft-config',default='')
+    parser.add_argument('--vocab-mapping',default='')
+    parser.add_argument('--reflex-feature-dim',type=int,default=8)
+    parser.add_argument('--reflex-lr',type=float,default=.05)
+    parser.add_argument('--reflex-weight-decay',type=float,default=0.)
+    parser.add_argument('--reflex-seed',type=int,default=42)
+    parser.add_argument('--reflex-feedback-scope',choices=('root','visited_path'),default='root')
+    parser.add_argument('--reflex-update-stream',type=int,choices=(0,1),default=1)
+    parser.add_argument('--reflex-proposal-strategy',choices=('fused','sort','hybrid','torch'),default='fused')
+    parser.add_argument('--reflex-correction-strategy',choices=('serial','parallel','tiled'),default='serial')
+    parser.add_argument('--reflex-feedback-strategy',choices=('serial','parallel'),default='serial')
+    parser.add_argument('--reflex-feature-strategy',choices=('auto','triton','torch'),default='auto')
     parser.add_argument('--generation-profile', choices=('clean', 'detailed'), default='detailed')
     parser.add_argument('--opd-b-sharing-scope', choices=('per_prompt_group', 'rollout_batch'), default='per_prompt_group')
     parser.add_argument('--dtype', choices=('bf16', 'fp16'), default='bf16')
@@ -84,7 +97,7 @@ STEADY_FIELDS = (
     'generation_wall_time_s', 'throughput_tokens_s', 'aal', 'acceptance_rate', 'generated_tokens',
     'length_mean', 'length_max', 'fraction_over_2048', 'fraction_reaching_4096',
     'peak_allocated_bytes', 'peak_reserved_bytes', 'correction_matrix_count', 'correction_matrix_bytes',
-    'dense_fp32_correction_bytes', 'projector_bytes', 'correction_workspace_bytes', 'spark_updates',
+    'dense_fp32_correction_bytes', 'projector_bytes', 'correction_workspace_bytes', 'spark_updates', 'fastlk_updates',
 )
 
 
@@ -92,7 +105,6 @@ def main(argv):
     args = parse_args(argv)
     from peft import PeftModel
     from transformers import AutoModelForCausalLM, AutoTokenizer
-    from helper.fastgrpo_model import FastGRPOModel
     from helper.shared_adapter import preflight_shared_adapter
 
     if torch.cuda.device_count() != 1 or int(os.getenv('WORLD_SIZE', '1')) != 1:
@@ -102,18 +114,26 @@ def main(argv):
     dtype = torch.bfloat16 if args.dtype == 'bf16' else torch.float16
     device = torch.device('cuda:0')
     preflight_shared_adapter(args.target_adapter, args.target_model)
-    checkpoint = draft_file(args.draft_checkpoint).resolve(strict=True)
-    draft_state = torch.load(checkpoint, map_location='cpu', weights_only=True)['draft_model']
-    projector = project_tensor(args.projector_checkpoint, draft_state)
-    draft_state.pop('opd_projector', None)
+    historical = args.engine == 'eagle3'
+    checkpoint = (Path(args.draft_checkpoint) if historical else draft_file(args.draft_checkpoint)).resolve(strict=True)
+    projector = None
     target = AutoModelForCausalLM.from_pretrained(args.target_model, torch_dtype=dtype,
         attn_implementation=args.attn_implementation, local_files_only=True).to(device).eval()
-    config = deepcopy(target.config)
-    config.rope_scaling = None
-    config.num_hidden_layers = 1
-    model = FastGRPOModel(config, target).to(device).eval()
-    model.draft_model.load_state_dict(draft_state)
-    del draft_state
+    if historical:
+        from helper.eagle3_specforge import Eagle3FastGRPOAdapter
+        model = Eagle3FastGRPOAdapter(target, args.draft_config, str(checkpoint),
+                                     args.vocab_mapping).to(device).eval()
+    else:
+        from helper.fastgrpo_model import FastGRPOModel
+        draft_state = torch.load(checkpoint, map_location='cpu', weights_only=True)['draft_model']
+        projector = project_tensor(args.projector_checkpoint, draft_state)
+        draft_state.pop('opd_projector', None)
+        config = deepcopy(target.config)
+        config.rope_scaling = None
+        config.num_hidden_layers = 1
+        model = FastGRPOModel(config, target).to(device).eval()
+        model.draft_model.load_state_dict(draft_state)
+        del draft_state
     if args.target_adapter:
         model.target_model = PeftModel.from_pretrained(model.target_model, args.target_adapter).eval()
     model.requires_grad_(False)
@@ -140,11 +160,15 @@ def main(argv):
     env = runtime_environment(ROOT, device)
     json_write(output / 'environment.json', env)
     inputs = dict(target=asset_id(args.target_model), draft=asset_id(checkpoint),
-                  projector=asset_id(args.projector_checkpoint or checkpoint), dataset=asset_id(args.dataset_path),
+                  projector=asset_id(args.projector_checkpoint or checkpoint) if not historical else None,
+                  draft_config=asset_id(args.draft_config) if historical else None,
+                  vocab_mapping=asset_id(args.vocab_mapping) if historical and args.vocab_mapping else None,
+                  dataset=asset_id(args.dataset_path),
                   target_adapter=asset_id(args.target_adapter) if args.target_adapter else None)
     config = dict(args=vars(args), inputs=inputs, dataset_sample_count=len(rows),
                   prompt_ids=order[:needed], prompt_rows_sha256=digest_rows([rows[i] for i in order[:needed]]),
-                  projector_sha256=hashlib.sha256(projector.contiguous().numpy().tobytes()).hexdigest(),
+                  projector_sha256=(hashlib.sha256(projector.contiguous().numpy().tobytes()).hexdigest()
+                                    if projector is not None else None),
                   proposal_env={key: value for key, value in os.environ.items() if key.startswith('OPD_')})
     json_write(output / 'config_resolved.yaml', config)
     rollout_log = CSVLog(logs / 'rollout_metrics.csv')
@@ -156,7 +180,8 @@ def main(argv):
     by_method_and_shape = {}
     warmup_time = diagnostic_time = 0.
     with torch.inference_mode(), (logs / 'response_metrics.jsonl').open('x', buffering=65536) as responses:
-        for method in ('fastgrpo', 'opd_reflex'):
+        treatment = 'specnaacl' if historical else 'opd_reflex'
+        for method in ('fastgrpo', treatment):
             if method == 'opd_reflex':
                 model.enable_opd(args.rank, projector=projector)
                 model.opd_projector.requires_grad_(False)
@@ -172,25 +197,37 @@ def main(argv):
                     batch = batches[rep]
                     seed = args.seed + rep
                     torch.manual_seed(seed)
+                    if historical:
+                        method_options = dict(reflex_mode='active' if method == treatment else 'off',
+                            reflex_profile=mode=='detailed',reflex_feature_dim=args.reflex_feature_dim,
+                            reflex_lr=args.reflex_lr,reflex_weight_decay=args.reflex_weight_decay,reflex_seed=args.reflex_seed,
+                            reflex_backend='triton',reflex_feedback_scope=args.reflex_feedback_scope,
+                            reflex_update_stream=bool(args.reflex_update_stream),
+                            reflex_proposal_strategy=args.reflex_proposal_strategy,
+                            reflex_correction_strategy=args.reflex_correction_strategy,
+                            reflex_feedback_strategy=args.reflex_feedback_strategy,
+                            reflex_feature_strategy=args.reflex_feature_strategy)
+                    else:
+                        method_options = dict(method=method,opd_rank=args.rank,opd_topk=args.topk,
+                            opd_fast_lr=args.opd_fast_lr,opd_visited_weight=args.opd_visited_weight,
+                            opd_frontier_weight=args.opd_frontier_weight,opd_update_stream=bool(args.opd_update_stream),
+                            opd_train_projector=False,opd_update_interval_rounds=1,opd_b_reset_mode='rollout',
+                            opd_b_sharing_scope=args.opd_b_sharing_scope,opd_backend='triton')
                     return speculative_generate(model, batch['input_ids'].to(device), batch['attention_mask'].to(device),
-                        tokenizer, do_sample=True, method=method, repeated_generate_nums=responses_per_prompt,
+                        tokenizer, do_sample=True, repeated_generate_nums=responses_per_prompt,
                         temperature=args.temperature, top_p=args.top_p, top_k=args.top_k or None,
                         max_length=args.max_length, max_response_tokens=cap, max_draft_k=args.max_draft_k,
                         max_draft_token_length=args.max_draft_token_length, min_draft_token_length=args.min_draft_token_length,
                         verification_capacity=args.verification_capacity, max_verification_num=args.max_verification_num,
                         draft_token_length_c=args.draft_token_length_c, generation_profile=mode,
-                        round_log_frequency=args.round_log_frequency, opd_rank=args.rank, opd_topk=args.topk,
-                        opd_fast_lr=args.opd_fast_lr, opd_visited_weight=args.opd_visited_weight,
-                        opd_frontier_weight=args.opd_frontier_weight, opd_update_stream=bool(args.opd_update_stream),
-                        opd_train_projector=False, opd_update_interval_rounds=1, opd_b_reset_mode='rollout',
-                        opd_b_sharing_scope=args.opd_b_sharing_scope, opd_backend='triton')
+                        round_log_frequency=args.round_log_frequency, **method_options)
 
                 warm_started = time.perf_counter()
                 for _ in range(args.warmup):
                     for rep in range(args.repetitions):
                         run(rep, 'clean')
                 warmup_time += time.perf_counter() - warm_started
-                settings = dict(method=method, model=args.model_key, dataset=args.dataset, sweep=args.sweep,
+                settings = dict(method=method, engine=args.engine, model=args.model_key, dataset=args.dataset, sweep=args.sweep,
                                 batch_size=batch_size, responses_per_prompt=responses_per_prompt,
                                 initial_concurrency=batch_size*responses_per_prompt, response_cap=cap,
                                 legacy_total_cap=args.max_length if cap is None else None)
@@ -209,7 +246,7 @@ def main(argv):
                         throughput_tokens_s=sum(lengths)/wall,
                         aal=out['total_acc_length']/max(1, out['total_decoded_token_num']),
                         acceptance_rate=out['draft_acceptance_rate'], peak_allocated_bytes=torch.cuda.max_memory_allocated(),
-                        peak_reserved_bytes=torch.cuda.max_memory_reserved(), spark_updates=out.get('opd_updates',0),
+                        peak_reserved_bytes=torch.cuda.max_memory_reserved(), spark_updates=out.get('opd_updates',0), fastlk_updates=out.get('reflex_updates',0),
                         prompt_indices=prompt_ids[rep])
                     rollout_log.write(row)
                     measured.append(row)
@@ -237,7 +274,8 @@ def main(argv):
                             proposal_profile=profile.get('opd_proposal_profile_effective'), **profile['generation_profile']))
                         memory_log.write(dict(**common, **profile['generation_memory'],
                                               spark_updates=profile.get('opd_updates', 0),
-                                              spark_feedback_states=profile.get('opd_selected_states', 0)))
+                                              spark_feedback_states=profile.get('opd_selected_states', 0),
+                                              fastlk_updates=profile.get('reflex_updates',0)))
                         diagnostics.append(dict(**profile['generation_profile'], **profile['generation_memory']))
                         if round_log:
                             for row in profile['verification_rounds']:
@@ -254,7 +292,7 @@ def main(argv):
     paired = []
     for batch, responses, cap in shapes:
         baseline = by_method_and_shape['fastgrpo',batch,responses,cap]
-        spark = by_method_and_shape['opd_reflex',batch,responses,cap]
+        spark = by_method_and_shape[treatment,batch,responses,cap]
         pairs = [dict(throughput_speedup=b['throughput_tokens_s']/a['throughput_tokens_s'],
                       wall_time_speedup=a['generation_wall_time_s']/b['generation_wall_time_s'])
                  for a,b in zip(baseline,spark)]

@@ -42,13 +42,15 @@ def test_rebuttal_launcher_matrix_and_isolation(script, tmp_path):
     assert '/nlp/users/minhpn19/data/' in value('--dataset_path')
     size = '7' if '7b' in name else '3'
     assert value('--model_dir').endswith(f'Qwen2.5-{size}B-Instruct')
-    method = 'opd_reflex' if 'spark' in name else 'fastgrpo'
+    method = 'specnaacl' if 'spark' in name or 'specnaacl' in name else 'fastgrpo'
     assert value('--method') == method
     assert value('--batch_size') == '8'
     assert value('--repeated_generate_nums') == ('16' if 'g16' in name else '8')
     assert value('--generation_profile') == ('detailed' if 'g16' in name else 'clean')
-    if method == 'opd_reflex':
-        assert value('--opd_b_sharing_scope') == ('rollout_batch' if size == '7' else 'per_prompt_group')
+    assert value('--reflex_mode') == ('active' if method == 'specnaacl' else 'off')
+    assert value('--draft_backend') == 'eagle3'
+    assert ROOT / 'runtimes/specnaacl/grpo_speculative.py' in map(Path,args)
+    assert '--opd_b_sharing_scope' not in args
     assert value('--max_length') == '2048'
     if '4096' in name:
         assert value('--max_response_tokens') == '4096'
@@ -56,6 +58,9 @@ def test_rebuttal_launcher_matrix_and_isolation(script, tmp_path):
         assert '--max_response_tokens' not in args
     assert value('--adapter_path') == str(ROOT / f'outputs/pretrain/qwen25_{size}b/latest_checkpoint')
     assert not value('--resume_checkpoint')
+    assert value('--draft_initialization_mode') == 'pretrained'
+    assert value('--draft_config').endswith('/latest_draft_config.json')
+    assert value('--vocab_mapping').endswith('/latest_vocab_mapping.pt')
     assert str(tmp_path/'rebuttal') in value('--summary_file')
     assert value('--summary_file') not in command()
     assert not (tmp_path/'rebuttal').exists()
@@ -235,3 +240,18 @@ def test_frozen_comparison_uses_both_engines_and_saved_projector_on_tiny_data(tm
     assert report['results'][1]['correction_matrix_count_mean'] == 2
     assert report['diagnostics'][1]['spark_correction_application_time_ms_mean'] is None
     assert report['diagnostics'][1]['spark_correction_update_time_ms_mean'] > 0
+
+
+def test_specnaacl_random_init_and_no_resume(tmp_path):
+    script = ROOT/'scripts/rebuttal/train_qwen25_7b_gsm8k_specnaacl_seed123.sh'
+    env = dict(os.environ,DRY_RUN='true',DRAFT_INITIALIZATION_MODE='random',
+        DRAFT_CHECKPOINT=str(tmp_path/'unavailable.pth'),REBUTTAL_OUTPUT_ROOT=str(tmp_path))
+    run = subprocess.run(['bash',str(script)],env=env,text=True,capture_output=True,check=True)
+    cmd = shlex.split(next(line for line in run.stdout.splitlines() if line.startswith('Command')).split(':',1)[1])
+    assert cmd[cmd.index('--adapter_path')+1] == ''
+    assert cmd[cmd.index('--resume_checkpoint')+1] == ''
+    assert cmd[cmd.index('--draft_initialization_mode')+1] == 'random'
+    assert cmd[cmd.index('--draft_config')+1].endswith('/draft_config.json')
+    assert not list(tmp_path.iterdir())
+    blocked = subprocess.run(['bash',str(script)],env=dict(env,RESUME='auto'),text=True,capture_output=True)
+    assert blocked.returncode == 2 and 'fresh training only' in blocked.stderr

@@ -1,3 +1,3 @@
 #!/usr/bin/env bash
 set -euo pipefail
-exec bash "$(dirname "${BASH_SOURCE[0]}")/train.sh" multiseed qwen25_7b opd_reflex 123 8 ""
+exec bash "$(dirname "${BASH_SOURCE[0]}")/train_qwen25_7b_gsm8k_specnaacl_seed123.sh"
