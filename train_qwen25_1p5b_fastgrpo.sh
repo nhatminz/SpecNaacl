@@ -3,7 +3,7 @@ set -euo pipefail
 # Paired launcher: all defaults are identical except METHOD / Reflex.
 export MODEL_KEY="qwen25_1p5b"
 export METHOD="fastgrpo"
-export MODEL="${MODEL:-/workspace/storage-shared/models/Qwen2.5-1.5B-Instruct}"
+export MODEL="${MODEL:-${MODEL_ROOT:-/workspace/storage-shared/models}/Qwen2.5-1.5B-Instruct}"
 export DATASET="${DATASET:-simplelr}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export NPROC_PER_NODE="${NPROC_PER_NODE:-1}"

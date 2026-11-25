@@ -58,7 +58,7 @@ mkdir -p "$TRAIN_MODEL_ROOT"
 cp outputs/pretrain/qwen25_3b/latest_checkpoint/draft.pth "$TRAIN_MODEL_ROOT/initial_draft.pth"
 export DRAFT_CHECKPOINT="$TRAIN_MODEL_ROOT/initial_draft.pth"
 export MODEL=/workspace/storage-shared/models/Qwen2.5-3B-Instruct
-export DATASET_PATH=/workspace/storage-shared/nlp/minhpn19/data/simplelr_abel_level3to5/train.parquet
+export DATASET_PATH=/workspace/storage-shared/nlp/users/minhpn19/data/simplelr_abel_level3to5/train.parquet
 export TARGET_ADAPTER="" RESUME=""
 export MAX_TARGET_OPTIMIZER_STEPS=1000 NUM_EPOCHS=100
 export TARGET_LR=1e-6 DRAFT_LR=1e-4 OPD_PROJECTOR_LR=1e-4

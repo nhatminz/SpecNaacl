@@ -5,8 +5,8 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 # Edit only this list, or pass run directories as command-line arguments.
 RUN_DIRS=(
-  # "/workspace/storage-shared/nlp/minhpn19/SpecNaacl/outputs/train/qwen25_3b/run1"
-  # "/workspace/storage-shared/nlp/minhpn19/SpecNaacl/outputs/train/qwen25_3b/run2"
+  # "/workspace/storage-shared/nlp/users/minhpn19/SpecNaacl/outputs/train/qwen25_3b/run1"
+  # "/workspace/storage-shared/nlp/users/minhpn19/SpecNaacl/outputs/train/qwen25_3b/run2"
 )
 if (($#)); then RUN_DIRS=("$@"); fi
 if ((${#RUN_DIRS[@]} == 0)); then

@@ -25,7 +25,7 @@ def _pad_schedule(TOKENS,INDICES,LENGTHS,OT,OI,OM,LAST,PACKET,SNAPSHOT,
     tl.store(OT+batch*OS0+slot*OS1,tl.where(accepted,token,EOS),slot<width)
     tl.store(OI+batch*OS0+slot*OS1,output_ids,slot<width)
     tl.store(OM+batch*OS0+slot*OS1,~accepted,slot<width);tl.store(LAST+batch,last)
-    eos_token=tl.load(TOKENS+batch*TS0+(length-1)*TS1)
+    eos_token=tl.load(TOKENS+batch*TS0+(length-1)*TS1,length>0,other=EOS)
     extension=tl.min(tl.where((slot<width)&(output_ids!=slot+PAST),slot,width),axis=0)
     tl.store(PACKET+batch*PS0,length)
     tl.store(PACKET+batch*PS0+PS1,(eos_token==EOS).to(tl.int64))

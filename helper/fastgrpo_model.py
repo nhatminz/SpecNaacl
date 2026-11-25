@@ -170,14 +170,18 @@ class FastGRPOModel(Model):
         prepare_target_decoder_api(target_model)
         super().__init__(config, target_model, path=path)
 
-    def enable_opd(self, rank=8, projector_init='head_aligned', projector_seed=42):
+    def enable_opd(self, rank=8, projector_init='head_aligned', projector_seed=42, *, projector=None):
         from helper.opd_reflex import initialize_projector
         if hasattr(self.draft_model, 'opd_projector'):
             raise ValueError('OPD already initialized')
         device = self.lm_head.weight.device
-        self.draft_model.register_parameter('opd_projector', nn.Parameter(
-            initialize_projector(self.draft_model.hidden_size, rank, seed=projector_seed,
-                                 head=self.lm_head.weight, init=projector_init).to(device)))
+        hidden = self.draft_model.hidden_size
+        if projector is None:
+            projector = initialize_projector(hidden, rank, seed=projector_seed,
+                                             head=self.lm_head.weight, init=projector_init)
+        if projector.shape != (hidden, rank) or projector.dtype != torch.float32:
+            raise ValueError('OPD projector must match the draft hidden size and rank in FP32')
+        self.draft_model.register_parameter('opd_projector', nn.Parameter(projector.to(device)))
         self.draft_model.register_buffer('opd_projector_grad_sum', torch.zeros_like(self.opd_projector), persistent=False)
         self.draft_model.register_buffer('opd_projector_grad_weight', torch.zeros(1,device=device), persistent=False)
         self.register_buffer('full_vocabulary_ids', torch.arange(self.draft_model.vocab_size,device=device), persistent=False)

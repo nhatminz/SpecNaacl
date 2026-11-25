@@ -5,6 +5,7 @@ upstream final draft microbatch is NOT divided by draft_accumulation_steps.
 Default accumulation=1; retaining this behavior makes nondefault parity testable.
 """
 import torch
+from torch.utils.checkpoint import checkpoint
 
 def compute_target_loss(logits,ref_logits,old_logits,labels,mask,reward,epsilon,beta,grpo_iteration):
 
@@ -24,6 +25,10 @@ def compute_target_loss(logits,ref_logits,old_logits,labels,mask,reward,epsilon,
         ref_logps=ref_logits
         old_logps=old_logits
 
+    return target_loss_from_logps(logps, ref_logps, old_logps, mask, reward, epsilon, beta)
+
+
+def target_loss_from_logps(logps, ref_logps, old_logps, mask, reward, epsilon, beta):
     coef1=torch.exp(logps-old_logps)
     coef2 = torch.clamp(coef1, 1 - epsilon, 1 + epsilon)
     loss1=torch.min(coef1*reward,coef2*reward)
@@ -43,8 +48,53 @@ def compute_target_loss(logits,ref_logits,old_logits,labels,mask,reward,epsilon,
     
     return loss.sum(-1),abs_loss1,loss2.sum(-1),old_logps,ref_logps
 
+def _chunked_draft_losses(model, draft_outputs, features, mask, chunk_size):
+    """Apply the original draft objectives with bounded vocabulary storage."""
+    mask = mask[:, :-1]
+    count = mask.sum(-1).clamp_min(1)
+    next_features = draft_outputs['next_feature_states'][:, :-1]
+    feature_loss = torch.nn.functional.smooth_l1_loss(
+        next_features.float(), features[:, 1:].float(), reduction='none').mean(-1)
+    loss1 = ((feature_loss * mask).sum(-1) / count).sum() * 2.0
+
+    def cross_entropy(draft_hidden, target_hidden):
+        draft_hidden = draft_hidden.to(model.target_model.dtype)
+        with torch.no_grad():
+            target_p = model.target_model.lm_head(target_hidden.to(draft_hidden.dtype)).float().softmax(-1)
+        draft_p = model.lm_head(draft_hidden).float().softmax(-1)
+        return (target_p * draft_p.log()).sum(-1)
+
+    length = mask.shape[-1]
+    hidden = draft_outputs['hidden_states']
+    chunks = []
+    for start in range(0, length, chunk_size):
+        end = min(start + chunk_size, length)
+        chunks.append(checkpoint(cross_entropy, hidden[:, start:end], features[:, start+1:end+1],
+                                 use_reentrant=False, preserve_rng_state=False))
+    loss2 = -((torch.cat(chunks, dim=-1) * mask).sum(-1) / count).sum() * 0.1
+    return loss1, loss2
+
+
+def _full_draft_losses(model, draft_outputs, features, mask):
+    next_features = draft_outputs['next_feature_states']
+    draft_hidden = draft_outputs['hidden_states'].to(model.target_model.dtype)
+    draft_logits = model.lm_head(draft_hidden)
+    with torch.no_grad():
+        target_logits = model.target_model.lm_head(features.to(model.target_model.dtype))
+        target_p = target_logits[:, 1:].float().softmax(dim=-1).detach()
+
+    loss_mask = mask[:, :-1]
+    denom = loss_mask.sum(-1)
+    feature = torch.nn.functional.smooth_l1_loss(
+        next_features[:, :-1].float(), features[:, 1:].float(), reduction='none')
+    loss1 = ((feature.mean(dim=-1) * loss_mask).sum(-1) / denom).sum(-1) * 2.0
+    draft_p = draft_logits[:, :-1].float().softmax(dim=-1)
+    loss2 = -(((target_p * torch.log(draft_p)).sum(dim=-1) * loss_mask).sum(-1) / denom).sum(-1) * 0.1
+    return loss1, loss2
+
+
 def training_draft_model(model,outputs,prompt_mask,*,repeated_generate_nums,
-                         max_training_token,max_training_padding_gap,draft_accumulation_steps):
+                         max_training_token,max_training_padding_gap,draft_accumulation_steps,logps_chunk_size=None):
     
 
     all_draft_input_states = outputs['all_draft_input_states']
@@ -66,7 +116,6 @@ def training_draft_model(model,outputs,prompt_mask,*,repeated_generate_nums,
     all_draft_input_states = list(all_draft_input_states_sorted)
     all_prompt_length = list(all_prompt_length_sorted)
     
-    l1_loss=torch.nn.SmoothL1Loss(reduction='none')
     total_loss1,total_loss2=0,0
     
     draft_input_states_list=[]
@@ -128,31 +177,12 @@ def training_draft_model(model,outputs,prompt_mask,*,repeated_generate_nums,
                 draft_outputs=model(hidden_states=draft_input_states,input_ids=draft_input_ids,
                                 attention_mask=attention_mask,use_cache=False)
                 
-            next_feature_states=draft_outputs['next_feature_states']
-            draft_hidden_states=draft_outputs['hidden_states'].to(model.target_model.dtype)
-            draft_logits=model.lm_head(draft_hidden_states)
-            
-            with torch.no_grad():
-                target_hidden_states=draft_input_states
-                target_logits=model.target_model.lm_head(target_hidden_states.to(model.target_model.dtype))
-                target_logits=target_logits[:,1:,:].float().softmax(dim=-1).detach()
-                
-            loss1=l1_loss(next_feature_states[:,:-1,:].float(),draft_input_states[:,1:,:].float())
+            if logps_chunk_size:
+                loss1, loss2 = _chunked_draft_losses(
+                    model, draft_outputs, draft_input_states, loss_mask, logps_chunk_size)
+            else:
+                loss1, loss2 = _full_draft_losses(model, draft_outputs, draft_input_states, loss_mask)
 
-            loss1=torch.mean(loss1,dim=-1)*loss_mask[...,:-1] 
-            loss1=torch.sum(loss1, dim=-1) / torch.sum(loss_mask[...,:-1], dim=-1)
-            loss1=loss1.sum(-1)
-            loss1=loss1*2.0
-            
-            draft_logits=draft_logits[:,:-1,:].float().softmax(dim=-1)
-
-            plogp=target_logits*torch.log(draft_logits)
-            loss2=torch.sum(plogp,dim=-1)*loss_mask[...,:-1]
-            loss2=torch.sum(loss2, dim=-1) / torch.sum(loss_mask[...,:-1], dim=-1)
-            loss2= - loss2.sum(-1)
-
-            loss2=loss2*0.1
-            
             loss=loss1+loss2
                 
             total_loss1+=loss1.item()
@@ -215,31 +245,12 @@ def training_draft_model(model,outputs,prompt_mask,*,repeated_generate_nums,
         draft_outputs=model(hidden_states=draft_input_states,input_ids=draft_input_ids,
                         attention_mask=attention_mask,use_cache=False)
         
-    next_feature_states=draft_outputs['next_feature_states']
-    draft_hidden_states=draft_outputs['hidden_states'].to(model.target_model.dtype)
-    draft_logits=model.lm_head(draft_hidden_states)
-    
-    with torch.no_grad():
-        target_hidden_states=draft_input_states
-        target_logits=model.target_model.lm_head(target_hidden_states.to(model.target_model.dtype))
-        target_logits=target_logits[:,1:,:].float().softmax(dim=-1).detach()
-        
-    loss1=l1_loss(next_feature_states[:,:-1,:].float(),draft_input_states[:,1:,:].float())
+    if logps_chunk_size:
+        loss1, loss2 = _chunked_draft_losses(
+            model, draft_outputs, draft_input_states, loss_mask, logps_chunk_size)
+    else:
+        loss1, loss2 = _full_draft_losses(model, draft_outputs, draft_input_states, loss_mask)
 
-    loss1=torch.mean(loss1,dim=-1)*loss_mask[...,:-1] 
-    loss1=torch.sum(loss1, dim=-1) / torch.sum(loss_mask[...,:-1], dim=-1)
-    loss1=loss1.sum(-1)
-    loss1=loss1*2.0
-    
-    draft_logits=draft_logits[:,:-1,:].float().softmax(dim=-1)
-
-    plogp=target_logits*torch.log(draft_logits)
-    loss2=torch.sum(plogp,dim=-1)*loss_mask[...,:-1]
-    loss2=torch.sum(loss2, dim=-1) / torch.sum(loss_mask[...,:-1], dim=-1)
-    loss2= - loss2.sum(-1)
-
-    loss2=loss2*0.1
-    
     loss=loss1+loss2
         
     total_loss1+=loss1.item()

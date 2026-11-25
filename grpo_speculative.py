@@ -16,13 +16,16 @@ sys.path.insert(0, repo_import_path)
 
 import pandas as pd
 from transformers import AutoTokenizer,AutoConfig,AutoModelForCausalLM,GenerationConfig
+from helper.train_prompts import TrainDataCollator
+from helper.rebuttal_metrics import RebuttalRun, asset_id, digest_rows, json_write, phase_seconds, runtime_environment
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 from helper.response_alignment import append_response_group, sort_training_rows, GRPO_ALIGNMENT_VERSION
 from helper.shared_adapter import preflight_shared_adapter, verify_loaded_adapter, initialization_report
 from helper.rewards import accuracy_reward_func , format_reward_func
 from helper.get_QAs import get_test_QAs , get_train_QAs, get_QAs_from_path, select_train_subset
 from helper.specualtive_generate import speculative_generate
 from helper.fastgrpo_model import FastGRPOModel as Model
-from helper.fastgrpo_training import training_draft_model as upstream_train_draft, compute_target_loss
+from helper.fastgrpo_training import training_draft_model as upstream_train_draft, compute_target_loss, target_loss_from_logps
 from helper.checkpointing import capture_rng_state, restore_rng_state
 from helper.method_config import resolve_method
 from helper.opd_reflex import OPD_COUNTER_NAMES, GENERATION_COUNTER_NAMES
@@ -376,6 +379,14 @@ parser.add_argument('--repeated_generate_nums',type=int,default=8)
 parser.add_argument('--beta',type=float,default=0.01)
 parser.add_argument('--epsilon',type=float,default=0.1)
 parser.add_argument('--max_length',type=int,default=2048)
+parser.add_argument('--max_response_tokens',type=int,default=None)
+parser.add_argument('--generation_profile',choices=('off','clean','detailed'),default='off')
+parser.add_argument('--round_log_frequency',type=int,default=0)
+parser.add_argument('--rebuttal_experiment',default='')
+parser.add_argument('--rebuttal_model_key',default='')
+parser.add_argument('--prompt_order_seed',type=int,default=None)
+parser.add_argument('--evaluation_seed',type=int,default=42)
+parser.add_argument('--eval_interval_updates',type=int,default=50)
 parser.add_argument('--max_prompt_length', type=int, default=2048,
                     help='Maximum prompt tokens before rollout; kept separate from max generated sequence length.')
 parser.add_argument('--max_training_padding_gap',type=int,default=256)
@@ -447,6 +458,17 @@ if world_size > 1:
     torch.cuda.set_device(local_rank)
     dist.init_process_group(backend='nccl', init_method='env://')
 rank = dist.get_rank() if dist.is_initialized() else 0
+if args.max_response_tokens is not None and args.max_response_tokens < 1:
+    parser.error('--max_response_tokens must be positive')
+if args.prompt_order_seed is None:
+    args.prompt_order_seed = args.seed
+if args.min_draft_token_length < 1 or args.round_log_frequency < 0 or args.eval_interval_updates < 0:
+    parser.error('invalid draft depth or logging interval')
+if args.rebuttal_experiment:
+    if world_size != 1 or torch.cuda.device_count() != 1:
+        parser.error('rebuttal runs require exactly one visible CUDA device and one process')
+    if args.resume_checkpoint or args.generation_profile == 'off':
+        parser.error('rebuttal requires a fresh run and generation profile clean or detailed')
 if args.max_rollout_prompts and args.max_rollout_prompts % world_size:
     raise ValueError('max_rollout_prompts must be divisible by world_size')
 local_prompt_budget=args.max_rollout_prompts//world_size
@@ -539,6 +561,7 @@ repeated_generate_nums=args.repeated_generate_nums
 beta=args.beta
 epsilon=args.epsilon
 max_length=args.max_length
+max_response_tokens=args.max_response_tokens
 max_prompt_length=args.max_prompt_length
 max_training_padding_gap=args.max_training_padding_gap
 max_training_token=args.max_training_token
@@ -786,16 +809,19 @@ def _token_logps_from_hidden(hidden_states, lm_head, labels, chunk_size):
     seq_len = hidden_states.shape[1]
     logps_chunks = []
 
+    def selected_logps(hidden, token_ids):
+        logits = lm_head(hidden).float()
+        return logits.log_softmax(-1).gather(-1, token_ids.unsqueeze(-1)).squeeze(-1)
+
     for start in range(0, seq_len, chunk_size):
         end = min(start + chunk_size, seq_len)
-        logits = lm_head(hidden_states[:, start:end, :]).float()
+        cur_hidden = hidden_states[:, start:end, :]
         cur_labels = labels[:, start:end]
-        selected_logits = torch.gather(
-            logits, dim=-1, index=cur_labels.unsqueeze(-1)
-        ).squeeze(-1)
-        log_denominator = torch.logsumexp(logits, dim=-1)
-        logps_chunks.append(selected_logits - log_denominator)
-        del logits, selected_logits, log_denominator
+        if cur_hidden.requires_grad:
+            logps_chunks.append(activation_checkpoint(selected_logps, cur_hidden, cur_labels,
+                use_reentrant=False, preserve_rng_state=False))
+        else:
+            logps_chunks.append(selected_logps(cur_hidden, cur_labels))
 
     if logps_chunks:
         return torch.cat(logps_chunks, dim=1)
@@ -832,7 +858,23 @@ def compute_model_token_logps(causal_lm, input_ids, attention_mask, chunk_size):
 
 def compute_target_loss_and_backward(model, input_ids, attention_mask, mask, reward,
         epsilon, beta, grpo_iteration, old_logps=None, ref_logps=None,
-        chunk_size=256, loss_scale=1.):
+        chunk_size=256, loss_scale=1., chunked=False):
+    if chunked:
+        if grpo_iteration == 0:
+            model.target_model.disable_adapter_layers()
+            try:
+                with torch.no_grad():
+                    ref_logps = compute_model_token_logps(model.target_model, input_ids, attention_mask, chunk_size)
+            finally:
+                model.target_model.enable_adapter_layers()
+        logps = compute_model_token_logps(model.target_model, input_ids, attention_mask, chunk_size)
+        old = logps.detach() if old_logps is None else old_logps.to(input_ids.device)
+        ref = ref_logps.to(input_ids.device)
+        loss, loss1, loss2, old, ref = target_loss_from_logps(
+            logps, ref, old, mask[:, :-1], reward, epsilon, beta)
+        (loss * loss_scale).backward()
+        return float(loss.detach()), float(loss1.detach()), float(loss2.detach()), old.cpu(), ref.cpu()
+
     if grpo_iteration == 0:
         model.target_model.disable_adapter_layers()
         try:
@@ -858,7 +900,8 @@ def training_draft_model(model, outputs, prompt_mask, token_budget=None):
         repeated_generate_nums=repeated_generate_nums,
         max_training_token=max_training_token if token_budget is None else token_budget,
         max_training_padding_gap=max_training_padding_gap,
-        draft_accumulation_steps=draft_accumulation_steps)
+        draft_accumulation_steps=draft_accumulation_steps,
+        **({"logps_chunk_size": logps_chunk_size} if max_response_tokens else {}))
     return loss1, loss2, 0., 0., 0
 
 optimizer_target = torch.optim.AdamW(model.target_model.parameters(), lr=target_lr)
@@ -1037,40 +1080,6 @@ step_metrics = StepMetricsWriter(
     log_file, timing_file, enabled=is_main_process, append=append_log,
     baseline=step_metrics_baseline, state=step_metrics_state)
 
-class TrainDataCollator:
-    def __init__(self, tokenizer, max_prompt_length):
-        self.tokenizer = tokenizer
-        self.max_prompt_length = max_prompt_length
-    
-    def __call__(self, batch):
-        system_prompt = "You are a math problem assistant." 
-        user_prompt =  '''Below is an instruction that describes a task, paired with an input that provides further context.
-            Write a response that appropriately completes the request.
-            Your response should include your thought process enclosed within <think></think> tags
-            and the final answer enclosed within <answer></answer> tags (Just put a number between the tags).\n
-            ### Instruction:\n{instruction}\nPlease reason step by step, and put your final answer within \\boxed{{}}'''
-        messages = []
-        answers = []
-
-        for example in batch:
-            messages.append([
-                {"role" : "system" , "content": system_prompt} , 
-                {"role" : "user" , "content": user_prompt.format_map({"instruction" : example['question']}) }
-            ])
-            answers.append(example['answer'])
-        tokenized_inputs = self.tokenizer(
-            text=self.tokenizer.apply_chat_template(messages,tokenize=False,add_generation_prompt=True),
-            return_tensors='pt',padding='longest',truncation=True,max_length=self.max_prompt_length,padding_side='left'
-        )
-
-        return {
-            'input_ids': tokenized_inputs['input_ids'],
-            'attention_mask': tokenized_inputs['attention_mask'],
-            'messages': messages,        
-            'answers': answers,           
-        }
-
-
 def _analysis_rng_state():
     return {
         'python': random.getstate(),
@@ -1204,7 +1213,7 @@ if analysis_enabled:
     Path(policy_lag_output_dir).mkdir(parents=True, exist_ok=True)
 
 train_sampler = DistributedSampler(
-    QAs, num_replicas=world_size, rank=rank, shuffle=True, seed=trace_seed,
+    QAs, num_replicas=world_size, rank=rank, shuffle=True, seed=args.prompt_order_seed,
 )
 dataloader=DataLoader(
     QAs,
@@ -1214,7 +1223,7 @@ dataloader=DataLoader(
     batch_size=batch_size,
     shuffle=False,
     sampler=train_sampler,
-    generator=torch.Generator().manual_seed(trace_seed),
+    generator=torch.Generator().manual_seed(args.prompt_order_seed),
     drop_last=False,
 )
 
@@ -1237,6 +1246,26 @@ if rollout_resume_state is None and resume_checkpoint:
 rollout_metrics=RolloutMetricsWriter(rollout_timing_path,method,state=rollout_resume_state,
     flush_interval=args.rollout_log_flush_interval, metadata=ablation_metadata)
 
+rebuttal = None
+checkpoint_writer = save_training_checkpoint
+if args.rebuttal_experiment:
+    run_dir = Path(summary_file).parent
+    environment = runtime_environment(REPO_ROOT, model.target_model.device)
+    json_write(run_dir / 'environment.json', environment)
+    inputs = {key: asset_id(path) if path else None for key, path in (
+        ('target', model_dir), ('draft', adapter_path), ('target_adapter', args.load_lora_path),
+        ('train_dataset', args.dataset_path), ('eval_dataset', args.eval_dataset_path))}
+    rebuttal = RebuttalRun(args, run_dir, environment, inputs, dict(
+        full_sample_count=full_train_samples, selected_sample_count=selected_train_samples,
+        selected_rows_sha256=digest_rows(QAs), train_split=args.train_split,
+        eval_split=args.eval_split, prompt_order_protocol='DistributedSampler shuffle, seed + zero-based epoch'),
+        dict(initialization_proof, **ablation_metadata), process_started_at)
+    rebuttal.snapshot(model.target_model, 0, 'initial')
+
+    def checkpoint_writer(*positional, **keyword):
+        return rebuttal.timed_io(save_training_checkpoint, *positional, **keyword)
+
+
 def finish_rollout_iteration():
     rollout_metrics.finish(iter_outputs,grpo_step=step,used_items=used_items,
         wall_time_s=_cumulative_wall_time(),draft_updates_cumulative=draft_step)
@@ -1247,6 +1276,8 @@ import signal
 _previous_sigterm_handler=signal.getsignal(signal.SIGTERM)
 def _flush_rollout_sigterm(signum,frame):
     rollout_metrics.flush()
+    if rebuttal is not None:
+        rebuttal.flush()
     if callable(_previous_sigterm_handler):
         _previous_sigterm_handler(signum,frame)
     raise SystemExit(128+signum)
@@ -1280,7 +1311,7 @@ for epoch in epoch_bar:
         if ((args.max_target_optimizer_steps > 0 and batch_data.get('target_optimizer_steps',0) >= args.max_target_optimizer_steps)
                 or (local_prompt_budget > 0 and batch_data.get('rollout_prompts_seen',0) >= local_prompt_budget)):
             stop_requested=True
-            save_training_checkpoint(checkpoint_dir,model=model,optimizer_target=optimizer_target,
+            checkpoint_writer(checkpoint_dir,model=model,optimizer_target=optimizer_target,
                 optimizer_draft=optimizer_draft,epoch=epoch,next_batch=i,step=step,used_items=used_items,
                 draft_step=draft_step,draft_accumulated_step=draft_accumulated_step,batch_data=batch_data,
                 keep_last=keep_last_checkpoints,cumulative_elapsed_time_s=_cumulative_wall_time())
@@ -1291,9 +1322,12 @@ for epoch in epoch_bar:
 
         iter_outputs=None
         iteration_checkpoint=False
+        rebuttal_row = None
+        rebuttal_target_s = rebuttal_draft_s = 0.
+        rebuttal_start = rebuttal.wall() if rebuttal is not None else None
         rollout_metrics.begin(epoch+1,i,len(batch['answers']),used_items)
         try:
-            if batch['input_ids'].shape[-1]>=max_length:
+            if not max_response_tokens and batch['input_ids'].shape[-1]>=max_length:
                 batch=[]
                 batch_bar.set_postfix(phase="skip_prompt_len", step=step, refresh=False)
                 continue
@@ -1337,7 +1371,8 @@ for epoch in epoch_bar:
                 min_draft_token_length=min_draft_token_length,
                 draft_token_length_c=draft_token_length_c,
                 return_all_draft_input=True,statistical_time=statistical_time,
-                **opd_kwargs)
+                max_response_tokens=max_response_tokens, generation_profile=args.generation_profile,
+                round_log_frequency=args.round_log_frequency, **opd_kwargs)
             iter_outputs=rollout_metrics.capture(outputs)
             effective_opd_backend = outputs.get('opd_backend', 'off')
             if _as_bool(args.opd_diagnostics) and is_main_process:
@@ -1358,9 +1393,9 @@ for epoch in epoch_bar:
             outputs['decoded_sequences']=[tokenizer.decode(x,skip_special_tokens=True) for x in outputs['generated_token_ids']]
             token_ids_length = [len(item) for item in outputs['generated_token_ids'] ]
             total_rollout_tokens = int(sum(token_ids_length))
-            length_stdev = stdev(token_ids_length)
+            length_stdev = stdev(token_ids_length) if len(token_ids_length) > 1 else 0.
             length_range = max(token_ids_length) - min(token_ids_length)
-            length_cv = length_stdev / mean(token_ids_length)
+            length_cv = length_stdev / max(mean(token_ids_length), 1e-12)
             length_ave = mean(token_ids_length)
             batch_data['generate_length_list'].extend(token_ids_length)
             batch_data['total_rollout_tokens']+=total_rollout_tokens
@@ -1421,15 +1456,22 @@ for epoch in epoch_bar:
                 # Reuse the host duration already recorded by the phase timer;
                 # do not resolve/read its CUDA events for iteration logging.
                 iter_outputs['iter_draft_train_time_s']=phase_timings.pending[-1][1]
+                if rebuttal is not None:
+                    rebuttal_draft_s = phase_seconds(phase_timings.pending[-1])
 
             if draft_step % 1024 == 0 and step > 0 and is_train_draft:
                 with open(f"{saved_statistics_dir}/{step}.pkl","wb") as f:
                     pickle.dump(batch_data['generate_length_list'],f)
 
             generate_length=0
+            reward_groups = []
+            exact_token_rows = []
+            prompt_rows = ([row[mask.bool()].tolist() for row, mask in zip(input_ids, attention_mask)]
+                           if max_response_tokens else None)
             for idx_batch in range(len(answers)):
                 generate_length += outputs['max_sequence_length']
                 rewards=[]
+                reward_components=[]
                 new_messages=[]
                 for idx_k in range(repeated_generate_nums):
                     idx_sequence=idx_batch*repeated_generate_nums+idx_k
@@ -1447,11 +1489,16 @@ for epoch in epoch_bar:
                     reward=0.2*format_reward[0]+answer_reward[0]
 
                     rewards.append(reward)
+                    if rebuttal is not None:
+                        reward_components.append((reward, answer_reward[0], format_reward[0]))
                     new_messages.append(new_message)
 
 
                 rewards=np.array(rewards)
-                if rewards.std()==0:
+                eligible = bool(rewards.std() != 0)
+                if rebuttal is not None:
+                    reward_groups.append((reward_components, eligible))
+                if not eligible:
 
                     if rewards[0]>=1.0:
                         batch_data['ignore_due_correct']+=1
@@ -1463,7 +1510,15 @@ for epoch in epoch_bar:
                 std_rewards=(rewards-rewards.mean())/rewards.std()
                 append_response_group(batch_data, new_messages, rewards.tolist(),
                                       std_rewards.tolist(), (rank, epoch, i, idx_batch))
+                if max_response_tokens:
+                    prompt = prompt_rows[idx_batch]
+                    for row in outputs['generated_token_ids'][idx_batch*repeated_generate_nums:(idx_batch+1)*repeated_generate_nums]:
+                        exact_token_rows.append((prompt + row, [0]*(len(prompt)-1) + [1]*len(row) + [0]))
                 used_items+=1
+
+            if rebuttal is not None:
+                rebuttal_row = rebuttal.observe(outputs, reward_groups, outputs['prompt_token_lengths'],
+                    token_ids_length, tokenizer.eos_token_id, rebuttal_draft_s)
 
             generate_length /= len(answers)
 
@@ -1555,18 +1610,22 @@ for epoch in epoch_bar:
             if not all_ranks_ready:
                 continue
 
-            text=tokenizer.apply_chat_template(batch_data['messages'],tokenize=False,add_generation_prompt=False)
-            text=tokenizer(text,padding=False)
-            loss_mask=[]
+            if max_response_tokens:
+                input_ids, loss_mask = map(list, zip(*exact_token_rows))
+                attention_mask = [[1] * len(row) for row in input_ids]
+            else:
+                text=tokenizer.apply_chat_template(batch_data['messages'],tokenize=False,add_generation_prompt=False)
+                text=tokenizer(text,padding=False)
+                loss_mask=[]
 
-            for idx_message, message in enumerate(batch_data['messages']):
-                prompt_text=tokenizer.apply_chat_template(message[:-1],tokenize=False,add_generation_prompt=True)
-                prompt_text=tokenizer.encode(prompt_text)
-                cur_loss_mask=[0]*(len(prompt_text)-1)+[1]*(len(text.input_ids[idx_message])-len(prompt_text)+1)
-                loss_mask.append(cur_loss_mask)
+                for idx_message, message in enumerate(batch_data['messages']):
+                    prompt_text=tokenizer.apply_chat_template(message[:-1],tokenize=False,add_generation_prompt=True)
+                    prompt_text=tokenizer.encode(prompt_text)
+                    cur_loss_mask=[0]*(len(prompt_text)-1)+[1]*(len(text.input_ids[idx_message])-len(prompt_text)+1)
+                    loss_mask.append(cur_loss_mask)
 
-            input_ids=text.input_ids
-            attention_mask=text.attention_mask
+                input_ids=text.input_ids
+                attention_mask=text.attention_mask
 
             input_ids, attention_mask, loss_mask = sort_training_rows(
                 input_ids, attention_mask, loss_mask, batch_data)
@@ -1592,6 +1651,7 @@ for epoch in epoch_bar:
                     torch.cuda.synchronize()
                 train_time_start=time.time()
                 target_phase_ticket = phase_timings.begin('target')
+                loss_before_update = batch_data['target_loss_sum']
 
                 cur_max_length=0
                 device=model.target_model.device
@@ -1647,6 +1707,7 @@ for epoch in epoch_bar:
                             old_logps=old_logps,
                             ref_logps=ref_logps,
                             chunk_size=logps_chunk_size,
+                            chunked=bool(max_response_tokens),
                             loss_scale=1.0 / max(len(batch_data['messages']), 1),
                         )
                         batch_data['target_loss_sum'] += float(loss)
@@ -1696,6 +1757,7 @@ for epoch in epoch_bar:
                     old_logps=old_logps,
                     ref_logps=ref_logps,
                     chunk_size=logps_chunk_size,
+                    chunked=bool(max_response_tokens),
                     loss_scale=1.0 / max(len(batch_data['messages']), 1),
                 )
                 batch_data['target_loss_sum'] += float(loss)
@@ -1715,6 +1777,17 @@ for epoch in epoch_bar:
                 phase_timings.end(target_phase_ticket)
                 iter_outputs['iter_target_train_time_s']=(
                     iter_outputs.get('iter_target_train_time_s',0.)+phase_timings.pending[-1][1])
+                if rebuttal is not None:
+                    target_s = phase_seconds(phase_timings.pending[-1])
+                    rebuttal_target_s += target_s
+                    actual_updates = batch_data['target_optimizer_steps']
+                    row_count = len(batch_data['rewards'])
+                    rebuttal.optimizer_update(actual_updates, draft_step, target_s,
+                        (batch_data['target_loss_sum'] - loss_before_update) / row_count,
+                        (iter_outputs.get('iter_draft_feature_loss'), iter_outputs.get('iter_draft_distribution_loss')),
+                        optimizer_target, optimizer_draft, sum(batch_data['rewards']) / row_count)
+                    if args.eval_interval_updates and actual_updates % args.eval_interval_updates == 0:
+                        rebuttal.snapshot(model.target_model, actual_updates, 'intermediate')
 
                 if (
                     analysis_enabled
@@ -2057,8 +2130,12 @@ for epoch in epoch_bar:
             batch_ref_logps.clear()
 
             if is_main_process and step%500==0 and step!=0:
-                model.save_model(f"{saved_draft_model_dir}/step{step}.pth")
-                model.target_model.save_pretrained(f'{saved_model_dir}/step{step}')
+                if rebuttal is not None:
+                    rebuttal.timed_io(model.save_model, f"{saved_draft_model_dir}/step{step}.pth")
+                    rebuttal.timed_io(model.target_model.save_pretrained, f'{saved_model_dir}/step{step}')
+                else:
+                    model.save_model(f"{saved_draft_model_dir}/step{step}.pth")
+                    model.target_model.save_pretrained(f'{saved_model_dir}/step{step}')
 
             if (
                 save_checkpoint_steps > 0
@@ -2069,7 +2146,7 @@ for epoch in epoch_bar:
                 batch_data['_rollout_metrics_state']=rollout_metrics.next_state(iter_outputs)
                 iteration_checkpoint=True
                 rollout_metrics.flush()
-                save_training_checkpoint(
+                checkpoint_writer(
                     checkpoint_dir,
                     model=model,
                     optimizer_target=optimizer_target,
@@ -2095,7 +2172,7 @@ for epoch in epoch_bar:
                     batch_data['_rollout_metrics_state']=rollout_metrics.next_state(iter_outputs)
                     iteration_checkpoint=True
                     rollout_metrics.flush()
-                    save_training_checkpoint(
+                    checkpoint_writer(
                         checkpoint_dir,
                         model=model,
                         optimizer_target=optimizer_target,
@@ -2123,6 +2200,9 @@ for epoch in epoch_bar:
                 break
 
         finally:
+            if rebuttal is not None and rebuttal_row is not None:
+                rebuttal.finish_rollout(rebuttal_row, batch_data.get('target_optimizer_steps', 0),
+                    draft_step, rebuttal_target_s, rebuttal_start)
             finish_rollout_iteration()
             if iteration_checkpoint or sys.exc_info()[0] is not None:
                 rollout_metrics.flush()
@@ -2131,6 +2211,7 @@ for epoch in epoch_bar:
         break
 
 
+training_wall_without_io = rebuttal.wall() if rebuttal is not None else None
 rollout_metrics.close()
 signal.signal(signal.SIGTERM,_previous_sigterm_handler)
 
@@ -2152,10 +2233,16 @@ if step_metrics.pending is not None:
 step_metrics.flush()
 batch_data['_step_metrics_state'] = step_metrics.state_dict()
 if is_main_process:
-    model.save_model(f"{saved_draft_model_dir}/step{step}.pth")
-    model.target_model.save_pretrained(f'{saved_model_dir}/step{step}')
+    if rebuttal is not None:
+        rebuttal.snapshot(model.target_model, batch_data.get('target_optimizer_steps', 0), 'final',
+                          wall=training_wall_without_io)
+        rebuttal.timed_io(model.save_model, f"{saved_draft_model_dir}/step{step}.pth")
+        rebuttal.timed_io(model.target_model.save_pretrained, f'{saved_model_dir}/step{step}')
+    else:
+        model.save_model(f"{saved_draft_model_dir}/step{step}.pth")
+        model.target_model.save_pretrained(f'{saved_model_dir}/step{step}')
 if checkpoint_dir and not stop_requested:
-    save_training_checkpoint(
+    checkpoint_writer(
         checkpoint_dir,
         model=model,
         optimizer_target=optimizer_target,
@@ -2276,6 +2363,8 @@ summary.update(initialization=initialization_proof,grpo_alignment_version=GRPO_A
     rollout_prompts_seen=batch_data.get('rollout_prompts_seen',0),
     prompt_order_sha256=batch_data.get('prompt_order_sha256'),
     optimizer_step_cadence=batch_data.get('optimizer_step_cadence',[]))
+if rebuttal is not None:
+    summary.update(rebuttal.finish(training_wall_without_io), actual_draft_optimizer_steps=draft_step)
 summary_text = json.dumps(summary, indent=2, ensure_ascii=True)
 if is_main_process:
     with open(summary_file, "w", encoding="utf-8") as f:

@@ -1,3 +1,4 @@
+from helper.generation_telemetry import GenerationTelemetry, response_limit, validate_response_context
 import pandas as pd
 from transformers import AutoTokenizer, AutoProcessor,AutoConfig,AutoModelForCausalLM
 import torch
@@ -139,9 +140,14 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
                         max_draft_token_length=5, max_draft_k=8, max_verification_num=160,
                         min_draft_token_length=3, draft_token_length_c=0.75,
                         statistical_time=True,return_all_draft_input=False,
-                        max_length=2048
+                        max_length=2048, max_response_tokens=None, generation_profile="off", round_log_frequency=0
                         ):
 
+
+    max_response_tokens = response_limit(max_response_tokens)
+    validate_response_context(model, input_ids.shape[-1], max_response_tokens, max_draft_token_length)
+    telemetry = GenerationTelemetry(generation_profile, model.target_model.device,
+                                    repeated_generate_nums, round_log_frequency)
 
     class Node:
         
@@ -231,17 +237,20 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
             if isinstance(padding_positions_tensor, torch.Tensor):
                 draft_attention_mask[padding_positions_tensor[:, 0], 0, :, padding_positions_tensor[:, 1]] = min_dtype
 
-            torch.cuda.synchronize()
-            check_time_start=time.time()
+            if statistical_time or not telemetry.enabled:
+                torch.cuda.synchronize()
+                check_time_start=time.time()
             
             draft_outputs=model(hidden_states=next_feature_states,input_ids=draft_next_token,
                                 attention_mask=draft_attention_mask,use_cache=True,
                                 past_key_values=draft_past_key_values_tree,position_ids=draft_position_ids)
             
-            torch.cuda.synchronize()
-            total_check_time+=time.time()-check_time_start
+            if statistical_time or not telemetry.enabled:
+                torch.cuda.synchronize()
+                total_check_time+=time.time()-check_time_start
             
             draft_past_key_values_tree=draft_outputs['past_key_values']
+            telemetry.observe_cache('draft', draft_past_key_values_tree)
             draft_hidden_states=draft_outputs['hidden_states']
             next_feature_states=draft_outputs['next_feature_states'] # (bsz, seq, hidden_size)
             
@@ -414,6 +423,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
 
     torch.cuda.synchronize()
     start_time=time.time()
+    telemetry.started = time.perf_counter()
     target_past_key_values=DynamicCache()
     avg_acc_length=[0,0]
     verification_batches = verified_tree_nodes = proposed_tokens = 0
@@ -427,6 +437,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
     transfer_stream = torch.cuda.Stream(device)
     executor = ThreadPoolExecutor(max_workers=64)
 
+    prefill_ticket = telemetry.begin("prefill")
     prefill_time_start=time.time()
     target_time_start=time.time()
     
@@ -437,8 +448,11 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
     all_draft_input_states=None
     all_draft_input_ids=None
 
+    if telemetry.enabled or max_response_tokens:
+        attention_mask = attention_mask.cpu()
     position_ids=[torch.sum(item) for item in attention_mask]
     past_position_ids=[item.item()-1 for item in position_ids]
+    prompt_lengths = [position + 1 for position in past_position_ids]
 
     position_ids=[torch.concat(
         [torch.zeros((input_ids.shape[-1]-item)),torch.arange(0,item)],dim=-1)
@@ -474,6 +488,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
         torch.cuda.synchronize()
         total_target_time+=time.time()-target_time_start
             
+    sample_ticket = telemetry.begin("target_sampling")
     if do_sample==False:
         target_next_token=target_logits.softmax(dim=-1).argmax(-1)
     elif do_sample==True:
@@ -481,7 +496,9 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
     else:
         raise ValueError('"do_sample" must be True or False')
     
+    telemetry.end(sample_ticket)
     generated_sequences=target_next_token
+    prefill_eos = (target_next_token[:, 0].eq(eos_token_id).tolist() if max_response_tokens else None)
     
     draft_input_ids=torch.concat([input_ids[:,1:],target_next_token],dim=-1)
     draft_attention_mask=attention_mask.to(model.dtype)
@@ -565,7 +582,13 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
     draft_input_ids_dict={}
     generated_sequences_dict={}
     padding_positions_dict={}
-    residual_index=[_ for _ in range(bsz)]
+    residual_index=list(range(bsz))
+    if max_response_tokens:
+        end_sig = [int(eos or max_response_tokens == 1) for eos in prefill_eos
+                   for _ in range(repeated_generate_nums or 1)]
+    telemetry.observe_cache("target", target_past_key_values)
+    telemetry.observe_cache("draft", draft_past_key_values)
+    telemetry.end(prefill_ticket)
         
 
     if statistical_time:
@@ -576,10 +599,12 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
                         dtype=torch.bfloat16 if model.dtype==torch.bfloat16 else torch.float16):
     
         
+        proposal_ticket = telemetry.begin("draft_proposal")
         outputs=draft_generate(model,next_feature_states,draft_hidden_states,draft_past_key_values,
                             draft_token_length,past_position_ids_tensor,padding_positions_tensor,
                             draft_k=draft_k, draft_total_token=draft_total_token)
         
+        telemetry.end(proposal_ticket)
         draft_trees=outputs['trees']
         trees_chosen_index=outputs['trees_chosen_index']
         next_token_trees=outputs['next_token_trees']
@@ -591,7 +616,11 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
 
     total_prefill_time=time.time()-prefill_time_start
 
-    for token_num in range(1,max_length):
+    token_num = 1
+    for token_num in range(1, max_response_tokens or max_length):
+        if max_response_tokens and all(end_sig):
+            break
+        tree_ticket = telemetry.begin("tree_attention_mask")
         
         past_kv_len=target_past_key_values.get_seq_length()
         kv_length=past_kv_len+draft_total_token+1
@@ -638,7 +667,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
                 indices.append([idx_tree, cur_index, node.target_index])
                         
         if indices:
-            indices=torch.tensor(indices, dtype=torch.int16).to(device).long()
+            indices=torch.tensor(indices, dtype=torch.long if max_response_tokens else torch.int16).to(device).long()
             target_attention_mask[indices[:, 0], 0, indices[:, 1], indices[:, 2]] = 0
             
         if isinstance(padding_positions_tensor, torch.Tensor):
@@ -656,12 +685,16 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
                         
             return trees
         
+        telemetry.end(tree_ticket)
+        if telemetry.enabled or max_response_tokens:
+            transfer_stream.wait_stream(torch.cuda.current_stream(device))
         transfer_thread = executor.submit(transfer_input_ids, target_trees, trees_chosen_index, device, transfer_stream)
 
         if statistical_time:
             torch.cuda.synchronize()
             target_time_start=time.time()
 
+        verify_ticket = telemetry.begin("target_verification")
         with torch.amp.autocast(str(model.target_model.device),
                             dtype=torch.bfloat16 if model.dtype==torch.bfloat16 else torch.float16):
             
@@ -671,6 +704,9 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
             feature_states_tree=target_outputs['last_hidden_state']
             target_outputs_logits=model.target_model.lm_head(feature_states_tree)
             
+            telemetry.end(verify_ticket)
+            telemetry.observe_cache("target", target_past_key_values)
+            sample_ticket = telemetry.begin("target_sampling")
             if do_sample==False:
                 target_next_token_tree=target_outputs_logits.softmax(-1).argmax(-1)
             elif do_sample==True:
@@ -682,6 +718,8 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
             torch.cuda.synchronize()
             total_target_time+=time.time()-target_time_start
         
+        telemetry.end(sample_ticket)
+        trace_ticket = telemetry.begin("verified_path_tracing")
         target_trees=transfer_thread.result()
 
         acc_length=[0]*bsz
@@ -726,6 +764,12 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
                                     break
                         break
 
+                if max_response_tokens:
+                    remaining = max_response_tokens - 1 - response_accepted_length_sum[residual_index[idx_tree]]
+                    cur_acc_length = min(cur_acc_length, remaining)
+                    cur_next_token = cur_next_token[:cur_acc_length]
+                    cur_chosen_index = cur_chosen_index[:cur_acc_length]
+                    end_sig[idx_tree] = int(cur_acc_length == remaining)
                 acc_length[idx_tree]=cur_acc_length
                 next_token[idx_tree]=cur_next_token
                 chosen_index[idx_tree]=cur_chosen_index
@@ -748,6 +792,12 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
             else:
                 acc_length[idx_tree]=0
 
+        telemetry.end(trace_ticket)
+        telemetry.round(verification_batches, residual_index, prompt_lengths,
+                        response_accepted_length_sum, acc_length, end_sig, draft_total_token,
+                        draft_token_length, draft_k,
+                        max_budget=max(1, min(verification_capacity // bsz, max_verification_num)))
+        scheduling_ticket = telemetry.begin("scheduling_batching")
         max_acc_length=max(acc_length)
         last_valid_index=[max_acc_length-1]*bsz 
 
@@ -822,13 +872,15 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
             
         generated_sequences=torch.concat([generated_sequences,next_token],dim=-1)
         
+        telemetry.end(scheduling_ticket)
         if 0 not in end_sig:
             break
         real_sequences_length=max([len(item1)+input_ids.shape[-1]-len(item2) for item1,item2 in zip(generated_sequences, padding_positions)])
         
-        if real_sequences_length>=max_length:
+        if not max_response_tokens and real_sequences_length>=max_length:
             break
         
+        cache_ticket = telemetry.begin("kv_cache_management")
         idx_batch=0
         while idx_batch < bsz:
             
@@ -953,6 +1005,8 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
                 target_past_key_values.key_cache[idx_L] = new_key[idx_L]
                 target_past_key_values.value_cache[idx_L] = new_value[idx_L]
                 
+        telemetry.end(cache_ticket)
+        tree_ticket = telemetry.begin("tree_attention_mask")
         draft_attention_mask=get_attention_mask(draft_past_key_values[0][0].shape[-2], max_acc_length,
                                                 model.dtype, bsz, padding_positions=padding_positions_tensor)
         draft_position_ids=[[] for _ in range(bsz)]
@@ -976,6 +1030,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
             
         draft_position_ids=torch.tensor(draft_position_ids, dtype=torch.int16).to(device).long()
         past_position_ids_tensor=draft_position_ids[:, -1]
+        telemetry.end(tree_ticket)
         
         if statistical_time:
             torch.cuda.synchronize()
@@ -988,6 +1043,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
                 torch.cuda.synchronize()
                 check_time_start=time.time()
 
+            advance_ticket = telemetry.begin("draft_advance")
             draft_outputs=model(hidden_states=feature_states.to(model.dtype),input_ids=next_token,
                         attention_mask=draft_attention_mask,use_cache=True,
                         position_ids=draft_position_ids,past_key_values=draft_past_key_values)
@@ -998,15 +1054,19 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
 
             draft_past_key_values=draft_outputs['past_key_values']
             
+            telemetry.end(advance_ticket)
             B, S, D =draft_outputs['hidden_states'].shape
             last_valid_index=last_valid_index.unsqueeze(-1).expand(-1,-1,D) # [bsz, 1] -> [bsz, 1, D]
             draft_hidden_states=draft_outputs['hidden_states'].gather(index=last_valid_index, dim=1)
             next_feature_states=draft_outputs['next_feature_states'].gather(index=last_valid_index, dim=1)
 
+            telemetry.observe_cache("draft", draft_past_key_values)
+            proposal_ticket = telemetry.begin("draft_proposal")
             outputs=draft_generate(model, next_feature_states, draft_hidden_states, draft_past_key_values,
                                 draft_token_length, past_position_ids_tensor, padding_positions_tensor,
                                 draft_k=draft_k, draft_total_token=draft_total_token)
             
+            telemetry.end(proposal_ticket)
             draft_trees=outputs['trees']
             trees_chosen_index=outputs['trees_chosen_index']
             next_token_trees=outputs['next_token_trees']
@@ -1017,6 +1077,8 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
             total_draft_time+=time.time()-draft_time_start
             
             
+    other_ticket = telemetry.begin("other_generation_overhead")
+    executor.shutdown()
     post_time_start=time.time()
             
     for idx_batch in range(bsz):
@@ -1088,7 +1150,8 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
         filtered_generated_token_ids.append(sequence_without_padding)
         max_sequence_length=max(max_sequence_length,len(sequence_without_padding))
 
-    return {
+    telemetry.end(other_ticket)
+    result = {
         'response_accepted_length_sum': response_accepted_length_sum,
         'response_verification_rounds': response_verification_rounds,
         'response_generated_tokens': [len(row) for row in filtered_generated_token_ids],
@@ -1113,4 +1176,4 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
         'all_draft_input_states':all_draft_input_states,
         'all_draft_input_ids':all_draft_input_ids
     }
-    
+    return telemetry.finish(result, prompt_lengths=prompt_lengths)

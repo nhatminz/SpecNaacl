@@ -5,13 +5,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # All experiment knobs are overrideable here or as environment variables.
-TARGET_MODEL_PATH="${TARGET_MODEL_PATH:-/workspace/storage-shared/models/Qwen2.5-7B-Instruct}"
+TARGET_MODEL_PATH="${TARGET_MODEL_PATH:-${MODEL_ROOT:-/workspace/storage-shared/models}/Qwen2.5-7B-Instruct}"
 TARGET_ADAPTER_PATH="${TARGET_ADAPTER_PATH:-}"
 TARGET_RESUME_CHECKPOINT="${TARGET_RESUME_CHECKPOINT:-}"
 DRAFT_CHECKPOINT="${DRAFT_CHECKPOINT:-}"
 DRAFT_INITIALIZATION_MODE="${DRAFT_INITIALIZATION_MODE:-pretrained}" # pretrained|random (explicit)
 
-DATASET_PATH="${DATASET_PATH:-$WORKSPACE/data/gsm8k/main}"
+DATASET_PATH="${DATASET_PATH:-$DATA_ROOT/gsm8k/main}"
 EVAL_DATASET_PATH="${EVAL_DATASET_PATH:-}"
 TRAIN_SPLIT="${TRAIN_SPLIT:-train}"
 EVAL_SPLIT="${EVAL_SPLIT:-test}"
@@ -44,6 +44,7 @@ MASTER_PORT="${MASTER_PORT:-29500}"
 MODEL_DTYPE="${MODEL_DTYPE:-bf16}"
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-eager}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+DATA_ROOT="${DATA_ROOT:-/workspace/storage-shared/nlp/users/minhpn19/data}"
 
 # Existing FastGRPO concurrency-aware scheduler defaults.
 VERIFICATION_CAPACITY="${VERIFICATION_CAPACITY:-512}"

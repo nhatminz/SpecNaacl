@@ -604,6 +604,8 @@ def feedback(state,tree,path,target,greedy=False,sampling_metadata=None):
         draft_p,row_map,*strides,q,state.cache_contexts,state.vocab,k,10,
         triton.next_power_of_2(2*k),greedy,compact,row_map is not None,num_warps=4,enable_fp_fusion=False)
     _reduce[(10,)](state.state_stats,state.round_weight,state.counters,n,10,triton.next_power_of_2(n),num_warps=4)
+    state.end(ticket)
+    ticket=state.begin("opd_projector_grad_ms") if state.train_projector else None
     if state.train_projector and state._ever_updated:
         # B is STILL frozen B_t. No per-round backward/optimizer/DDP sync.
         h=state.head.weight.shape[1]

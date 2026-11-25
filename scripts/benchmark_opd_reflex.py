@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Frozen-checkpoint end-to-end OPD sweep. Never train policy/draft or fake AAL."""
 import argparse
-import ast
 import csv
 import hashlib
 import json
@@ -48,10 +47,8 @@ def parse_args(argv=None):
 
 
 def collator(tokenizer,max_prompt_length):
-    source=ROOT/'grpo_speculative.py'
-    node=next(n for n in ast.parse(source.read_text()).body if isinstance(n,ast.ClassDef) and n.name=='TrainDataCollator')
-    scope={};exec(compile(ast.Module(body=[node],type_ignores=[]),str(source),'exec'),scope)
-    return scope['TrainDataCollator'](tokenizer,max_prompt_length)
+    from helper.train_prompts import TrainDataCollator
+    return TrainDataCollator(tokenizer, max_prompt_length)
 
 
 def release_runtime_cache(model):
@@ -270,6 +267,9 @@ def benchmark(args):
 
 
 def main():
+    if sys.argv[1:2] == ['rebuttal']:
+        from scripts.benchmark_rebuttal import main as rebuttal_main
+        return rebuttal_main(sys.argv[2:])
     args=parse_args()
     if args.dry_run:print(json.dumps(vars(args),indent=2));return
     output=Path(args.output)

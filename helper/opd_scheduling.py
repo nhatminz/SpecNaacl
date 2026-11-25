@@ -27,7 +27,7 @@ def schedule(path,past,eos,workspace,packet,kernels=None,opd=None):
     row_extensions=(indices==torch.arange(width)[None,:]+past).long().cumprod(1).sum(1).tolist()
     rows=[]
     for i,length in enumerate(lengths):
-        rows.append([length,int(tokens[i,last[i,0]]==eos),row_extensions[i],
+        rows.append([length,int(length == 0 or tokens[i,last[i,0]]==eos),row_extensions[i],
                      *torch.where(mask[i],indices[i],-1).tolist()])
     return rows,tokens,indices,mask,last,width
 

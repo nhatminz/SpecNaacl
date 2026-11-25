@@ -3,7 +3,7 @@ set -euo pipefail
 # Paired launcher: all defaults are identical except METHOD / Reflex.
 export MODEL_KEY="llama31_8b"
 export METHOD="fastgrpo"
-export MODEL="${MODEL:-/workspace/storage-shared/models/Llama-3.1-8B-Instruct}"
+export MODEL="${MODEL:-${MODEL_ROOT:-/workspace/storage-shared/models}/Llama-3.1-8B-Instruct}"
 export DATASET="${DATASET:-simplelr}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export NPROC_PER_NODE="${NPROC_PER_NODE:-1}"

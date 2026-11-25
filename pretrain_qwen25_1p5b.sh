@@ -2,7 +2,7 @@
 set -euo pipefail
 
 MODEL_KEY="qwen25_1p5b"
-MODEL="${MODEL:-/workspace/storage-shared/models/Qwen2.5-1.5B-Instruct}"
+MODEL="${MODEL:-${MODEL_ROOT:-/workspace/storage-shared/models}/Qwen2.5-1.5B-Instruct}"
 PRETRAIN_DATASET="${PRETRAIN_DATASET:-sharegpt}"; PRETRAIN_LR="${PRETRAIN_LR:-5e-5}"
 PRETRAIN_BATCH_SIZE="${PRETRAIN_BATCH_SIZE:-16}"; PRETRAIN_MAX_LENGTH="${PRETRAIN_MAX_LENGTH:-2048}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-1}"

@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE="$(cd "$SCRIPT_DIR/.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+DATA_ROOT="${DATA_ROOT:-/workspace/storage-shared/nlp/users/minhpn19/data}"
 
 MODEL_KEY="${MODEL_KEY:-qwen25_3b}"
 GLOBAL_LATEST_RUN="$SCRIPT_DIR/outputs/pretrain/$MODEL_KEY/latest_run"
@@ -19,7 +20,7 @@ print(json.load(open(sys.argv[1], encoding='utf-8'))['target_model_path'])
 PY
 )"
 fi
-TARGET_MODEL_PATH="${TARGET_MODEL_PATH:-/workspace/storage-shared/models/Qwen2.5-3B-Instruct}"
+TARGET_MODEL_PATH="${TARGET_MODEL_PATH:-${MODEL_ROOT:-/workspace/storage-shared/models}/Qwen2.5-3B-Instruct}"
 MODEL_BASENAME="$(basename "${TARGET_MODEL_PATH%/}")"
 MODEL_SLUG="$(printf '%s' "$MODEL_BASENAME" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '_')"
 MODEL_SLUG="${MODEL_SLUG%_}"
@@ -37,7 +38,7 @@ if recorded != requested:
     raise SystemExit(f"pretrain target mismatch: checkpoint={recorded}, requested={requested}")
 PY
 fi
-DAPO_PARQUET="${DAPO_PARQUET:-$WORKSPACE/data/DAPO-Math-17k-Processed/en/train-00000-of-00001.parquet}"
+DAPO_PARQUET="${DAPO_PARQUET:-$DATA_ROOT/DAPO-Math-17k-Processed/en/train-00000-of-00001.parquet}"
 DAPO_SPLIT_DIR="${DAPO_SPLIT_DIR:-$SCRIPT_DIR/outputs/policy_lag/dapo_math_seed42}"
 DAPO_ANALYSIS_SAMPLES="${DAPO_ANALYSIS_SAMPLES:-5000}"
 DAPO_EVAL_SAMPLES="${DAPO_EVAL_SAMPLES:-512}"

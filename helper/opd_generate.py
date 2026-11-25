@@ -1,3 +1,4 @@
+from helper.generation_telemetry import GenerationTelemetry, cap_path, response_limit, storage_bytes, validate_response_context
 """GPU tensor implementation of the FastGRPO tree with ReflexOPD proposals."""
 import torch
 import math
@@ -77,7 +78,15 @@ def _cache_seq_length(cache):
     return int(key.shape[-2])
 
 @torch.inference_mode()
-def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=False, repeated_generate_nums=None, temperature=0.8, top_p=0.9, top_k=None, verification_capacity=160, max_draft_token_length=5, max_draft_k=8, max_verification_num=160, min_draft_token_length=3, draft_token_length_c=0.75, statistical_time=False, return_all_draft_input=False, max_length=2048, method='opd_reflex', opd_rank=8, opd_topk=16, opd_fast_lr=0.01, opd_visited_weight=1.0, opd_frontier_weight=1.0, opd_update_stream=True, opd_profile=False, opd_diagnostics=False, opd_backend='auto', opd_train_projector=False, kv_gather_strategy='stacked', opd_update_interval_rounds=1, opd_b_sharing_scope='rollout_batch', opd_b_reset_mode='rollout'):
+def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=False, repeated_generate_nums=None, temperature=0.8, top_p=0.9, top_k=None, verification_capacity=160, max_draft_token_length=5, max_draft_k=8, max_verification_num=160, min_draft_token_length=3, draft_token_length_c=0.75, statistical_time=False, return_all_draft_input=False, max_length=2048, method='opd_reflex', opd_rank=8, opd_topk=16, opd_fast_lr=0.01, opd_visited_weight=1.0, opd_frontier_weight=1.0, opd_update_stream=True, opd_profile=False, opd_diagnostics=False, opd_backend='auto', opd_train_projector=False, kv_gather_strategy='stacked', opd_update_interval_rounds=1, opd_b_sharing_scope='rollout_batch', opd_b_reset_mode='rollout', max_response_tokens=None, generation_profile="off", round_log_frequency=0):
+    max_response_tokens = response_limit(max_response_tokens)
+    validate_response_context(model, input_ids.shape[-1], max_response_tokens, max_draft_token_length)
+    telemetry = GenerationTelemetry(generation_profile, model.target_model.device,
+                                    repeated_generate_nums, round_log_frequency, spark=True)
+    if telemetry.detailed:
+        opd_profile = True
+    rounds_limit = max_response_tokens or max_length
+    context_capacity = input_ids.shape[-1] + max_response_tokens if max_response_tokens else max_length
     (method, _) = resolve_method(method)
     if method != 'opd_reflex':
         raise ValueError('use the upstream dispatcher for fastgrpo')
@@ -160,6 +169,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
                 torch.cuda.synchronize()
                 total_check_time += time.time() - check_time_start
             draft_past_key_values_tree = draft_outputs['past_key_values']
+            telemetry.observe_cache('draft', draft_past_key_values_tree)
             draft_hidden_states = draft_outputs['hidden_states']
             next_feature_states = draft_outputs['next_feature_states']
             context_ids = opd.tree_arange[1+(idx_token-1)*draft_k:1+idx_token*draft_k]
@@ -238,6 +248,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
     if statistical_time:
         torch.cuda.synchronize()
     start_time = time.perf_counter()
+    telemetry.started = start_time
     static_kv=True
     max_retained_tokens=int(os.environ.get('OPD_KV_MAX_RETAINED_TOKENS','0'))
     if max_retained_tokens<0:raise ValueError('OPD_KV_MAX_RETAINED_TOKENS must be nonnegative')
@@ -267,6 +278,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
     verification_batches = active_response_rounds = verified_tree_nodes = 0
     feedback_rounds = 0
     round_feedback_due = False
+    prefill_ticket = telemetry.begin("prefill")
     prefill_time_start = time.time()
     target_time_start = time.time()
     global total_target_time, total_draft_time, total_check_time
@@ -277,6 +289,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
     initial_padding=attention_mask.eq(0).to(device)
     position_ids = [torch.sum(item) for item in attention_mask]
     past_position_ids = [item.item() - 1 for item in position_ids]
+    prompt_lengths = [position + 1 for position in past_position_ids]
     position_ids = [torch.concat([torch.zeros(input_ids.shape[-1] - item, dtype=torch.long), torch.arange(0, item, dtype=torch.long)], dim=-1) for item in position_ids]
     position_ids = torch.stack(position_ids, dim=0)
     padding_positions = []
@@ -298,14 +311,17 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
     if statistical_time:
         torch.cuda.synchronize()
         total_target_time += time.time() - target_time_start
+    sample_ticket = telemetry.begin("target_sampling")
     (target_next_token, _, prefill_metadata) = sample_target_with_metadata(target_logits, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k, eos_token_id=eos_token_id)
+    telemetry.end(sample_ticket)
     del _, prefill_metadata, target_logits
+    prefill_eos = (target_next_token[:, 0].eq(eos_token_id).tolist() if max_response_tokens else None)
     draft_input_ids = torch.concat([input_ids[:, 1:], target_next_token], dim=-1)
     draft_attention_mask = attention_mask.to(model.dtype)
     initial_history = {'generated_ids': target_next_token}
     if return_all_draft_input:
         initial_history.update(features=feature_states, input_ids=draft_input_ids)
-    history = RolloutHistory(initial_history, repeats=max(1, repeated_generate_nums or 1), max_length=max_length + max_draft_token_length + 1)
+    history = RolloutHistory(initial_history, repeats=max(1, repeated_generate_nums or 1), max_length=context_capacity + max_draft_token_length + 1)
     del initial_history
     if statistical_time:
         torch.cuda.synchronize()
@@ -356,7 +372,13 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
     draft_input_ids_dict = {}
     generated_sequences_dict = {}
     padding_positions_dict = {}
-    residual_index = [_ for _ in range(bsz)]
+    residual_index = list(range(bsz))
+    if max_response_tokens:
+        end_sig = [int(eos or max_response_tokens == 1) for eos in prefill_eos
+                   for _ in range(repeated_generate_nums or 1)]
+    telemetry.observe_cache("target", target_past_key_values)
+    telemetry.observe_cache("draft", draft_past_key_values)
+    telemetry.end(prefill_ticket)
     response_accepted_length_sum = [0 for _ in range(bsz)]
     response_verification_rounds = [0 for _ in range(bsz)]
     vocabulary_ids = model.full_vocabulary_ids
@@ -374,7 +396,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
     opd.start(model, bsz, vocabulary_ids, draft_hidden_states.shape[-1], max_contexts=1 + max_draft_k * (max_draft_token_length - 1), max_nodes=max(verification_capacity+bsz,2*bsz), max_path=max_draft_token_length + 1, max_proposal_contexts=max_draft_k,
               prompt_groups=input_ids.shape[0],responses_per_prompt=repeated_generate_nums or 1)
     opd.async_updates=update_stream is not None
-    mask_columns_capacity = input_ids.shape[-1] + max_length * (max_draft_token_length + 1) + max_verification_num
+    mask_columns_capacity = input_ids.shape[-1] + rounds_limit * (max_draft_token_length + 1) + max_verification_num
     model._opd_initial_batch=bsz;model._opd_max_path_capacity=max_draft_token_length+1
     pad_capacity=mask_columns_capacity
     pad_mask=getattr(model,'_opd_padding_workspace',None)
@@ -391,7 +413,9 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
         torch.cuda.synchronize()
         draft_time_start = time.time()
     with torch.amp.autocast(str(model.target_model.device), dtype=torch.bfloat16 if model.dtype == torch.bfloat16 else torch.float16):
+        proposal_ticket = telemetry.begin("draft_proposal")
         outputs = draft_generate(model, next_feature_states, draft_hidden_states, draft_past_key_values, draft_token_length, past_position_ids_tensor, padding_positions_tensor, draft_k=draft_k, draft_total_token=draft_total_token)
+        telemetry.end(proposal_ticket)
         draft_trees = outputs['trees']
         trees_chosen_index = outputs['trees_chosen_index']
         next_token_trees = outputs['next_token_trees']
@@ -405,19 +429,39 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
     feedback_path=None
     def compact_teacher_metadata(tokens,probs,sorted_metadata):
         nonlocal path,feedback_path
+        trace_ticket = telemetry.begin("verified_path_tracing")
         feedback_path=trace_verified_path(feedback_tree,tokens,eos_token_id,kernels=opd._kernels,workspace=opd.path_workspace)
+        if max_response_tokens:
+            ordered_remaining = remaining if canonical_to_physical is None else remaining.index_select(0, canonical_to_physical)
+            cap_path(feedback_path, ordered_remaining)
+        telemetry.end(trace_ticket)
         path=feedback_path if physical_to_canonical is None else VerifiedPath(
             *[x.index_select(0,physical_to_canonical) for x in (feedback_path.tokens,feedback_path.packed_indices,feedback_path.feedback_contexts,feedback_path.lengths)])
         if round_feedback_due:
             return opd.prepare_compact_teacher(feedback_tree,feedback_path,probs if do_sample else tokens,sorted_metadata,greedy=not do_sample)
         return None
-    for token_num in range(1, max_length):
+    counter_indices = [OPD_COUNTER_NAMES.index(name) for name in ("opd_selected_states", "opd_updates")]
+    def apply_feedback(tree, path, teacher, metadata):
+        collect = telemetry.samples(verification_batches)
+        before = torch.stack([opd.counters[i] for i in counter_indices]) if collect else None
+        opd.feedback(tree, path, teacher, greedy=not do_sample, sampling_metadata=metadata)
+        return torch.stack([opd.counters[i] for i in counter_indices]) - before if collect else None
+
+    token_num = 1
+    for token_num in range(1, rounds_limit):
+        if max_response_tokens:
+            if all(end_sig):
+                break
+            host_remaining = [0 if end_sig[i] else max_response_tokens - 1 - response_accepted_length_sum[owner]
+                              for i, owner in enumerate(residual_index)]
+            remaining = torch.tensor(host_remaining, device=device)
+        tree_ticket = telemetry.begin("tree_attention_mask")
         past_kv_len = _cache_seq_length(target_past_key_values)
         kv_length = past_kv_len + draft_total_token + 1
         q_length = draft_total_token + 1
         verification_batches += 1
         round_feedback_due = feedback_due(verification_batches, opd_update_interval_rounds)
-        active_response_rounds += bsz
+        active_response_rounds += sum(not done for done in end_sig) if max_response_tokens else bsz
         verified_tree_nodes += bsz * q_length
         target_trees = draft_trees
         tree_inputs=attention_workspace.buffer('target_tokens',(bsz,q_length),torch.long)
@@ -436,11 +480,13 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
             target_attention_mask[indices[:, 0], 0, indices[:, 1], indices[:, 2]] = 0
         if isinstance(padding_positions_tensor, torch.Tensor):
             target_attention_mask.masked_fill_(padding_positions_tensor[:,None,None,:kv_length],min_dtype)
+        telemetry.end(tree_ticket)
         transfer_thread = None
         if statistical_time:
             torch.cuda.synchronize()
             target_time_start = time.time()
         with torch.amp.autocast(str(model.target_model.device), dtype=torch.bfloat16 if model.dtype == torch.bfloat16 else torch.float16):
+            verify_ticket = telemetry.begin("target_verification")
             target_outputs = model_forward(model.target_model, input_ids=next_token_trees, attention_mask=target_attention_mask, past_key_values=target_past_key_values, position_ids=target_position_ids)
             target_past_key_values = target_outputs['past_key_values']
             feature_states_tree = target_outputs['last_hidden_state']
@@ -450,18 +496,23 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
             # logits/probs. No additional head/transformer forward.
             head_input=target_hidden_states_tree if canonical_to_physical is None else target_hidden_states_tree.index_select(0,canonical_to_physical)
             target_outputs_logits = model.target_model.lm_head(head_input)
+            telemetry.end(verify_ticket)
+            telemetry.observe_cache("target", target_past_key_values)
             del head_input
             feedback_tree=tensor_tree if canonical_to_physical is None else PackedTree(
                 *[x.index_select(0,canonical_to_physical) for x in (tensor_tree.parents,tensor_tree.tokens,tensor_tree.feedback_contexts)],tensor_tree.max_depth)
             opd.feedback_row_map=canonical_to_physical
             path=None
+            sample_ticket = telemetry.begin("target_sampling")
             (target_next_token_tree, target_sampling_probs, sampling_metadata) = sample_target_with_metadata(target_outputs_logits, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k, eos_token_id=eos_token_id,metadata_builder=compact_teacher_metadata,return_probs=False)
+            telemetry.end(sample_ticket)
             del target_outputs_logits
         if statistical_time:
             torch.cuda.synchronize()
             total_target_time += time.time() - target_time_start
         if path is None:
             path = trace_verified_path(tensor_tree, target_next_token_tree, eos_token_id, kernels=opd._kernels, workspace=opd.path_workspace)
+        round_feedback = torch.zeros(2, device=device) if telemetry.samples(verification_batches) and not round_feedback_due else None
         if round_feedback_due:
             feedback_rounds += 1
             teacher = None # compact metadata owns every teacher coordinate needed
@@ -475,24 +526,31 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
                 if sampling_metadata is not None:
                     for shared in sampling_metadata:shared.record_stream(update_stream)
                 with torch.cuda.stream(update_stream):
-                    opd.feedback(feedback_tree, feedback_path, teacher, greedy=not do_sample,sampling_metadata=sampling_metadata)
+                    round_feedback = apply_feedback(feedback_tree, feedback_path, teacher, sampling_metadata)
                     update_done.record(update_stream)
                     if opd.carry_b:opd.model._opd_persistent_b['pending_event']=update_done
             else:
-                opd.feedback(feedback_tree, feedback_path, teacher, greedy=not do_sample,sampling_metadata=sampling_metadata)
+                round_feedback = apply_feedback(feedback_tree, feedback_path, teacher, sampling_metadata)
             # record_stream above keeps asynchronous readers safe. Drop this
             # alias too, otherwise previous-round full probs survive until the
             # NEXT sampler has already allocated its full-vocabulary arrays.
             del teacher
+        scheduling_ticket = telemetry.begin("scheduling_batching")
         scheduling_packet,next_token,chosen_index,newly_padded,last_valid_index,max_acc_length=schedule(
             path,past_kv_len,eos_token_id,opd.padded_path_workspace,opd.scheduling_packet,opd._kernels,opd=opd)
         acc_length=[row[0] for row in scheduling_packet]
         end_sig=[row[1] for row in scheduling_packet]
+        if max_response_tokens:
+            for row, limit in zip(scheduling_packet, host_remaining):
+                if row[0] == limit:
+                    row[1] = 1
+            end_sig = [row[1] for row in scheduling_packet]
+            last_valid_index = last_valid_index.clamp_min(0)
         for idx_tree,length in enumerate(acc_length):
             pad_counts[idx_tree]+=sum(index>=0 for index in scheduling_packet[idx_tree][3:])
             total_proposed_draft_tokens+=draft_total_token
             total_accepted_draft_tokens+=max(length-1,0)
-            avg_acc_length[0]+=length;avg_acc_length[1]+=1
+            avg_acc_length[0]+=length;avg_acc_length[1]+=int(length>0)
         output_columns=attention_workspace.positions('output_columns',past_kv_len,max_acc_length)
         pad_mask[owners[:,None],output_columns[None,:]]=newly_padded
         padding_positions_tensor[:,output_columns]=newly_padded
@@ -504,6 +562,10 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
                 original_index = residual_index[active_index]
                 response_accepted_length_sum[original_index] += int(accepted_length)
                 response_verification_rounds[original_index] += 1
+        telemetry.round(verification_batches, residual_index, prompt_lengths,
+                        response_accepted_length_sum, acc_length, end_sig, draft_total_token,
+                        draft_token_length, draft_k, round_feedback,
+                        max_budget=max(1, min(verification_capacity // bsz, max_verification_num)))
         feature_states_index = chosen_index - past_kv_len
         target_next_token = next_token.gather(index=last_valid_index, dim=-1)
         (B, T, D) = feature_states_tree.shape
@@ -518,13 +580,14 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
             history_chunk.update(features=feature_states, input_ids=next_token)
         history.append(residual_index, history_chunk, owners=owners)
         del history_chunk
+        telemetry.end(scheduling_ticket)
         finished_indices = [index for (index, finished) in enumerate(end_sig) if finished]
         if 0 not in end_sig:
             if update_stream is not None:
                 wait_for_opd_update()
             break
         real_sequences_length = max(history.lengths['generated_ids']+input_ids.shape[-1]-count for count in pad_counts)
-        if real_sequences_length >= max_length:
+        if not max_response_tokens and real_sequences_length >= max_length:
             if update_stream is not None:
                 wait_for_opd_update()
             break
@@ -595,18 +658,23 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
             if statistical_time:
                 torch.cuda.synchronize()
                 check_time_start = time.time()
+            advance_ticket = telemetry.begin("draft_advance")
             draft_outputs = model(hidden_states=feature_states.to(model.dtype), input_ids=next_token, attention_mask=draft_attention_mask, use_cache=True, position_ids=draft_position_ids, past_key_values=draft_past_key_values)
             if statistical_time:
                 torch.cuda.synchronize()
                 total_check_time += time.time() - check_time_start
             draft_past_key_values = draft_outputs['past_key_values']
+            telemetry.end(advance_ticket)
             (B, S, D) = draft_outputs['hidden_states'].shape
             last_valid_index = last_valid_index.unsqueeze(-1).expand(-1, -1, D)
             draft_hidden_states = draft_outputs['hidden_states'].gather(index=last_valid_index, dim=1)
             next_feature_states = draft_outputs['next_feature_states'].gather(index=last_valid_index, dim=1)
             if update_stream is not None:
                 wait_for_opd_update()
+            telemetry.observe_cache("draft", draft_past_key_values)
+            proposal_ticket = telemetry.begin("draft_proposal")
             outputs = draft_generate(model, next_feature_states, draft_hidden_states, draft_past_key_values, draft_token_length, past_position_ids_tensor, padding_positions_tensor, draft_k=draft_k, draft_total_token=draft_total_token)
+            telemetry.end(proposal_ticket)
             draft_trees = outputs['trees']
             trees_chosen_index = outputs['trees_chosen_index']
             next_token_trees = outputs['next_token_trees']
@@ -615,6 +683,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
         if statistical_time:
             torch.cuda.synchronize()
             total_draft_time += time.time() - draft_time_start
+    other_ticket = telemetry.begin("other_generation_overhead")
     post_time_start = time.time()
     padding_cpu=pad_mask[:,:max_recorded_pad_column].cpu()
     padding_positions_dict={str(row):set(torch.nonzero(mask,as_tuple=False).flatten().tolist())
@@ -673,6 +742,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
         filtered_generated_token_ids.append(sequence_without_padding)
         max_sequence_length = max(max_sequence_length, len(sequence_without_padding))
     draft_acceptance_rate = total_accepted_draft_tokens / max(total_proposed_draft_tokens, 1)
+    telemetry.end(other_ticket)
     opd_statistics = opd.finish()
     opd.clear()
     result = {'generated_token_ids': filtered_generated_token_ids, 'max_sequence_length': max_sequence_length, 'total_acc_length': avg_acc_length[0], 'total_acc': max_sequence_length / token_num, 'total_decoded_token_num': avg_acc_length[1], 'total_accepted_draft_tokens': total_accepted_draft_tokens, 'total_proposed_draft_tokens': total_proposed_draft_tokens, 'total_accepted_medusa_tokens': total_accepted_draft_tokens, 'total_proposed_medusa_tokens': total_proposed_draft_tokens, 'draft_acceptance_rate': draft_acceptance_rate, 'medusa_acceptance_rate': draft_acceptance_rate, 'total_time_cost': time.perf_counter() - start_time, 'target_time_cost': total_target_time, 'draft_time_cost': total_draft_time, 'check_time_cost': total_check_time, 'prefill_time_cost': total_prefill_time, 'post_time_cost': time.time() - post_time_start, 'all_draft_input_states': all_draft_input_states, 'all_draft_input_ids': all_draft_input_ids, 'response_accepted_length_sum': response_accepted_length_sum, 'response_verification_rounds': response_verification_rounds, 'response_generated_tokens': [len(item) for item in filtered_generated_token_ids], 'batch_verification_rounds': verification_batches, 'verification_batches': verification_batches, 'active_response_rounds': active_response_rounds, 'verified_tree_nodes': verified_tree_nodes}
@@ -680,6 +750,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
     result.update(opd_feedback_rounds=feedback_rounds,
                   opd_skipped_rounds=verification_batches-feedback_rounds)
     if not enabled:result.update({name:0. for name in OPD_COUNTER_NAMES})
+    result['opd_proposal_profile_effective']=opd.profile_path
     result['opd_host_syncs']=opd.host_sync_count
     result['opd_host_syncs_per_round']=opd.host_sync_count/max(verification_batches,1)
     if static_kv:
@@ -688,4 +759,24 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
             cache.end_rollout(max_retained_tokens)
     result['opd_attention_workspace_bytes']=attention_workspace.memory_bytes()+opd.attention_workspace.memory_bytes()
     result['total_time_cost']=time.perf_counter()-start_time
-    return result
+    memory = None
+    if telemetry.enabled:
+        matrices = opd.num_groups if opd.enabled else 0
+        workspace_names = (
+            'bitmap', 'active_ids', 'active_count', 'active_slots', 'dispatch_count', 'dispatch_snapshot',
+            'row_groups', 'group_first', 'proposal_u', 'proposal_q', 'proposal_ids', 'proposal_norm', 'sparse_scores',
+            'score_workspace', 'head_cache', 'u_cache', 'ids_cache', 'q_cache', 'norm_cache',
+            'selected_weights', 'selected_kind', 'selected_ids', 'selected_count', 'teacher_p',
+            'teacher_ids', 'teacher_mass', 'teacher_q', 'teacher_draft_p', 'union_ids', 'union_g',
+            'state_stats', 'round_weight', 'group_weight', 'counters', 'projector_head',
+            'projector_v', 'projector_delta',
+        )
+        workspace = [getattr(opd, name, None) for name in workspace_names]
+        workspace += opd.proposal_tiles + getattr(opd, 'teacher_tiles', [])
+        workspace += [getattr(model, name, None) for name in
+                      ('opd_projector_grad_sum', 'opd_projector_grad_weight')]
+        memory = dict(correction_matrix_bytes=storage_bytes([opd.B_fast]),
+                      correction_matrix_count=matrices, dense_fp32_correction_bytes=matrices*opd.vocab*opd.rank*4,
+                      projector_bytes=storage_bytes([getattr(opd, 'projector', None)]),
+                      correction_workspace_bytes=storage_bytes(workspace) if opd.enabled else 0)
+    return telemetry.finish(result, opd_memory=memory, prompt_lengths=prompt_lengths)
