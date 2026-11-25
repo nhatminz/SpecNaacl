@@ -22,48 +22,48 @@ ROOT = Path(__file__).resolve().parents[1]
 TRAIN_LAUNCHERS = sorted((ROOT / 'scripts/rebuttal').glob('train_qwen*.sh'))
 
 
+def launcher_command(script, **overrides):
+    env = dict(os.environ, DRY_RUN='true', DATASET='gsm8k', CUDA_VISIBLE_DEVICES='3',
+               NPROC_PER_NODE='1', TRAIN_SUBSET_SEED='42', RESUME='', RUN_NAME='', RUN_DIR='',
+               **overrides)
+    out = subprocess.check_output(['bash',str(script)], text=True, cwd=ROOT, env=env)
+    return shlex.split(next(line for line in out.splitlines() if line.startswith('Command')).split(':',1)[1])
+
+
 @pytest.mark.parametrize('script', TRAIN_LAUNCHERS, ids=lambda script: script.stem)
-def test_rebuttal_launcher_matrix_and_isolation(script, tmp_path):
-    env = dict(os.environ, DRY_RUN='true', CUDA_VISIBLE_DEVICES='3', NPROC_PER_NODE='1',
-               REBUTTAL_OUTPUT_ROOT=str(tmp_path/'rebuttal'), OUTPUT_ROOT=str(tmp_path/'other'))
-    def command():
-        out = subprocess.check_output(['bash', str(script)], text=True, cwd=ROOT, env=env)
-        return shlex.split(next(line for line in out.splitlines() if line.startswith('Command')).split(':',1)[1])
-    args = command()
-    def value(flag):
-        return args[args.index(flag)+1]
-    assert args[0:2] == ['env', 'CUDA_VISIBLE_DEVICES=3']
-    assert '--nproc_per_node=1' in args
-    name = script.stem
-    seed = '123' if '123' in name else '456' if '456' in name else '42'
+def test_seed_wrappers_separate_training_seed_from_data_seed(script,tmp_path):
+    args = launcher_command(script, OUTPUT_ROOT=str(tmp_path))
+    value = lambda flag: args[args.index(flag)+1]
+    seed = '123' if '123' in script.stem else '456'
     assert value('--seed') == seed
     assert value('--train_subset_seed') == value('--prompt_order_seed') == '42'
+    assert value('--method') == ('opd_reflex' if 'opd_reflex' in script.stem else 'fastgrpo')
     assert value('--train_option') == 'gsm8k'
     assert '/nlp/users/minhpn19/data/' in value('--dataset_path')
-    size = '7' if '7b' in name else '3'
-    assert value('--model_dir').endswith(f'Qwen2.5-{size}B-Instruct')
-    method = 'specnaacl' if 'spark' in name or 'specnaacl' in name else 'fastgrpo'
-    assert value('--method') == method
+    assert value('--batch_size') == value('--repeated_generate_nums') == '8'
+    assert '--nproc_per_node=1' in args and not value('--resume_checkpoint')
+    assert str(tmp_path/'pretrain/qwen25_7b/latest_checkpoint') == value('--adapter_path')
+    assert str(tmp_path/'rebuttal/multiseed') in value('--summary_file')
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize('script', ['train_qwen25_3b.sh','train_qwen25_3b_fastgrpo.sh'])
+@pytest.mark.parametrize('experiment,extra', [
+    ('concurrency', {'RESPONSES_PER_PROMPT':'16', 'GENERATION_PROFILE':'detailed'}),
+    ('long_context', {'MAX_RESPONSE_TOKENS':'4096'}),
+])
+def test_original_launchers_accept_response_overrides(script,experiment,extra,tmp_path):
+    args = launcher_command(ROOT/script, OUTPUT_ROOT=str(tmp_path), REBUTTAL_EXPERIMENT=experiment, **extra)
+    value = lambda flag: args[args.index(flag)+1]
+    assert value('--rebuttal_experiment') == experiment
     assert value('--batch_size') == '8'
-    assert value('--repeated_generate_nums') == ('16' if 'g16' in name else '8')
-    assert value('--generation_profile') == ('detailed' if 'g16' in name else 'clean')
-    assert value('--reflex_mode') == ('active' if method == 'specnaacl' else 'off')
-    assert value('--draft_backend') == 'eagle3'
-    assert ROOT / 'runtimes/specnaacl/grpo_speculative.py' in map(Path,args)
-    assert '--opd_b_sharing_scope' not in args
-    assert value('--max_length') == '2048'
-    if '4096' in name:
+    assert value('--repeated_generate_nums') == extra.get('RESPONSES_PER_PROMPT','8')
+    assert value('--generation_profile') == extra.get('GENERATION_PROFILE','clean')
+    assert value('--max_length') == value('--max_prompt_length') == '2048'
+    if experiment == 'long_context':
         assert value('--max_response_tokens') == '4096'
     else:
         assert '--max_response_tokens' not in args
-    assert value('--adapter_path') == str(ROOT / f'outputs/pretrain/qwen25_{size}b/latest_checkpoint')
-    assert not value('--resume_checkpoint')
-    assert value('--draft_initialization_mode') == 'pretrained'
-    assert value('--draft_config').endswith('/latest_draft_config.json')
-    assert value('--vocab_mapping').endswith('/latest_vocab_mapping.pt')
-    assert str(tmp_path/'rebuttal') in value('--summary_file')
-    assert value('--summary_file') not in command()
-    assert not (tmp_path/'rebuttal').exists()
 
 
 def test_concurrency_keeps_verification_capacity_and_changes_budget():
@@ -242,16 +242,54 @@ def test_frozen_comparison_uses_both_engines_and_saved_projector_on_tiny_data(tm
     assert report['diagnostics'][1]['spark_correction_update_time_ms_mean'] > 0
 
 
-def test_specnaacl_random_init_and_no_resume(tmp_path):
-    script = ROOT/'scripts/rebuttal/train_qwen25_7b_gsm8k_specnaacl_seed123.sh'
-    env = dict(os.environ,DRY_RUN='true',DRAFT_INITIALIZATION_MODE='random',
-        DRAFT_CHECKPOINT=str(tmp_path/'unavailable.pth'),REBUTTAL_OUTPUT_ROOT=str(tmp_path))
-    run = subprocess.run(['bash',str(script)],env=env,text=True,capture_output=True,check=True)
-    cmd = shlex.split(next(line for line in run.stdout.splitlines() if line.startswith('Command')).split(':',1)[1])
-    assert cmd[cmd.index('--adapter_path')+1] == ''
-    assert cmd[cmd.index('--resume_checkpoint')+1] == ''
-    assert cmd[cmd.index('--draft_initialization_mode')+1] == 'random'
-    assert cmd[cmd.index('--draft_config')+1].endswith('/draft_config.json')
-    assert not list(tmp_path.iterdir())
-    blocked = subprocess.run(['bash',str(script)],env=dict(env,RESUME='auto'),text=True,capture_output=True)
-    assert blocked.returncode == 2 and 'fresh training only' in blocked.stderr
+def test_random_rebuttal_ignores_draft_checkpoint_and_starts_fresh(tmp_path):
+    script = ROOT / 'scripts/rebuttal/train_qwen25_7b_gsm8k_opd_reflex_seed123.sh'
+    env = dict(os.environ, DRY_RUN='true', DRAFT_INITIALIZATION_MODE='random',
+               DRAFT_CHECKPOINT=str(tmp_path/'missing'), OUTPUT_ROOT=str(tmp_path/'runs'))
+    result = subprocess.run(['bash',str(script)], env=env, text=True, capture_output=True, check=True)
+    argv = shlex.split(next(line for line in result.stdout.splitlines() if line.startswith('Command')).split(':',1)[1])
+    assert argv[argv.index('--method')+1] == 'opd_reflex'
+    assert argv[argv.index('--draft_initialization_mode')+1] == 'random'
+    assert argv[argv.index('--adapter_path')+1] == ''
+    assert argv[argv.index('--resume_checkpoint')+1] == ''
+    assert not (tmp_path/'runs').exists()
+    inherited_resume = subprocess.run(['bash',str(script)], env=dict(env, RESUME='auto'),
+                                      text=True, capture_output=True)
+    assert inherited_resume.returncode == 2
+    assert 'fresh run' in inherited_resume.stderr
+
+
+def test_missing_pretrained_draft_preflight_identifies_initialization(tmp_path):
+    model = tmp_path/'model'
+    model.mkdir()
+    (model/'config.json').write_text('{}')
+    data = tmp_path/'data.json'
+    data.write_text('[]')
+    script = ROOT / 'scripts/rebuttal/train_qwen25_7b_gsm8k_opd_reflex_seed123.sh'
+    env = dict(os.environ, DRY_RUN='false', PYTHON_BIN=sys.executable, MODEL=str(model), DATASET_PATH=str(data),
+               EVAL_DATASET_PATH=str(data), DRAFT_CHECKPOINT=str(tmp_path/'missing'),
+               DRAFT_INITIALIZATION_MODE='pretrained', OUTPUT_ROOT=str(tmp_path/'runs'))
+    result = subprocess.run(['bash',str(script)], env=env, text=True, capture_output=True)
+    assert result.returncode == 2
+    assert 'draft checkpoint not found' in result.stderr
+    assert 'DRAFT_INITIALIZATION_MODE=random' in result.stderr
+    assert not (tmp_path/'runs').exists()
+
+
+def test_random_init_signature_cannot_pool_with_pretrained():
+    from scripts.summarize_rebuttal import BASE_ARGS, signature
+
+    config = dict(args=dict.fromkeys(BASE_ARGS), inputs={key:{'sha256':key}
+                  for key in ('target','train_dataset')})
+    config['inputs'].update(draft=None, target_adapter=None)
+    config['dataset'] = dict(selected_rows_sha256='rows', selected_sample_count=2, prompt_order_protocol='shuffle')
+    config['environment'] = dict(gpu='B200', gpu_memory_bytes=1, world_size=1, gpu_count=1,
+        torch_version='version', cuda_build='build', driver='driver',
+        software=dict.fromkeys(('transformers','peft','triton','math-verify')))
+    config['args']['draft_initialization_mode'] = 'random'
+    random_settings, _ = signature(config, 'fastgrpo')
+    assert random_settings['assets']['draft'] is None
+    config['args']['draft_initialization_mode'] = 'pretrained'
+    config['inputs']['draft'] = dict(sha256='pretrained-draft')
+    pretrained, _ = signature(config, 'fastgrpo')
+    assert random_settings != pretrained

@@ -174,8 +174,7 @@ class RebuttalRun:
             historical_reference=os.getenv('REBUTTAL_HISTORICAL_REFERENCE', 'unverified_launcher_defaults'),
             generation_timing_basis='perf_counter_through_generation_stream_boundary',
             seeds=dict(training=args.seed, dataset=args.train_subset_seed, dataloader=args.prompt_order_seed,
-                       projector=getattr(args,'opd_projector_seed',None),
-                       reflex=getattr(args,'reflex_seed',None), evaluation=args.evaluation_seed)))
+                       projector=args.opd_projector_seed, evaluation=args.evaluation_seed)))
         self.training_start = time.perf_counter()
         self.start_timestamp = utc_now()
 
@@ -237,8 +236,7 @@ class RebuttalRun:
                                **outputs['generation_memory'],
                                spark_correction_application_time_ms=profile['spark_correction_application_time_ms'],
                                spark_correction_update_time_ms=profile['spark_correction_update_time_ms'],
-                               spark_updates=outputs.get('opd_updates', 0),
-                               fastlk_updates=outputs.get('reflex_updates', 0)))
+                               spark_updates=outputs.get('opd_updates', 0)))
         if self.rounds:
             for row in outputs['verification_rounds']:
                 self.rounds.write(dict(**common, **row))

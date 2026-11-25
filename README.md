@@ -1,10 +1,8 @@
 # SpecNaacl: FastGRPO và ReflexOPD
 
 Core dùng trực tiếp FastGRPO gốc trong `sources/FastGRPO`, được sao chép từ
-`../FastGRPO-main` và kiểm tra SHA256. Runtime full-vocab nhận `METHOD=fastgrpo` và
-`METHOD=opd_reflex`. Chế độ lịch sử `METHOD=specnaacl` dùng FastLKReflex
-trên EAGLE-3. Chạy bằng `bash scripts/run_specnaacl.sh` hoặc các launcher
-trong [hướng dẫn rebuttal B200](REBUTTAL_EXPERIMENTS_B200.md).
+`../FastGRPO-main` và kiểm tra SHA256. Chỉ có `METHOD=fastgrpo` và
+`METHOD=opd_reflex`.
 
 Cả hai dùng FastGRPO DraftModel (EagleFS, một DraftDecoderLayer,
 nhánh dự đoán feature/logits), embedding và lm_head của target, full target

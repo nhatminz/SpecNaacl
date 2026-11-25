@@ -4,9 +4,7 @@ import math
 import json
 import os
 import random
-from pathlib import Path
-
-DATA_ROOT = Path(os.getenv("DATA_ROOT", "/workspace/storage-shared/nlp/users/minhpn19/data"))
+dir_key = "uids1103/data"
 
 prompt_dict = {
     "math" : {
@@ -129,19 +127,19 @@ def get_QAs_from_path(path, split):
 def get_test_QAs(option,tokenizer=None):
     
     if option == "amc-23":
-        eval_data_path = DATA_ROOT / "amc-23"
-        dataset = datasets.load_dataset(str(eval_data_path),split='test')
+        eval_data_path = f"./data/amc-23"
+        dataset = datasets.load_dataset(eval_data_path,split='test')
         QAs = [{'question':x, 'answer':f"\\boxed{{{y.split('####')[-1].strip()}}}"} for x,y in zip(dataset['question'], dataset['answer'])]
     elif option == "gsm8k":
-        data_path = DATA_ROOT / "gsm8k/main"
-        dataset = datasets.load_dataset(str(data_path),split='test')
+        data_path = f"./data/gsm8k/main"
+        dataset = datasets.load_dataset(data_path,split='test')
         QAs = [{'question':x, 'answer':f"\\boxed{{{y.split('####')[-1].strip()}}}"} for x,y in zip(dataset['question'], dataset['answer'])]
     elif option == "math-500":
-        eval_data_path = DATA_ROOT / "math-500/"
-        dataset = datasets.load_dataset(str(eval_data_path),split='test')
+        eval_data_path = f"./data/math-500/"
+        dataset = datasets.load_dataset(eval_data_path,split='test')
         QAs = [{'question':x, 'answer':f"\\boxed{{{y}}}"} for x,y in zip(dataset['problem'], dataset['answer'])]
     elif option == "simplelr_qwen_level3to5":
-        eval_data_path = DATA_ROOT / "simplelr_qwen_level3to5/test.parquet"
+        eval_data_path = f"./data/simplelr_qwen_level3to5/test.parquet"
         ds = pd.read_parquet(eval_data_path)
         ds = pd.DataFrame({
         'question': ds['prompt'].apply(lambda x: x[0]['content']),
@@ -149,13 +147,13 @@ def get_test_QAs(option,tokenizer=None):
         })
         QAs = ds.to_dict(orient='records')
     elif option == "simplelr_abel_level3to5":
-        data_path = DATA_ROOT / "simplelr_abel_level3to5/test.parquet"
+        data_path = f"./data/simplelr_abel_level3to5/test.parquet"
         QAs = _load_simplelr_parquet(data_path)
     elif option == "simplelr_abel_level3to5_smoke":
-        data_path = DATA_ROOT / "simplelr_abel_level3to5_smoke/test.parquet"
+        data_path = f"./data/simplelr_abel_level3to5_smoke/test.parquet"
         QAs = _load_simplelr_parquet(data_path)
     elif option == 'DAPO-math':
-        dataset = datasets.load_dataset(str(DATA_ROOT / "DAPO-Math-17k-Processed"),split='train')
+        dataset = datasets.load_dataset(r"./data/DAPO-Math-17k-Processed",split='train')
         QAs = [{'question' : item['prompt'] , 'answer' : f"\\boxed{{{item['reward_model']['ground_truth']}}}" }for item in dataset]
     if tokenizer is None:
         return QAs
@@ -164,11 +162,11 @@ def get_test_QAs(option,tokenizer=None):
 
 def get_train_QAs(option,tokenizer=None):
     if option == "gsm8k":
-        data_path = DATA_ROOT / "gsm8k/main"
-        dataset = datasets.load_dataset(str(data_path),split='train')
+        data_path = f"./data/gsm8k/main"
+        dataset = datasets.load_dataset(data_path,split='train')
         QAs = [{'question':x, 'answer':f"\\boxed{{{y.split('####')[-1].strip()}}}"} for x,y in zip(dataset['question'], dataset['answer'])]
     elif option == "simplelr_qwen_level3to5":
-        data_path = DATA_ROOT / "simplelr_qwen_level3to5/train.parquet"
+        data_path = f"./data/simplelr_qwen_level3to5/train.parquet"
         ds = pd.read_parquet(data_path)
         ds = pd.DataFrame({
         'question': ds['prompt'].apply(lambda x: x[0]['content']),
@@ -176,13 +174,13 @@ def get_train_QAs(option,tokenizer=None):
         })
         QAs = ds.to_dict(orient='records')
     elif option == "simplelr_abel_level3to5":
-        data_path = DATA_ROOT / "simplelr_abel_level3to5/train.parquet"
+        data_path = f"./data/simplelr_abel_level3to5/train.parquet"
         QAs = _load_simplelr_parquet(data_path)
     elif option == "simplelr_abel_level3to5_smoke":
-        data_path = DATA_ROOT / "simplelr_abel_level3to5_smoke/train.parquet"
+        data_path = f"./data/simplelr_abel_level3to5_smoke/train.parquet"
         QAs = _load_simplelr_parquet(data_path)
     elif option == 'DAPO-math':
-        dataset = datasets.load_dataset(str(DATA_ROOT / "DAPO-Math-17k-Processed"),split='train')
+        dataset = datasets.load_dataset(f"./data/DAPO-Math-17k-Processed",split='train')
         QAs = [{'question' : item['prompt'] , 'answer' : f"\\boxed{{{item['reward_model']['ground_truth']}}}" }for item in dataset]
     if tokenizer is None:
         return QAs

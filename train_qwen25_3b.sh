@@ -4,7 +4,7 @@ set -euo pipefail
 export MODEL_KEY="qwen25_3b"
 export METHOD="opd_reflex"
 export OPD_SAMPLER_MODE="${OPD_SAMPLER_MODE:-finite}"
-export MODEL="${MODEL:-${MODEL_ROOT:-/workspace/storage-shared/models}/Qwen2.5-3B-Instruct}"
+export MODEL="${MODEL:-/workspace/storage-shared/models/Qwen2.5-3B-Instruct}"
 export DATASET="${DATASET:-simplelr}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export NPROC_PER_NODE="${NPROC_PER_NODE:-1}"

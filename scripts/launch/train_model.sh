@@ -71,9 +71,19 @@ PRETRAIN_MODEL_ROOT="${PRETRAIN_MODEL_ROOT:-$OUTPUT_ROOT/pretrain/$MODEL_KEY}"
 DRAFT_CHECKPOINT="${DRAFT_CHECKPOINT:-$PRETRAIN_MODEL_ROOT/latest_checkpoint}"
 TARGET_CONFIG="$MODEL/config.json"
 DRAFT_INITIALIZATION_MODE="${DRAFT_INITIALIZATION_MODE:-pretrained}"
+[[ "$DRAFT_INITIALIZATION_MODE" != random ]] || DRAFT_CHECKPOINT=""
 export OPD_PROPOSAL_PROFILE_DIR="${OPD_PROPOSAL_PROFILE_DIR:-$OUTPUT_ROOT/benchmarks/opd_proposals}"
 
-TRAIN_MODEL_ROOT="${TRAIN_MODEL_ROOT:-$OUTPUT_ROOT/train/$MODEL_KEY}"
+if [[ -n "${REBUTTAL_EXPERIMENT:-}" ]]; then
+  [[ "$NPROC_PER_NODE" == 1 && "$CUDA_VISIBLE_DEVICES" =~ ^[a-zA-Z0-9_/-]+$ &&
+     -z "$RESUME" && -z "${RUN_DIR:-}${RUN_NAME:-}" ]] || {
+    echo 'ERROR: rebuttal runs require one visible GPU and a fresh run. Unset RESUME, RUN_DIR and RUN_NAME.' >&2
+    exit 2
+  }
+  TRAIN_MODEL_ROOT="${TRAIN_MODEL_ROOT:-$OUTPUT_ROOT/rebuttal/$REBUTTAL_EXPERIMENT}"
+else
+  TRAIN_MODEL_ROOT="${TRAIN_MODEL_ROOT:-$OUTPUT_ROOT/train/$MODEL_KEY}"
+fi
 # Each ablation owns its active/latest pointers. Parallel configurations never
 # discover or overwrite another configuration's auto-resume run.
 if [[ "$METHOD" == opd_reflex ]]; then
@@ -104,29 +114,14 @@ if [[ "$METHOD" == opd_reflex ]]; then
   fi
 fi
 SEED="${SEED:-$TRAIN_SUBSET_SEED}"
-REBUTTAL_EXPERIMENT="${REBUTTAL_EXPERIMENT:-}"
-if [[ -n "$REBUTTAL_EXPERIMENT" ]]; then
-  [[ "${GENERATION_PROFILE:-}" =~ ^(clean|detailed)$ && "${ROUND_LOG_FREQUENCY:-}" =~ ^[0-9]+$ &&
-    "${EVAL_INTERVAL_UPDATES:-}" =~ ^[0-9]+$ && "$SEED" =~ ^[0-9]+$ &&
-    "${PROMPT_ORDER_SEED:-}" =~ ^[0-9]+$ && "${EVALUATION_SEED:-}" =~ ^[0-9]+$ ]] ||
-    { echo 'ERROR: invalid rebuttal profile or integer setting' >&2; exit 2; }
-  [[ "$NPROC_PER_NODE" == 1 && "$CUDA_VISIBLE_DEVICES" =~ ^[a-zA-Z0-9_/-]+$ && -z "$RESUME" && -z "${RUN_DIR:-}${RUN_NAME:-}" ]] ||
-    { echo 'ERROR: rebuttal requires one GPU and a fresh run directory' >&2; exit 2; }
-  if [[ ! "$BATCH_SIZE" =~ ^[1-9][0-9]*$ || ! "$RESPONSES_PER_PROMPT" =~ ^[1-9][0-9]*$ ||
-        ! "$VERIFICATION_CAPACITY" =~ ^[1-9][0-9]*$ || ! "$MAX_VERIFICATION_NUM" =~ ^[1-9][0-9]*$ ]] ||
-     ((VERIFICATION_CAPACITY < 2 * BATCH_SIZE * RESPONSES_PER_PROMPT || MAX_VERIFICATION_NUM < 2)); then
-    echo 'ERROR: verification schedule requires at least two nodes per initial response, including the root' >&2
-    exit 2
-  fi
-  TRAIN_MODEL_ROOT="${REBUTTAL_OUTPUT_ROOT:?}/$REBUTTAL_EXPERIMENT"
-  RUN_PREFIX="${REBUTTAL_EXPERIMENT}__${MODEL_KEY}__${DATASET}__method-${METHOD}__seed${SEED}__b${BATCH_SIZE}__g${RESPONSES_PER_PROMPT}__cap${MAX_RESPONSE_TOKENS:-total${GEN_MAX_LENGTH}}"
-else
-  RUN_PREFIX="${MODEL_KEY}__${DATASET}__method-${METHOD}__seed${SEED}"
-fi
 REQUESTED_RUN_DIR="${RUN_DIR:-}"
 timestamp="$(date -u +%Y%m%dT%H%M%S)"
 short_uuid="$($PYTHON_BIN -c 'import uuid; print(uuid.uuid4().hex[:8])')"
-RUN_NAME="${RUN_NAME:-${RUN_PREFIX}__${timestamp}__${short_uuid}}"
+run_label="${MODEL_KEY}__${DATASET}__method-${METHOD}__seed${SEED}"
+if [[ -n "${REBUTTAL_EXPERIMENT:-}" ]]; then
+  run_label+="__b${BATCH_SIZE}__g${RESPONSES_PER_PROMPT}__cap${MAX_RESPONSE_TOKENS:-total$GEN_MAX_LENGTH}"
+fi
+RUN_NAME="${RUN_NAME:-${run_label}__${timestamp}__${short_uuid}}"
 RUN_DIR="${RUN_DIR:-$TRAIN_MODEL_ROOT/$RUN_NAME}"
 if [[ "$RESUME" == "auto" && -z "$REQUESTED_RUN_DIR" && -e "$TRAIN_MODEL_ROOT/active_run" ]]; then
   active_run="$(readlink -f "$TRAIN_MODEL_ROOT/active_run")"
@@ -215,15 +210,16 @@ cmd=(
   --seed "$SEED"
 )
 if [[ -n "${MAX_RESPONSE_TOKENS:-}" ]]; then
-  [[ "$MAX_RESPONSE_TOKENS" =~ ^[1-9][0-9]*$ ]] ||
-    { echo 'ERROR: MAX_RESPONSE_TOKENS must be a positive integer' >&2; exit 2; }
+  [[ "$MAX_RESPONSE_TOKENS" =~ ^[1-9][0-9]*$ ]] || { echo 'ERROR: MAX_RESPONSE_TOKENS must be positive' >&2; exit 2; }
   cmd+=(--max_response_tokens "$MAX_RESPONSE_TOKENS")
 fi
-if [[ -n "$REBUTTAL_EXPERIMENT" ]]; then
+if [[ -n "${REBUTTAL_EXPERIMENT:-}" ]]; then
+  EVAL_DATASET_PATH="${EVAL_DATASET_PATH:-${GSM8K_TEST:-$DATA_ROOT/gsm8k/main/test-00000-of-00001.parquet}}"
   cmd+=(--rebuttal_experiment "$REBUTTAL_EXPERIMENT" --rebuttal_model_key "$MODEL_KEY"
-    --generation_profile "$GENERATION_PROFILE" --round_log_frequency "$ROUND_LOG_FREQUENCY"
-    --prompt_order_seed "$PROMPT_ORDER_SEED" --evaluation_seed "$EVALUATION_SEED"
-    --eval_interval_updates "$EVAL_INTERVAL_UPDATES" --eval_dataset_path "$EVAL_DATASET_PATH")
+    --prompt_order_seed "${PROMPT_ORDER_SEED:-$TRAIN_SUBSET_SEED}"
+    --generation_profile "${GENERATION_PROFILE:-clean}" --round_log_frequency "${ROUND_LOG_FREQUENCY:-20}"
+    --evaluation_seed "${EVALUATION_SEED:-42}" --eval_interval_updates "${EVAL_INTERVAL_UPDATES:-50}"
+    --eval_dataset_path "$EVAL_DATASET_PATH")
 fi
 if [[ "$METHOD" == opd_reflex ]]; then
   cmd+=(
@@ -247,48 +243,26 @@ if (($#)); then cmd+=("$@"); fi
 
 printf 'Run name : %s\nRun dir  : %s\nModel    : %s\nDataset  : %s\nDraft    : %s\nMethod   : %s\nEngine   : %s\nGPUs     : %s\n' \
   "$RUN_NAME" "$RUN_DIR" "$MODEL" "$DATASET_PATH" "$DRAFT_CHECKPOINT" "$METHOD" "$METHOD" "$NPROC_PER_NODE"
-if [[ -n "$REBUTTAL_EXPERIMENT" ]]; then
-  printf 'Seed / subset / order : %s / %s / %s\nBatch / responses : %s / %s\nLength cap : %s\nProfile : %s\n' \
-    "$SEED" "$TRAIN_SUBSET_SEED" "$PROMPT_ORDER_SEED" "$BATCH_SIZE" "$RESPONSES_PER_PROMPT" \
-    "${MAX_RESPONSE_TOKENS:-total $GEN_MAX_LENGTH}" "$GENERATION_PROFILE"
-  if [[ "$METHOD" == opd_reflex ]]; then
-    printf 'SPARK dispatch : %s / %s / %s\n' "$OPD_PROPOSAL_MODE" "$OPD_DENSE_IMPLEMENTATION" "${OPD_PROPOSAL_PROFILE:-auto-discovery}"
-  fi
-fi
-printf 'Command  :'
-if [[ -n "$REBUTTAL_EXPERIMENT" ]]; then printf ' %q' env "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"; fi
-printf ' %q' "${cmd[@]}"; printf '\n'
+printf 'Command  :'; printf ' %q' "${cmd[@]}"; printf '\n'
 if [[ "${DRY_RUN:-false}" == "true" ]]; then return 0 2>/dev/null || exit 0; fi
 
 if [[ "$RESUME" == auto && -z "$RESUME_CHECKPOINT" && "${REQUIRE_RESUME:-0}" == 1 ]];then
   echo "ERROR: no checkpoint for this configuration under $TRAIN_MODEL_ROOT; use RESUME= for a fresh run" >&2;exit 2
 fi
+"$PYTHON_BIN" "$PROJECT_DIR/scripts/validate_environment.py" --python-only
+"$PYTHON_BIN" "$PROJECT_DIR/scripts/check_training_sources.py" --backend fastgrpo
+
 [[ -f "$MODEL/config.json" ]] || { echo "ERROR: model config not found: $MODEL/config.json" >&2; exit 2; }
-[[ -e "$DATASET_PATH" ]] || { echo "ERROR: dataset not found: $DATASET_PATH" >&2; exit 2; }
+[[ -f "$DATASET_PATH" ]] || { echo "ERROR: dataset not found: $DATASET_PATH" >&2; exit 2; }
 if [[ "$DRAFT_INITIALIZATION_MODE" == "pretrained" && ! -e "$DRAFT_CHECKPOINT" ]]; then
-  echo "ERROR: draft checkpoint not found: $DRAFT_CHECKPOINT" >&2; exit 2
+  echo "ERROR: draft checkpoint not found: $DRAFT_CHECKPOINT. Set DRAFT_CHECKPOINT to the original draft or use DRAFT_INITIALIZATION_MODE=random for a separate random-init study." >&2; exit 2
 fi
-if [[ -n "$REBUTTAL_EXPERIMENT" ]]; then
-  [[ -f "$DRAFT_CHECKPOINT" || -f "$DRAFT_CHECKPOINT/draft.pth" ]] ||
-    { echo "ERROR: set DRAFT_CHECKPOINT to a FastGRPO draft.pth file or its parent: $DRAFT_CHECKPOINT" >&2; exit 2; }
-  DRAFT_FILE="$DRAFT_CHECKPOINT"
-  [[ ! -d "$DRAFT_FILE" ]] || DRAFT_FILE="$DRAFT_FILE/draft.pth"
-  # Pin the resolved pretraining checkpoint before the training process starts.
-  DRAFT_FILE="$(readlink -f "$DRAFT_FILE")"
-  for index in "${!cmd[@]}"; do
-    if [[ "${cmd[$index]}" == --adapter_path ]]; then cmd[index+1]="$DRAFT_FILE"; break; fi
-  done
-  DRAFT_CHECKPOINT="$DRAFT_FILE"
-  [[ -e "$EVAL_DATASET_PATH" ]] || { echo "ERROR: set GSM8K_TEST or EVAL_DATASET_PATH: $EVAL_DATASET_PATH" >&2; exit 2; }
-  [[ -z "$TARGET_ADAPTER" || -f "$TARGET_ADAPTER/adapter_config.json" ]] ||
-    { echo "ERROR: missing adapter_config.json under TARGET_ADAPTER=$TARGET_ADAPTER" >&2; exit 2; }
+if [[ -n "${REBUTTAL_EXPERIMENT:-}" && ! -e "$EVAL_DATASET_PATH" ]]; then
+  echo "ERROR: held-out GSM8K file not found: $EVAL_DATASET_PATH" >&2; exit 2
 fi
 if [[ -n "$RESUME_CHECKPOINT" && ! -f "$RESUME_CHECKPOINT" ]]; then
   echo "ERROR: resume checkpoint not found: $RESUME_CHECKPOINT" >&2; exit 2
 fi
-
-"$PYTHON_BIN" "$PROJECT_DIR/scripts/validate_environment.py" --python-only
-"$PYTHON_BIN" "$PROJECT_DIR/scripts/check_training_sources.py" --backend fastgrpo
 
 export PYTHONPATH="$PROJECT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 env CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" "$PYTHON_BIN" "$PROJECT_DIR/scripts/validate_environment.py" \
@@ -305,13 +279,13 @@ if [[ "$METHOD" == opd_reflex && "$OPD_PROPOSAL_MODE" == auto && "$DRAFT_INITIAL
   export OPD_PROPOSAL_PROFILE
 fi
 
-mkdir -p "$TRAIN_MODEL_ROOT"
-if [[ -n "$REBUTTAL_EXPERIMENT" ]]; then
+if [[ -n "${REBUTTAL_EXPERIMENT:-}" ]]; then
+  mkdir -p "$TRAIN_MODEL_ROOT"
   mkdir "$RUN_DIR"
-else
-  ln -sfn "$RUN_DIR" "$TRAIN_MODEL_ROOT/active_run"
 fi
 mkdir -p "$LOG_DIR" "$CHECKPOINT_DIR" "$RUN_DIR/statistics"
+mkdir -p "$TRAIN_MODEL_ROOT"
+if [[ -z "${REBUTTAL_EXPERIMENT:-}" ]]; then ln -sfn "$RUN_DIR" "$TRAIN_MODEL_ROOT/active_run"; fi
 "$PYTHON_BIN" "$PROJECT_DIR/scripts/write_run_metadata.py" --run-dir "$RUN_DIR" --kind train \
   --item "run_name=$RUN_NAME" --item "model=$MODEL" --item "dataset=$DATASET_PATH" \
   --item "draft_checkpoint=$DRAFT_CHECKPOINT" --item "draft_architecture=FastGRPO" \
@@ -345,4 +319,4 @@ mkdir -p "$LOG_DIR" "$CHECKPOINT_DIR" "$RUN_DIR/statistics"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 env CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" "${cmd[@]}" 2>&1 | tee -a "$LOG_DIR/console.log"
-if [[ -z "$REBUTTAL_EXPERIMENT" ]]; then ln -sfn "$RUN_DIR" "$TRAIN_MODEL_ROOT/latest_run"; fi
+if [[ -z "${REBUTTAL_EXPERIMENT:-}" ]]; then ln -sfn "$RUN_DIR" "$TRAIN_MODEL_ROOT/latest_run"; fi

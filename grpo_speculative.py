@@ -16,7 +16,6 @@ sys.path.insert(0, repo_import_path)
 
 import pandas as pd
 from transformers import AutoTokenizer,AutoConfig,AutoModelForCausalLM,GenerationConfig
-from helper.train_prompts import TrainDataCollator
 from helper.rebuttal_metrics import RebuttalRun, asset_id, digest_rows, json_write, phase_seconds, runtime_environment
 from torch.utils.checkpoint import checkpoint as activation_checkpoint
 from helper.response_alignment import append_response_group, sort_training_rows, GRPO_ALIGNMENT_VERSION
@@ -448,6 +447,8 @@ parser.add_argument('--analysis_draft_update_steps', type=int, default=1)
 parser.add_argument('--analysis_bootstrap_samples', type=int, default=2000)
 parser.add_argument('--analysis_resume', default='true')
 args = parser.parse_args()
+if args.draft_initialization_mode == 'random':
+    args.adapter_path = ''
 preflight_shared_adapter(args.load_lora_path, args.model_dir)
 method,_=resolve_method(args.method)
 world_size = int(os.environ.get('WORLD_SIZE', '1'))
@@ -1079,6 +1080,40 @@ if resume_checkpoint and step_metrics_state is None:
 step_metrics = StepMetricsWriter(
     log_file, timing_file, enabled=is_main_process, append=append_log,
     baseline=step_metrics_baseline, state=step_metrics_state)
+
+class TrainDataCollator:
+    def __init__(self, tokenizer, max_prompt_length):
+        self.tokenizer = tokenizer
+        self.max_prompt_length = max_prompt_length
+
+    def __call__(self, batch):
+        system_prompt = "You are a math problem assistant."
+        user_prompt =  '''Below is an instruction that describes a task, paired with an input that provides further context.
+            Write a response that appropriately completes the request.
+            Your response should include your thought process enclosed within <think></think> tags
+            and the final answer enclosed within <answer></answer> tags (Just put a number between the tags).\n
+            ### Instruction:\n{instruction}\nPlease reason step by step, and put your final answer within \\boxed{{}}'''
+        messages = []
+        answers = []
+
+        for example in batch:
+            messages.append([
+                {"role" : "system" , "content": system_prompt} ,
+                {"role" : "user" , "content": user_prompt.format_map({"instruction" : example['question']}) }
+            ])
+            answers.append(example['answer'])
+        tokenized_inputs = self.tokenizer(
+            text=self.tokenizer.apply_chat_template(messages,tokenize=False,add_generation_prompt=True),
+            return_tensors='pt',padding='longest',truncation=True,max_length=self.max_prompt_length,padding_side='left'
+        )
+
+        return {
+            'input_ids': tokenized_inputs['input_ids'],
+            'attention_mask': tokenized_inputs['attention_mask'],
+            'messages': messages,
+            'answers': answers,
+        }
+
 
 def _analysis_rng_state():
     return {

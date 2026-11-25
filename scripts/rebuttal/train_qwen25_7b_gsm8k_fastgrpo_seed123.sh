@@ -1,3 +1,4 @@
 #!/usr/bin/env bash
 set -euo pipefail
-exec bash "$(dirname "${BASH_SOURCE[0]}")/train.sh" multiseed qwen25_7b fastgrpo 123 8 ""
+export SEED=123 DATASET="${DATASET:-gsm8k}" REBUTTAL_EXPERIMENT=multiseed
+exec bash "$(dirname "${BASH_SOURCE[0]}")/../../train_qwen25_7b_fastgrpo.sh"

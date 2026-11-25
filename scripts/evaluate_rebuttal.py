@@ -4,7 +4,10 @@ import argparse
 import json
 from pathlib import Path
 import random
+import sys
 import time
+
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 
 import numpy as np
 import torch
@@ -14,7 +17,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 from helper.get_QAs import get_QAs_from_path
 from helper.rebuttal_metrics import CSVLog, asset_id, digest_rows, json_write, runtime_environment, utc_now
 from helper.rewards import accuracy_reward_func
-from helper.train_prompts import TrainDataCollator
+from scripts.benchmark_opd_reflex import collator
 
 
 def read_snapshots(run, manifest):
@@ -90,7 +93,7 @@ def main():
     limit = getattr(base.config, 'max_position_embeddings', None)
     if limit and max_prompt + args.max_new_tokens > limit:
         raise ValueError('evaluation prompt cap + response cap exceeds target context')
-    make_batch = TrainDataCollator(tokenizer, max_prompt)
+    make_batch = collator(tokenizer, max_prompt)
     generation_settings = dict(do_sample=args.sample, max_new_tokens=args.max_new_tokens,
         eos_token_id=tokenizer.eos_token_id, pad_token_id=tokenizer.pad_token_id, use_cache=True)
     if args.sample:

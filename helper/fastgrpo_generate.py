@@ -237,17 +237,15 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
             if isinstance(padding_positions_tensor, torch.Tensor):
                 draft_attention_mask[padding_positions_tensor[:, 0], 0, :, padding_positions_tensor[:, 1]] = min_dtype
 
-            if statistical_time or not telemetry.enabled:
-                torch.cuda.synchronize()
-                check_time_start=time.time()
+            torch.cuda.synchronize()
+            check_time_start=time.time()
             
             draft_outputs=model(hidden_states=next_feature_states,input_ids=draft_next_token,
                                 attention_mask=draft_attention_mask,use_cache=True,
                                 past_key_values=draft_past_key_values_tree,position_ids=draft_position_ids)
             
-            if statistical_time or not telemetry.enabled:
-                torch.cuda.synchronize()
-                total_check_time+=time.time()-check_time_start
+            torch.cuda.synchronize()
+            total_check_time+=time.time()-check_time_start
             
             draft_past_key_values_tree=draft_outputs['past_key_values']
             telemetry.observe_cache('draft', draft_past_key_values_tree)
@@ -448,8 +446,6 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
     all_draft_input_states=None
     all_draft_input_ids=None
 
-    if telemetry.enabled or max_response_tokens:
-        attention_mask = attention_mask.cpu()
     position_ids=[torch.sum(item) for item in attention_mask]
     past_position_ids=[item.item()-1 for item in position_ids]
     prompt_lengths = [position + 1 for position in past_position_ids]
@@ -686,7 +682,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
             return trees
         
         telemetry.end(tree_ticket)
-        if telemetry.enabled or max_response_tokens:
+        if max_response_tokens:
             transfer_stream.wait_stream(torch.cuda.current_stream(device))
         transfer_thread = executor.submit(transfer_input_ids, target_trees, trees_chosen_index, device, transfer_stream)
 
