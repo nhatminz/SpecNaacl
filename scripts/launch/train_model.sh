@@ -44,7 +44,15 @@ case "$METHOD" in
   *) echo "ERROR: METHOD must be fastgrpo or opd_reflex, got: $METHOD" >&2; exit 2 ;;
 esac
 
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+if [[ -z "${PYTHON_BIN:-}" ]]; then
+  if [[ -n "${VIRTUAL_ENV:-}" && -x "$VIRTUAL_ENV/bin/python" ]]; then
+    PYTHON_BIN="$VIRTUAL_ENV/bin/python"
+  elif [[ -x "$PROJECT_DIR/.venv/bin/python" ]]; then
+    PYTHON_BIN="$PROJECT_DIR/.venv/bin/python"
+  else
+    PYTHON_BIN=python3
+  fi
+fi
 OUTPUT_ROOT="${OUTPUT_ROOT:-$PROJECT_DIR/outputs}"
 case "${DATASET,,}" in
   gsm8k)
@@ -116,7 +124,7 @@ fi
 SEED="${SEED:-$TRAIN_SUBSET_SEED}"
 REQUESTED_RUN_DIR="${RUN_DIR:-}"
 timestamp="$(date -u +%Y%m%dT%H%M%S)"
-short_uuid="$($PYTHON_BIN -c 'import uuid; print(uuid.uuid4().hex[:8])')"
+short_uuid="$("$PYTHON_BIN" -c 'import uuid; print(uuid.uuid4().hex[:8])')"
 run_label="${MODEL_KEY}__${DATASET}__method-${METHOD}__seed${SEED}"
 if [[ -n "${REBUTTAL_EXPERIMENT:-}" ]]; then
   run_label+="__b${BATCH_SIZE}__g${RESPONSES_PER_PROMPT}__cap${MAX_RESPONSE_TOKENS:-total$GEN_MAX_LENGTH}"

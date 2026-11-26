@@ -1,6 +1,16 @@
 """Small execution checks for the installed training APIs; no production weights."""
 from copy import deepcopy
 import io
+import os
+
+
+def configure_cuda_sdpa():
+    """Use PyTorch's other SDPA backends when cuDNN attention is disabled."""
+    if os.environ.get('DISABLE_CUDNN_SDPA') == '1':
+        import torch
+
+        torch.backends.cuda.enable_cudnn_sdp(False)
+        print('cuDNN SDPA disabled (DISABLE_CUDNN_SDPA=1)', flush=True)
 
 
 def probe_training_runtime(device='cpu'):
@@ -12,6 +22,8 @@ def probe_training_runtime(device='cpu'):
     from train_draft import pretrain_loss
 
     device=torch.device(device)
+    if device.type == 'cuda':
+        configure_cuda_sdpa()
     devices=[torch.cuda.current_device()] if device.type=='cuda' else []
     with torch.random.fork_rng(devices=devices):
         torch.manual_seed(17)

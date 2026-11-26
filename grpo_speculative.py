@@ -68,6 +68,7 @@ import csv
 import importlib.util
 from tqdm.auto import tqdm
 from helper.drift_metrics import sparse_union_metrics
+from helper.environment_checks import configure_cuda_sdpa
 
 def handle_signal(signum, frame):
     print("Received signal, cleaning up...")
@@ -447,6 +448,7 @@ parser.add_argument('--analysis_draft_update_steps', type=int, default=1)
 parser.add_argument('--analysis_bootstrap_samples', type=int, default=2000)
 parser.add_argument('--analysis_resume', default='true')
 args = parser.parse_args()
+configure_cuda_sdpa()
 if args.draft_initialization_mode == 'random':
     args.adapter_path = ''
 preflight_shared_adapter(args.load_lora_path, args.model_dir)

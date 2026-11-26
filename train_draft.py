@@ -15,6 +15,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, get_sc
 from helper.fastgrpo_model import FastGRPOModel
 from helper.pretrain_data import DataCollator
 from helper.checkpointing import capture_rng_state, restore_rng_state
+from helper.environment_checks import configure_cuda_sdpa
 
 
 def pretrain_loss(model, batch):
@@ -60,6 +61,7 @@ def main(argv=None):
     p.add_argument('--model_output_root',default='');p.add_argument('--dtype',default='bf16',choices=['bf16','fp16','fp32','auto'])
     p.add_argument('--attn_implementation',default='sdpa')
     a=p.parse_args(argv)
+    configure_cuda_sdpa()
     if min(a.batch_size,a.accumulation_steps,a.num_epochs,a.max_length,a.save_interval)<1: p.error('positive training settings required')
     rank=int(os.environ.get('RANK',0));world=int(os.environ.get('WORLD_SIZE',1))
     torch.cuda.set_device(int(os.environ.get('LOCAL_RANK',0)))
