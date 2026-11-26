@@ -45,6 +45,17 @@ case "$METHOD" in
 esac
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+export OPD_STATIC_CORRECTION="${OPD_STATIC_CORRECTION:-none}"
+export OPD_STATIC_ALPHA="${OPD_STATIC_ALPHA:-1.0}"
+export OPD_STATIC_COUNT_MODE="${OPD_STATIC_COUNT_MODE:-miss}"
+export OPD_CACHE_ORDER="${OPD_CACHE_ORDER:-1}"
+export OPD_CACHE_SLOTS="${OPD_CACHE_SLOTS:-1}"
+export OPD_CACHE_BONUS="${OPD_CACHE_BONUS:-1.0}"
+if [[ "$OPD_STATIC_CORRECTION" != none ]]; then
+  if ! static_label="$("$PYTHON_BIN" "$PROJECT_DIR/helper/static_correction.py" \
+    --method "$METHOD" --interval "$OPD_UPDATE_INTERVAL_ROUNDS")"; then exit 2; fi
+  export OPD_ABLATION_NAME="${OPD_ABLATION_NAME:+${OPD_ABLATION_NAME}__}$static_label"
+fi
 OUTPUT_ROOT="${OUTPUT_ROOT:-$PROJECT_DIR/outputs}"
 case "${DATASET,,}" in
   gsm8k)
@@ -232,6 +243,9 @@ if [[ "$METHOD" == opd_reflex ]]; then
   --opd_projector_init "$OPD_PROJECTOR_INIT" --opd_projector_seed "$OPD_PROJECTOR_SEED"
   --opd_update_interval_rounds "$OPD_UPDATE_INTERVAL_ROUNDS" --opd_ablation_name "$OPD_ABLATION_NAME"
   --opd_b_sharing_scope "$OPD_B_SHARING_SCOPE" --opd_b_reset_mode "$OPD_B_RESET_MODE"
+  --opd_static_correction "$OPD_STATIC_CORRECTION" --opd_static_alpha "$OPD_STATIC_ALPHA"
+  --opd_static_count_mode "$OPD_STATIC_COUNT_MODE" --opd_cache_order "$OPD_CACHE_ORDER"
+  --opd_cache_slots "$OPD_CACHE_SLOTS" --opd_cache_bonus "$OPD_CACHE_BONUS"
   --kv_gather_strategy "${KV_GATHER_STRATEGY:-stacked}"
   )
 fi
@@ -306,6 +320,9 @@ if [[ -z "${REBUTTAL_EXPERIMENT:-}" ]]; then ln -sfn "$RUN_DIR" "$TRAIN_MODEL_RO
   --item "opd_ablation_name=$OPD_ABLATION_NAME" --item "opd_projector_init=$OPD_PROJECTOR_INIT" \
   --item "opd_projector_seed=$OPD_PROJECTOR_SEED" --item "opd_update_interval_rounds=$OPD_UPDATE_INTERVAL_ROUNDS" \
   --item "opd_b_sharing_scope=$OPD_B_SHARING_SCOPE" --item "opd_b_reset_mode=$OPD_B_RESET_MODE" \
+  --item "opd_static_correction=$OPD_STATIC_CORRECTION" --item "opd_static_alpha=$OPD_STATIC_ALPHA" \
+  --item "opd_static_count_mode=$OPD_STATIC_COUNT_MODE" --item "opd_cache_order=$OPD_CACHE_ORDER" \
+  --item "opd_cache_slots=$OPD_CACHE_SLOTS" --item "opd_cache_bonus=$OPD_CACHE_BONUS" \
   --item "opd_feedback_selection=$OPD_FEEDBACK_SELECTION" \
   --item "opd_projector_mode=${OPD_PROJECTOR_MODE:-off}" \
   --item "opd_train_projector=$OPD_TRAIN_PROJECTOR" --item "opd_proposal_mode=$OPD_PROPOSAL_MODE" \

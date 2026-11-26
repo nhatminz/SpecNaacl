@@ -74,6 +74,24 @@ def project_tensor(source, draft_state):
     return value
 
 
+def load_frozen_model(target_path, adapter_path, draft_state, device, dtype, attention):
+    from peft import PeftModel
+    from transformers import AutoModelForCausalLM
+    from helper.fastgrpo_model import FastGRPOModel
+
+    target = AutoModelForCausalLM.from_pretrained(target_path, torch_dtype=dtype,
+        attn_implementation=attention, local_files_only=True).to(device).eval()
+    config = deepcopy(target.config)
+    config.rope_scaling = None
+    config.num_hidden_layers = 1
+    model = FastGRPOModel(config, target).to(device).eval()
+    model.draft_model.load_state_dict(draft_state)
+    if adapter_path:
+        model.target_model = PeftModel.from_pretrained(model.target_model, adapter_path).eval()
+    model.requires_grad_(False)
+    return model
+
+
 def repetition_summary(rows, fields):
     result = {'repetitions': len(rows)}
     for key in fields:
@@ -93,9 +111,7 @@ STEADY_FIELDS = (
 
 def main(argv):
     args = parse_args(argv)
-    from peft import PeftModel
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    from helper.fastgrpo_model import FastGRPOModel
+    from transformers import AutoTokenizer
     from helper.shared_adapter import preflight_shared_adapter
 
     if torch.cuda.device_count() != 1 or int(os.getenv('WORLD_SIZE', '1')) != 1:
@@ -109,17 +125,9 @@ def main(argv):
     draft_state = torch.load(checkpoint, map_location='cpu', weights_only=True)['draft_model']
     projector = project_tensor(args.projector_checkpoint, draft_state)
     draft_state.pop('opd_projector', None)
-    target = AutoModelForCausalLM.from_pretrained(args.target_model, torch_dtype=dtype,
-        attn_implementation=args.attn_implementation, local_files_only=True).to(device).eval()
-    config = deepcopy(target.config)
-    config.rope_scaling = None
-    config.num_hidden_layers = 1
-    model = FastGRPOModel(config, target).to(device).eval()
-    model.draft_model.load_state_dict(draft_state)
+    model = load_frozen_model(args.target_model, args.target_adapter, draft_state, device, dtype,
+                              args.attn_implementation)
     del draft_state
-    if args.target_adapter:
-        model.target_model = PeftModel.from_pretrained(model.target_model, args.target_adapter).eval()
-    model.requires_grad_(False)
     tokenizer = AutoTokenizer.from_pretrained(args.target_model, padding_side='left', local_files_only=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token

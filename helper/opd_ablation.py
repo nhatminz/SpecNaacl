@@ -5,12 +5,13 @@ copies/hashes run only at initialization, checkpoint/resume and termination.
 """
 import hashlib
 import torch
+from helper.static_correction import STATIC_DEFAULTS, static_ablation_label, static_options
 
 UPDATE_INTERVALS = (0, 1, 5, 10, 15)
 HOST_COUNTER_NAMES = ('opd_feedback_rounds', 'opd_skipped_rounds')
 CONFIG_FIELDS = ('opd_ablation_name', 'opd_projector_init', 'opd_projector_mode',
                  'opd_projector_seed', 'opd_train_projector', 'opd_update_interval_rounds',
-                 'opd_b_sharing_scope', 'opd_b_reset_mode', 'opd_feedback_selection')
+                 'opd_b_sharing_scope', 'opd_b_reset_mode', 'opd_feedback_selection') + tuple(STATIC_DEFAULTS)
 PROVENANCE_FIELDS = ('opd_initial_a_sha256', 'opd_final_a_sha256', 'opd_a_change_norm')
 
 
@@ -29,8 +30,9 @@ def ablation_config(args):
     if sharing == 'per_prompt_group' and reset == 'carry':
         raise ValueError('per_prompt_group and carry_b are independent ablations')
     name = args.opd_ablation_name
+    static = static_options(args)
     if not name:
-        name = ('learned_random' if train else 'frozen_random') if init == 'random_orthogonal' else ('main' if train else 'frozen_head_aligned')
+        name = static_ablation_label(static) or (('learned_random' if train else 'frozen_random') if init == 'random_orthogonal' else ('main' if train else 'frozen_head_aligned'))
         if interval != 1:
             name += f'_interval{interval}'
     return dict(opd_ablation_name=name, opd_projector_init=init,
@@ -42,7 +44,7 @@ def ablation_config(args):
                 opd_visited_weight=float(args.opd_visited_weight),
                 opd_frontier_weight=float(args.opd_frontier_weight),
                 opd_b_sharing_scope=sharing, opd_b_reset_mode=reset,
-                opd_feedback_selection=selection,
+                opd_feedback_selection=selection, **static,
                 opd_state_selection=('visited_only' if selection == 'accepted_only' else 'visited_and_expanded_one_hop_frontier'))
 
 
@@ -54,7 +56,8 @@ def validate_resume_config(saved, current):
         if (current['opd_projector_init'] != 'head_aligned' or
                 current['opd_update_interval_rounds'] != 1 or
                 not current['opd_train_projector'] or current['opd_projector_seed'] != 42 or
-                current['opd_b_sharing_scope'] != 'rollout_batch' or current['opd_b_reset_mode'] != 'rollout'):
+                current['opd_b_sharing_scope'] != 'rollout_batch' or current['opd_b_reset_mode'] != 'rollout' or
+                current.get('opd_static_correction', 'none') != 'none'):
             raise ValueError('resume ablation configuration missing in legacy checkpoint')
         return
     # Checkpoints from the initial A/interval study implicitly used shared,
@@ -63,6 +66,8 @@ def validate_resume_config(saved, current):
     saved.setdefault('opd_b_sharing_scope', 'rollout_batch')
     saved.setdefault('opd_b_reset_mode', 'rollout')
     saved.setdefault('opd_feedback_selection', 'accepted_only' if saved.get('opd_frontier_weight') == 0 else 'visited_frontier')
+    for key, default in STATIC_DEFAULTS.items():
+        saved.setdefault(key, default)
     differences = [key for key in current if saved.get(key) != current[key]]
     if differences:
         raise ValueError('resume ablation configuration mismatch: ' + ', '.join(differences))

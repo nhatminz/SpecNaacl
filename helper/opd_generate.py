@@ -17,6 +17,7 @@ from helper.opd_ablation import feedback_due, UPDATE_INTERVALS
 from helper.opd_static_cache import OPDStaticCache,persistent_cache,swap_remove_plan
 import os
 from helper.opd_attention import AttentionWorkspace
+from helper.static_correction import StaticCorrection, validate_static_correction
 total_target_time = 0
 total_draft_time = 0
 total_check_time = 0
@@ -78,7 +79,9 @@ def _cache_seq_length(cache):
     return int(key.shape[-2])
 
 @torch.inference_mode()
-def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=False, repeated_generate_nums=None, temperature=0.8, top_p=0.9, top_k=None, verification_capacity=160, max_draft_token_length=5, max_draft_k=8, max_verification_num=160, min_draft_token_length=3, draft_token_length_c=0.75, statistical_time=False, return_all_draft_input=False, max_length=2048, method='opd_reflex', opd_rank=8, opd_topk=16, opd_fast_lr=0.01, opd_visited_weight=1.0, opd_frontier_weight=1.0, opd_update_stream=True, opd_profile=False, opd_diagnostics=False, opd_backend='auto', opd_train_projector=False, kv_gather_strategy='stacked', opd_update_interval_rounds=1, opd_b_sharing_scope='rollout_batch', opd_b_reset_mode='rollout', max_response_tokens=None, generation_profile="off", round_log_frequency=0):
+def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=False, repeated_generate_nums=None, temperature=0.8, top_p=0.9, top_k=None, verification_capacity=160, max_draft_token_length=5, max_draft_k=8, max_verification_num=160, min_draft_token_length=3, draft_token_length_c=0.75, statistical_time=False, return_all_draft_input=False, max_length=2048, method='opd_reflex', opd_rank=8, opd_topk=16, opd_fast_lr=0.01, opd_visited_weight=1.0, opd_frontier_weight=1.0, opd_update_stream=True, opd_profile=False, opd_diagnostics=False, opd_backend='auto', opd_train_projector=False, kv_gather_strategy='stacked', opd_update_interval_rounds=1, opd_b_sharing_scope='rollout_batch', opd_b_reset_mode='rollout', max_response_tokens=None, generation_profile="off", round_log_frequency=0,
+                         opd_static_correction='none', opd_static_alpha=1., opd_static_count_mode='miss',
+                         opd_cache_order=1, opd_cache_slots=1, opd_cache_bonus=1.):
     max_response_tokens = response_limit(max_response_tokens)
     validate_response_context(model, input_ids.shape[-1], max_response_tokens, max_draft_token_length)
     telemetry = GenerationTelemetry(generation_profile, model.target_model.device,
@@ -98,6 +101,12 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
     adaptation_enabled = enabled and opd_update_interval_rounds > 0
     opd = None
     vocabulary_ids = None
+    static = None
+    static_groups = None
+    static_kwargs = dict(opd_static_correction=opd_static_correction, opd_static_alpha=opd_static_alpha,
+                         opd_static_count_mode=opd_static_count_mode, opd_cache_order=opd_cache_order,
+                         opd_cache_slots=opd_cache_slots, opd_cache_bonus=opd_cache_bonus)
+    validate_static_correction(method, opd_update_interval_rounds, static_kwargs)
 
     def draft_generate(model, next_feature_states, draft_hidden_states, draft_past_key_values_tree, draft_token_length, past_position_ids_tensor, padding_positions, draft_k=4, draft_total_token=32):
         global total_check_time
@@ -120,6 +129,9 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
         total_position_ids[:,:draft_k].copy_(draft_position_ids)
         head_inputs = draft_hidden_states.to(model.target_model.dtype)
         draft_logits = model.lm_head(head_inputs)
+        if static is not None:
+            static.apply(draft_logits, static_groups)
+        beam_parents = target_next_token if static is not None and static.history is not None and opd_cache_order == 2 else None
         (next_token_values, _, draft_next_token) = opd.propose(draft_logits, draft_hidden_states, draft_k, vocabulary_ids, root=True, context_offset=0, head_inputs=head_inputs)
         # propose() returns a view of reused proposal_q scratch. Both the first
         # beam and confidences[0] must survive later expansion proposals. Merely
@@ -177,6 +189,9 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
             full_parents[:,node_start:node_end].view(bsz,draft_k,draft_k).copy_(beam_node_ids[:,:,None])
             head_inputs = draft_hidden_states.to(model.target_model.dtype)
             draft_logits = model.lm_head(head_inputs)
+            if static is not None:
+                static.apply(draft_logits, static_groups, last=draft_next_token, previous=beam_parents)
+            beam_tokens = draft_next_token if beam_parents is not None else None
             (next_token_values, _, draft_next_token) = opd.propose(draft_logits, draft_hidden_states, draft_k, vocabulary_ids, context_offset=1 + (idx_token - 1) * draft_k, head_inputs=head_inputs)
             branches=opd.tree_branch_confidence.view(-1)[:bsz*draft_k*draft_k].view(bsz,draft_k,draft_k)
             torch.mul(draft_confidences.unsqueeze(-1),next_token_values,out=branches)
@@ -191,6 +206,8 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
             draft_next_token = draft_next_token.view(bsz, -1).gather(index=draft_top_k_token_indices, dim=-1)
             draft_confidences = draft_top_k_token_values
             draft_top_k_token_indices_div_k = draft_top_k_token_indices // draft_k
+            if beam_tokens is not None:
+                beam_parents = beam_tokens.gather(1, draft_top_k_token_indices_div_k)
             draft_top_k_token_indices_expanded = draft_top_k_token_indices_div_k.unsqueeze(-1).expand(bsz, draft_k, next_feature_states.shape[-1])
             next_feature_states = next_feature_states.gather(index=draft_top_k_token_indices_expanded, dim=-2)
             draft_top_k_token_indices_expanded = draft_top_k_token_indices_div_k.unsqueeze(-1).expand(bsz, draft_k, idx_token)
@@ -405,6 +422,17 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
     pad_mask.zero_()
     pad_mask[:,:input_ids.shape[-1]].copy_(initial_padding.repeat_interleave(max(1,repeated_generate_nums or 1),0))
     owners=torch.arange(bsz,device=device,dtype=torch.long)
+    if opd_static_correction != 'none':
+        static_groups = opd.row_groups if opd.grouped else torch.zeros_like(owners)
+        static_history = None
+        if opd_static_correction == 'context_cache':
+            columns = torch.arange(input_ids.shape[1], device=device)[None, :]
+            last_prompt_column = torch.where(initial_padding, -1, columns).amax(1, keepdim=True)
+            last_prompt = input_ids.gather(1, last_prompt_column.clamp_min(0)).masked_fill(last_prompt_column < 0, -1)
+            last_prompt = last_prompt.repeat_interleave(max(1, repeated_generate_nums or 1), dim=0)
+            static_history = torch.cat((last_prompt, target_next_token), dim=1)
+        static = StaticCorrection(vocabulary_ids.numel(), opd.num_groups, device, bsz,
+                                  history=static_history, **static_kwargs)
     padding_positions_tensor=pad_mask
     pad_counts=[len(pad) for pad in padding_positions]
     max_recorded_pad_column=input_ids.shape[-1]
@@ -567,6 +595,8 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
                         draft_token_length, draft_k, round_feedback,
                         max_budget=max(1, min(verification_capacity // bsz, max_verification_num)))
         feature_states_index = chosen_index - past_kv_len
+        if static is not None:
+            static.observe(path, target_next_token, static_groups, owners, tensor_tree)
         target_next_token = next_token.gather(index=last_valid_index, dim=-1)
         (B, T, D) = feature_states_tree.shape
         feature_states_index = feature_states_index.unsqueeze(-1).expand(B, -1, D)
@@ -607,6 +637,9 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
             past_position_ids_tensor=past_position_ids_tensor.index_select(0,keep)
             residual_index = [residual_index[row] for row in keep_rows]
             opd.compact_group_rows(keep,residual_index)
+            if static is not None:
+                static.compact(keep)
+                static_groups = opd.row_groups if opd.grouped else static_groups.index_select(0, keep)
             chosen_index = chosen_index.index_select(0, keep)
             if static_kv:
                 target_past_key_values.swap_remove(len(keep_rows),sources,destinations)
@@ -747,6 +780,8 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer, do_sample=
     opd.clear()
     result = {'generated_token_ids': filtered_generated_token_ids, 'max_sequence_length': max_sequence_length, 'total_acc_length': avg_acc_length[0], 'total_acc': max_sequence_length / token_num, 'total_decoded_token_num': avg_acc_length[1], 'total_accepted_draft_tokens': total_accepted_draft_tokens, 'total_proposed_draft_tokens': total_proposed_draft_tokens, 'total_accepted_medusa_tokens': total_accepted_draft_tokens, 'total_proposed_medusa_tokens': total_proposed_draft_tokens, 'draft_acceptance_rate': draft_acceptance_rate, 'medusa_acceptance_rate': draft_acceptance_rate, 'total_time_cost': time.perf_counter() - start_time, 'target_time_cost': total_target_time, 'draft_time_cost': total_draft_time, 'check_time_cost': total_check_time, 'prefill_time_cost': total_prefill_time, 'post_time_cost': time.time() - post_time_start, 'all_draft_input_states': all_draft_input_states, 'all_draft_input_ids': all_draft_input_ids, 'response_accepted_length_sum': response_accepted_length_sum, 'response_verification_rounds': response_verification_rounds, 'response_generated_tokens': [len(item) for item in filtered_generated_token_ids], 'batch_verification_rounds': verification_batches, 'verification_batches': verification_batches, 'active_response_rounds': active_response_rounds, 'verified_tree_nodes': verified_tree_nodes}
     result.update(opd_statistics)
+    if static is not None:
+        result.update(static.stats())
     result.update(opd_feedback_rounds=feedback_rounds,
                   opd_skipped_rounds=verification_batches-feedback_rounds)
     if not enabled:result.update({name:0. for name in OPD_COUNTER_NAMES})

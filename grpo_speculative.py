@@ -20,6 +20,7 @@ from helper.rebuttal_metrics import RebuttalRun, asset_id, digest_rows, json_wri
 from torch.utils.checkpoint import checkpoint as activation_checkpoint
 from helper.response_alignment import append_response_group, sort_training_rows, GRPO_ALIGNMENT_VERSION
 from helper.shared_adapter import preflight_shared_adapter, verify_loaded_adapter, initialization_report
+from helper.static_correction import add_static_arguments, static_options, validate_static_correction
 from helper.rewards import accuracy_reward_func , format_reward_func
 from helper.get_QAs import get_test_QAs , get_train_QAs, get_QAs_from_path, select_train_subset
 from helper.specualtive_generate import speculative_generate
@@ -344,6 +345,7 @@ parser.add_argument('--opd_update_interval_rounds',type=int,default=int(os.envir
 parser.add_argument('--opd_b_sharing_scope',default=os.environ.get('OPD_B_SHARING_SCOPE','rollout_batch'),choices=['rollout_batch','per_prompt_group'])
 parser.add_argument('--opd_b_reset_mode',default=os.environ.get('OPD_B_RESET_MODE','rollout'),choices=['rollout','carry'])
 parser.add_argument('--opd_ablation_name',default=os.environ.get('OPD_ABLATION_NAME',''))
+add_static_arguments(parser)
 parser.add_argument('--draft_train_profile', default='0', choices=['0', '1'])
 parser.add_argument('--kv_gather_strategy', default='stacked', choices=['stacked', 'per_layer'])
 parser.add_argument('--dtype', type=str, default='auto', choices=['auto', 'bf16', 'fp16', 'fp32'])
@@ -447,6 +449,10 @@ parser.add_argument('--analysis_draft_update_steps', type=int, default=1)
 parser.add_argument('--analysis_bootstrap_samples', type=int, default=2000)
 parser.add_argument('--analysis_resume', default='true')
 args = parser.parse_args()
+try:
+    validate_static_correction(args.method, args.opd_update_interval_rounds, static_options(args))
+except ValueError as error:
+    parser.error(str(error))
 if args.draft_initialization_mode == 'random':
     args.adapter_path = ''
 preflight_shared_adapter(args.load_lora_path, args.model_dir)
@@ -612,7 +618,8 @@ opd_kwargs={"method":method,"opd_rank":args.opd_rank,"opd_topk":args.opd_topk,
     "opd_backend":args.opd_backend,"kv_gather_strategy":args.kv_gather_strategy,
     "opd_train_projector":_as_bool(args.opd_train_projector) and is_train_draft and args.opd_update_interval_rounds > 0,
     "opd_update_interval_rounds":args.opd_update_interval_rounds,
-    "opd_b_sharing_scope":args.opd_b_sharing_scope,"opd_b_reset_mode":args.opd_b_reset_mode}
+    "opd_b_sharing_scope":args.opd_b_sharing_scope,"opd_b_reset_mode":args.opd_b_reset_mode,
+    **static_options(args)}
 ablation_metadata = ablation_config(args) if method=='opd_reflex' else {}
 effective_opd_backend = 'off'
 opd_eval_kwargs=dict(opd_kwargs,opd_train_projector=False)
